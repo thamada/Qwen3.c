@@ -1,11 +1,11 @@
 #define _GNU_SOURCE
 /*
- * Qwen3-VL GGUF — XDNA2 「tiny」バックエンド (amdxdna 直 ioctl + 低ホスト RAM).
+ * Qwen3-VL GGUF — XDNA2 + BFP16 ホスト重み (amdxdna 直 ioctl + 低ホスト RAM).
  *
- * main-xdna2.c と同様に /dev/accel を DRM ioctl で開き ERT_START_NPU で GEMV を投げるが、
- * 重みは GGUF mmap 上の量子化テンソルをそのまま参照し、GEMV ごとに出力行方向チャンクだけ
- * BF16 にステージングする。全レイヤーの BF16 常駐や巨大なデ量子化バッファは持たないため、
- * ホスト RAM が ~8GB 付近でも動かしやすい。
+ * 線形重みをロード時にブロック浮動小数点 (BFP16) に変換してホストメモリに保持する。
+ * 各行列行はブロック長ごとに BF16 スケールと int8 係数で格納され、F32 常駐より容量を抑える。
+ * GGUF はパース・変換の間だけ mmap し、変換後は munmap してファイルマップを解放する。
+ * GEMV は行チャンクごとに BF16 に展開して NPU に渡す（チャンク GEMV は main-xdna2.c と同様）。
  *
  * 環境変数:
  *   XDNA_GEMV_DIR          bf16-gemv-<n>x<d>.bin ctrlcode（チャンク出力行数 d）
@@ -13,7 +13,7 @@
  *   XDNA_NUM_COL           CREATE_HWCTX の最大列リクエスト（既定は FW が報告する cols）
  *   XDNA_FORCE_CPU         1 で NPU を使わず CPU のみ
  *
- * Build: make build.xdna2.tiny (-fopenmp)
+ * Build: make build.xdna2.bfpx (-fopenmp)
  */
 
 #include <stdio.h>
@@ -21,6 +21,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <time.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -893,8 +894,10 @@ static void dequant_iq3_s(const BlockIQ3_S *x, float *y, int64_t nb) {
     }
 }
 /* ================================================================
- * Model layout (host pointers into mmap)
+ * Model layout (RMS norm は F32 のコピー、線形重みは BFP16 ホストバッファ)
  * ================================================================ */
+
+#define BFPU_BLK 64
 
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq;
@@ -922,21 +925,30 @@ typedef struct {
     int byte_tok[256];
 } Tok;
 
+typedef struct BfpxMat {
+    int n_out;
+    int n_in;
+    int blk;
+    int nb_in;
+    uint16_t *scale_bf16;
+    int8_t *q;
+} BfpxMat;
+
 typedef struct {
-    void *embd;    int embd_t;
+    BfpxMat *embd;
     float **norm_att;
-    void **wq;     int *wq_t;
-    void **wk;     int *wk_t;
-    void **wv;     int *wv_t;
-    void **wo;     int *wo_t;
+    BfpxMat **wq;
+    BfpxMat **wk;
+    BfpxMat **wv;
+    BfpxMat **wo;
     float **q_norm;
     float **k_norm;
     float **norm_ffn;
-    void **gate;   int *gate_t;
-    void **up;     int *up_t;
-    void **down;   int *down_t;
+    BfpxMat **gate;
+    BfpxMat **up;
+    BfpxMat **down;
     float *norm_out;
-    void *out;     int out_t;
+    BfpxMat *out;
 } Weights;
 
 typedef struct {
@@ -997,6 +1009,39 @@ typedef struct {
     XdnaDev npu;
 } Model;
 
+static TensorInfo *ti_find(Model *m, const char *name) {
+    for (int i = 0; i < m->nti; i++)
+        if (!strcmp(m->ti[i].name, name)) return &m->ti[i];
+    return NULL;
+}
+
+static TensorInfo *ti_must(Model *m, const char *name) {
+    TensorInfo *t = ti_find(m, name);
+    if (!t) {
+        fprintf(stderr, "Error: missing tensor %s\n", name);
+        exit(1);
+    }
+    return t;
+}
+
+static void model_drop_gguf_mmap(Model *m) {
+    if (m->ti) {
+        for (int i = 0; i < m->nti; i++) free(m->ti[i].name);
+        free(m->ti);
+        m->ti = NULL;
+        m->nti = 0;
+    }
+    if (m->fdata && m->fsz) {
+        munmap(m->fdata, m->fsz);
+        m->fdata = NULL;
+        m->fsz = 0;
+    }
+    if (m->fd >= 0) {
+        close(m->fd);
+        m->fd = -1;
+    }
+}
+
 static size_t row_bytes_quant(int type, int n_in) {
     int nb = n_in / QK_K;
     switch (type) {
@@ -1028,6 +1073,331 @@ static void dequant_one_block_to(const void *blk, int type, float *dst) {
         fprintf(stderr, "dequant_one_block_to: bad type %d\n", type);
         exit(1);
     }
+}
+
+static void bfpx_mat_alloc(BfpxMat *M, int n_out, int n_in) {
+    M->n_out = n_out;
+    M->n_in = n_in;
+    M->blk = BFPU_BLK;
+    M->nb_in = (n_in + M->blk - 1) / M->blk;
+    size_t ns = (size_t)n_out * (size_t)M->nb_in;
+    size_t nq = ns * (size_t)M->blk;
+    M->scale_bf16 = (uint16_t *)malloc(ns * sizeof(uint16_t));
+    M->q = (int8_t *)malloc(nq * sizeof(int8_t));
+    if (!M->scale_bf16 || !M->q) {
+        fprintf(stderr, "bfpx_mat_alloc: OOM\n");
+        exit(1);
+    }
+}
+
+static void bfpx_mat_destroy(BfpxMat *p) {
+    if (!p) return;
+    free(p->scale_bf16);
+    free(p->q);
+    p->scale_bf16 = NULL;
+    p->q = NULL;
+}
+
+static size_t bfpx_mat_bytes(const BfpxMat *M) {
+    if (!M || !M->scale_bf16) return 0;
+    return sizeof(BfpxMat)
+        + (size_t)M->n_out * (size_t)M->nb_in * sizeof(uint16_t)
+        + (size_t)M->n_out * (size_t)M->nb_in * (size_t)M->blk * sizeof(int8_t);
+}
+
+static void bfpx_encode_row(BfpxMat *M, int row, const float *x) {
+    uint16_t *sc = M->scale_bf16 + (size_t)row * M->nb_in;
+    int8_t *qb = M->q + (size_t)row * M->nb_in * M->blk;
+    for (int b = 0; b < M->nb_in; b++) {
+        int j0 = b * M->blk;
+        float max_abs = 0.f;
+        for (int k = 0; k < M->blk; k++) {
+            int idx = j0 + k;
+            float v = (idx < M->n_in) ? x[idx] : 0.f;
+            float a = fabsf(v);
+            if (a > max_abs) max_abs = a;
+        }
+        float scale = (max_abs < 1e-8f) ? 0.f : (max_abs / 127.f);
+        sc[b] = host_f32bf16(scale);
+        int8_t *blkq = qb + (size_t)b * M->blk;
+        if (scale < 1e-12f) {
+            memset(blkq, 0, (size_t)M->blk * sizeof(int8_t));
+        } else {
+            for (int k = 0; k < M->blk; k++) {
+                int idx = j0 + k;
+                float v = (idx < M->n_in) ? x[idx] : 0.f;
+                float q = v / scale;
+                int qi = (int)lrintf(q);
+                if (qi > 127) qi = 127;
+                if (qi < -127) qi = -127;
+                blkq[k] = (int8_t)qi;
+            }
+        }
+    }
+}
+
+static void decode_weight_row_to_float(Model *m, const TensorInfo *ti, int row, float *dst) {
+    const uint8_t *base = m->fdata + m->doff + ti->offset;
+    int n_in = ti->n_dims >= 2 ? (int)ti->ne[1] : (int)ti->ne[0];
+    switch (ti->type) {
+    case DT_F32:
+        memcpy(dst, (const float *)base + (size_t)row * (size_t)n_in,
+               (size_t)n_in * sizeof(float));
+        break;
+    case DT_F16: {
+        const uint16_t *rp = (const uint16_t *)base + (size_t)row * (size_t)n_in;
+        for (int j = 0; j < n_in; j++) dst[j] = host_f16f32(rp[j]);
+        break;
+    }
+    case DT_Q4_K:
+    case DT_Q5_K:
+    case DT_IQ2_S:
+    case DT_IQ3_S:
+        if (n_in % QK_K) {
+            fprintf(stderr, "decode_weight_row_to_float: n_in=%d not multiple of QK_K\n", n_in);
+            exit(1);
+        }
+        {
+            int nb = n_in / QK_K;
+            size_t row_sz = row_bytes_quant(ti->type, n_in);
+            size_t bs = block_size_quant(ti->type);
+            const uint8_t *rp = base + (size_t)row * row_sz;
+            for (int b = 0; b < nb; b++)
+                dequant_one_block_to(rp + (size_t)b * bs, ti->type, dst + b * QK_K);
+        }
+        break;
+    default:
+        fprintf(stderr, "bfpx: unsupported tensor type %d\n", ti->type);
+        exit(1);
+    }
+}
+
+static void bfpx_convert_linear(Model *m, const TensorInfo *ti, BfpxMat *out) {
+    if (ti->n_dims < 2) {
+        fprintf(stderr, "bfpx: tensor %s needs >=2 dims\n", ti->name);
+        exit(1);
+    }
+    int n_out = (int)ti->ne[0];
+    int n_in = (int)ti->ne[1];
+    bfpx_mat_alloc(out, n_out, n_in);
+    float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
+    if (!tmp) {
+        fprintf(stderr, "bfpx_convert_linear: OOM\n");
+        exit(1);
+    }
+    for (int r = 0; r < n_out; r++) {
+        decode_weight_row_to_float(m, ti, r, tmp);
+        bfpx_encode_row(out, r, tmp);
+    }
+    free(tmp);
+}
+
+static size_t ti_nelements(const TensorInfo *ti) {
+    size_t n = 1;
+    for (int d = 0; d < ti->n_dims; d++) n *= (size_t)ti->ne[d];
+    return n;
+}
+
+static void dequant_tensor_all_f32(Model *m, const TensorInfo *ti, float *dst) {
+    size_t nel = ti_nelements(ti);
+    const uint8_t *raw = m->fdata + m->doff + ti->offset;
+    switch (ti->type) {
+    case DT_F32:
+        memcpy(dst, raw, nel * sizeof(float));
+        break;
+    case DT_F16: {
+        const uint16_t *r = (const uint16_t *)raw;
+        for (size_t i = 0; i < nel; i++) dst[i] = host_f16f32(r[i]);
+        break;
+    }
+    case DT_Q4_K:
+    case DT_Q5_K:
+    case DT_IQ2_S:
+    case DT_IQ3_S:
+        if (nel % (size_t)QK_K) {
+            fprintf(stderr, "dequant_tensor_all_f32: nel=%zu not multiple of QK_K\n", nel);
+            exit(1);
+        }
+        {
+            size_t nb = nel / (size_t)QK_K;
+            switch (ti->type) {
+            case DT_Q4_K: dequant_q4_k((const BlockQ4_K *)raw, dst, (int64_t)nb); break;
+            case DT_Q5_K: dequant_q5_k((const BlockQ5_K *)raw, dst, (int64_t)nb); break;
+            case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)raw, dst, (int64_t)nb); break;
+            case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)raw, dst, (int64_t)nb); break;
+            default: break;
+            }
+        }
+        break;
+    default:
+        fprintf(stderr, "dequant_tensor_all_f32: unsupported type %d\n", ti->type);
+        exit(1);
+    }
+}
+
+/*
+ * GEMV 重み W: 論理形状は n_out 行 × n_in 列（main-omp の mm(o,x,w,n_in,n_out) と同じ）。
+ * GGUF が [n_out,n_in] のときは行単位デコード可能。[n_in,n_out] のときは論理行 r が
+ * full[r*n_in ..) に連続して並ぶのでフルデ量子化してから詰める。
+ */
+static void bfpx_convert_weight_2d(Model *m, TensorInfo *ti, int n_out, int n_in,
+                                   const char *tensor_name, BfpxMat *out) {
+    if (ti->n_dims != 2) {
+        fprintf(stderr, "%s: expected 2 dims\n", tensor_name);
+        exit(1);
+    }
+    uint64_t n0 = ti->ne[0], n1 = ti->ne[1];
+    size_t nel = (size_t)n_out * (size_t)n_in;
+    if ((size_t)n0 * (size_t)n1 != nel) {
+        fprintf(stderr,
+                "%s: GGUF shape %" PRIu64 " x %" PRIu64 " (els=%zu) "
+                "!= weight %d x %d\n",
+                tensor_name, n0, n1, (size_t)n0 * (size_t)n1, n_out, n_in);
+        exit(1);
+    }
+
+    /* ggml 線形 idx = i0 + i1*n0（i0 が stride-1）*/
+
+    if (n0 == (uint64_t)n_in && n1 == (uint64_t)n_out && n_in != n_out) {
+        /* 長方形のみ: ggml で stride-1 が n_in、論理行 r が full[r*n_in ..)（例 [dim,vocab] の emb） */
+        float *full = (float *)malloc(nel * sizeof(float));
+        if (!full) {
+            fprintf(stderr, "%s: OOM full buffer\n", tensor_name);
+            exit(1);
+        }
+        dequant_tensor_all_f32(m, ti, full);
+        bfpx_mat_alloc(out, n_out, n_in);
+        float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
+        if (!tmp) {
+            fprintf(stderr, "%s: OOM row tmp\n", tensor_name);
+            exit(1);
+        }
+        for (int r = 0; r < n_out; r++) {
+            memcpy(tmp, full + (size_t)r * (size_t)n_in, (size_t)n_in * sizeof(float));
+            bfpx_encode_row(out, r, tmp);
+        }
+        free(tmp);
+        free(full);
+        return;
+    }
+
+    if (n0 == (uint64_t)n_out && n1 == (uint64_t)n_in) {
+        /* [n_out,n_in] で i0 が出力行方向 → 行 r は full[r + j*n_out]（量子化行デコードと整合しないことがある） */
+        int row_quant_ok = (ti->type == DT_F32 || ti->type == DT_F16) ||
+                           ((ti->type == DT_Q4_K || ti->type == DT_Q5_K || ti->type == DT_IQ2_S ||
+                             ti->type == DT_IQ3_S) &&
+                            (n_in % QK_K) == 0);
+        if (row_quant_ok) {
+            bfpx_convert_linear(m, ti, out);
+            return;
+        }
+        float *full = (float *)malloc(nel * sizeof(float));
+        if (!full) {
+            fprintf(stderr, "%s: OOM full buffer\n", tensor_name);
+            exit(1);
+        }
+        dequant_tensor_all_f32(m, ti, full);
+        bfpx_mat_alloc(out, n_out, n_in);
+        float *tmp = (float *)malloc((size_t)n_in * sizeof(float));
+        if (!tmp) {
+            fprintf(stderr, "%s: OOM row tmp\n", tensor_name);
+            exit(1);
+        }
+        for (int r = 0; r < n_out; r++) {
+            for (int j = 0; j < n_in; j++)
+                tmp[j] = full[(size_t)r + (size_t)j * (size_t)n_out];
+            bfpx_encode_row(out, r, tmp);
+        }
+        free(tmp);
+        free(full);
+        return;
+    }
+
+    fprintf(stderr,
+            "%s: cannot map GGUF shape %" PRIu64 " x %" PRIu64 " to weight %d x %d\n",
+            tensor_name, n0, n1, n_out, n_in);
+    exit(1);
+}
+
+static float bfpx_dot_row(const BfpxMat *M, int row, const float *x) {
+    const uint16_t *sc = M->scale_bf16 + (size_t)row * M->nb_in;
+    const int8_t *qb = M->q + (size_t)row * M->nb_in * M->blk;
+    float acc = 0.f;
+    for (int b = 0; b < M->nb_in; b++) {
+        float s = host_bf16f32(sc[b]);
+        const int8_t *blkq = qb + (size_t)b * M->blk;
+        int j0 = b * M->blk;
+        for (int k = 0; k < M->blk && j0 + k < M->n_in; k++)
+            acc += x[j0 + k] * (s * (float)blkq[k]);
+    }
+    return acc;
+}
+
+static void mm_bfpx(float *o, const float *x, const BfpxMat *W) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < W->n_out; i++)
+        o[i] = bfpx_dot_row(W, i, x);
+}
+
+static void mm_bfpx_slice(float *o, const float *x, const BfpxMat *W, int row0, int nrows) {
+    if (nrows <= 0) return;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int ii = 0; ii < nrows; ii++)
+        o[ii] = bfpx_dot_row(W, row0 + ii, x);
+}
+
+static void bfpx_row_to_float(const BfpxMat *M, int row, float *dst) {
+    const uint16_t *sc = M->scale_bf16 + (size_t)row * M->nb_in;
+    const int8_t *qb = M->q + (size_t)row * M->nb_in * M->blk;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int b = 0; b < M->nb_in; b++) {
+        float s = host_bf16f32(sc[b]);
+        const int8_t *blkq = qb + (size_t)b * M->blk;
+        int j0 = b * M->blk;
+        for (int k = 0; k < M->blk && j0 + k < M->n_in; k++)
+            dst[j0 + k] = s * (float)blkq[k];
+    }
+}
+
+static void bfpx_rows_to_bf16(const BfpxMat *M, int row0, int nrows, uint16_t *dst) {
+    for (int r = 0; r < nrows; r++) {
+        const uint16_t *sc = M->scale_bf16 + (size_t)(row0 + r) * M->nb_in;
+        const int8_t *qb = M->q + (size_t)(row0 + r) * M->nb_in * M->blk;
+        uint16_t *drow = dst + (size_t)r * (size_t)M->n_in;
+        for (int b = 0; b < M->nb_in; b++) {
+            float s = host_bf16f32(sc[b]);
+            const int8_t *blkq = qb + (size_t)b * M->blk;
+            int j0 = b * M->blk;
+            for (int k = 0; k < M->blk && j0 + k < M->n_in; k++) {
+                float wv = s * (float)blkq[k];
+                drow[j0 + k] = host_f32bf16(wv);
+            }
+        }
+    }
+}
+
+static float *dup_f32_tensor(Model *m, const char *name) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) return NULL;
+    if (ti->type != DT_F32) {
+        fprintf(stderr, "dup_f32_tensor %s: expected F32, got type %d\n", name, ti->type);
+        exit(1);
+    }
+    uint64_t nel = 1;
+    for (int d = 0; d < ti->n_dims; d++) nel *= ti->ne[d];
+    float *p = (float *)malloc((size_t)nel * sizeof(float));
+    if (!p) {
+        fprintf(stderr, "dup_f32_tensor %s: OOM\n", name);
+        exit(1);
+    }
+    memcpy(p, m->fdata + m->doff + ti->offset, (size_t)nel * sizeof(float));
+    return p;
 }
 
 /* ================================================================
@@ -1391,69 +1761,82 @@ static int *chat_encode(Tok *tk, const char *prompt, int *out_n) {
     return toks;
 }
 
-static void *find_tensor(Model *m, const char *name, int *out_type) {
-    for (int i = 0; i < m->nti; i++) {
-        if (strcmp(m->ti[i].name, name) == 0) {
-            if (out_type) *out_type = m->ti[i].type;
-            return m->fdata + m->doff + m->ti[i].offset;
-        }
-    }
-    return NULL;
-}
-
 static void load_weights(Model *m) {
     Config *c = &m->cfg;
     Weights *w = &m->w;
     int L = c->n_layers;
+    int dim = c->dim, hidden = c->hidden_dim, kv_dim = c->kv_dim;
 
-    w->embd = find_tensor(m, "token_embd.weight", &w->embd_t);
+    TensorInfo *ti_embd = ti_find(m, "token_embd.weight");
+    if (!ti_embd) {
+        fprintf(stderr, "Error: token_embd.weight missing\n");
+        exit(1);
+    }
+    w->embd = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+    bfpx_convert_weight_2d(m, ti_embd, c->vocab_size, dim, "token_embd.weight", w->embd);
 
     w->norm_att = (float **)calloc(L, sizeof(float *));
-    w->q_norm   = (float **)calloc(L, sizeof(float *));
-    w->k_norm   = (float **)calloc(L, sizeof(float *));
-    w->wq       = (void **)calloc(L, sizeof(void *));  w->wq_t   = (int *)calloc(L, sizeof(int));
-    w->wk       = (void **)calloc(L, sizeof(void *));  w->wk_t   = (int *)calloc(L, sizeof(int));
-    w->wv       = (void **)calloc(L, sizeof(void *));  w->wv_t   = (int *)calloc(L, sizeof(int));
-    w->wo       = (void **)calloc(L, sizeof(void *));  w->wo_t   = (int *)calloc(L, sizeof(int));
+    w->q_norm = (float **)calloc(L, sizeof(float *));
+    w->k_norm = (float **)calloc(L, sizeof(float *));
+    w->wq = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
+    w->wk = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
+    w->wv = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
+    w->wo = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
     w->norm_ffn = (float **)calloc(L, sizeof(float *));
-    w->gate     = (void **)calloc(L, sizeof(void *));  w->gate_t  = (int *)calloc(L, sizeof(int));
-    w->up       = (void **)calloc(L, sizeof(void *));  w->up_t    = (int *)calloc(L, sizeof(int));
-    w->down     = (void **)calloc(L, sizeof(void *));  w->down_t  = (int *)calloc(L, sizeof(int));
+    w->gate = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
+    w->up = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
+    w->down = (BfpxMat **)calloc(L, sizeof(BfpxMat *));
 
     char name[128];
     for (int l = 0; l < L; l++) {
         sprintf(name, "blk.%d.attn_norm.weight", l);
-        w->norm_att[l] = (float *)find_tensor(m, name, NULL);
+        w->norm_att[l] = dup_f32_tensor(m, name);
         sprintf(name, "blk.%d.attn_q_norm.weight", l);
-        w->q_norm[l] = (float *)find_tensor(m, name, NULL);
+        w->q_norm[l] = dup_f32_tensor(m, name);
         sprintf(name, "blk.%d.attn_k_norm.weight", l);
-        w->k_norm[l] = (float *)find_tensor(m, name, NULL);
+        w->k_norm[l] = dup_f32_tensor(m, name);
         sprintf(name, "blk.%d.attn_q.weight", l);
-        w->wq[l] = find_tensor(m, name, &w->wq_t[l]);
+        TensorInfo *ti = ti_must(m, name);
+        w->wq[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, dim, dim, name, w->wq[l]);
         sprintf(name, "blk.%d.attn_k.weight", l);
-        w->wk[l] = find_tensor(m, name, &w->wk_t[l]);
+        ti = ti_must(m, name);
+        w->wk[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, kv_dim, dim, name, w->wk[l]);
         sprintf(name, "blk.%d.attn_v.weight", l);
-        w->wv[l] = find_tensor(m, name, &w->wv_t[l]);
+        ti = ti_must(m, name);
+        w->wv[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, kv_dim, dim, name, w->wv[l]);
         sprintf(name, "blk.%d.attn_output.weight", l);
-        w->wo[l] = find_tensor(m, name, &w->wo_t[l]);
+        ti = ti_must(m, name);
+        w->wo[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, dim, dim, name, w->wo[l]);
         sprintf(name, "blk.%d.ffn_norm.weight", l);
-        w->norm_ffn[l] = (float *)find_tensor(m, name, NULL);
+        w->norm_ffn[l] = dup_f32_tensor(m, name);
         sprintf(name, "blk.%d.ffn_gate.weight", l);
-        w->gate[l] = find_tensor(m, name, &w->gate_t[l]);
+        ti = ti_must(m, name);
+        w->gate[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, hidden, dim, name, w->gate[l]);
         sprintf(name, "blk.%d.ffn_up.weight", l);
-        w->up[l] = find_tensor(m, name, &w->up_t[l]);
+        ti = ti_must(m, name);
+        w->up[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, hidden, dim, name, w->up[l]);
         sprintf(name, "blk.%d.ffn_down.weight", l);
-        w->down[l] = find_tensor(m, name, &w->down_t[l]);
+        ti = ti_must(m, name);
+        w->down[l] = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+        bfpx_convert_weight_2d(m, ti, dim, hidden, name, w->down[l]);
     }
 
-    w->norm_out = (float *)find_tensor(m, "output_norm.weight", NULL);
-    w->out = find_tensor(m, "output.weight", &w->out_t);
-    if (!w->out) {
+    w->norm_out = dup_f32_tensor(m, "output_norm.weight");
+    TensorInfo *ti_out = ti_find(m, "output.weight");
+    if (!ti_out) {
         fprintf(stderr, "Error: output.weight missing (Qwen3-VL uses untied LM head)\n");
         exit(1);
     }
+    w->out = (BfpxMat *)calloc(1, sizeof(BfpxMat));
+    bfpx_convert_weight_2d(m, ti_out, c->vocab_size, dim, "output.weight", w->out);
 
-    if (!w->embd || !w->norm_out) {
+    if (!w->norm_out) {
         fprintf(stderr, "Error: missing critical tensors\n");
         exit(1);
     }
@@ -1464,6 +1847,17 @@ static void load_weights(Model *m) {
             exit(1);
         }
     }
+
+    size_t btot = bfpx_mat_bytes(w->embd) + bfpx_mat_bytes(w->out);
+    for (int l = 0; l < L; l++) {
+        btot += bfpx_mat_bytes(w->wq[l]) + bfpx_mat_bytes(w->wk[l]) + bfpx_mat_bytes(w->wv[l]) +
+                bfpx_mat_bytes(w->wo[l]) + bfpx_mat_bytes(w->gate[l]) + bfpx_mat_bytes(w->up[l]) +
+                bfpx_mat_bytes(w->down[l]);
+    }
+    printf("BFPX linear weights host RAM ~ %.2f MiB (blk=%d, BF16 scale + int8)\n",
+           btot / (1024.0 * 1024.0), BFPU_BLK);
+
+    model_drop_gguf_mmap(m);
 }
 
 static void alloc_state(State *s, Config *c) {
@@ -1491,13 +1885,45 @@ static void free_state(State *s) {
 }
 
 static void free_weight_ptrs(Weights *w, int L) {
-    free(w->norm_att); free(w->q_norm); free(w->k_norm);
-    free(w->wq); free(w->wq_t); free(w->wk); free(w->wk_t);
-    free(w->wv); free(w->wv_t); free(w->wo); free(w->wo_t);
+    bfpx_mat_destroy(w->embd);
+    free(w->embd);
+    bfpx_mat_destroy(w->out);
+    free(w->out);
+    if (w->norm_att) {
+        for (int l = 0; l < L; l++) {
+            free(w->norm_att[l]);
+            free(w->q_norm[l]);
+            free(w->k_norm[l]);
+            free(w->norm_ffn[l]);
+            bfpx_mat_destroy(w->wq[l]);
+            free(w->wq[l]);
+            bfpx_mat_destroy(w->wk[l]);
+            free(w->wk[l]);
+            bfpx_mat_destroy(w->wv[l]);
+            free(w->wv[l]);
+            bfpx_mat_destroy(w->wo[l]);
+            free(w->wo[l]);
+            bfpx_mat_destroy(w->gate[l]);
+            free(w->gate[l]);
+            bfpx_mat_destroy(w->up[l]);
+            free(w->up[l]);
+            bfpx_mat_destroy(w->down[l]);
+            free(w->down[l]);
+        }
+    }
+    free(w->norm_att);
+    free(w->q_norm);
+    free(w->k_norm);
+    free(w->wq);
+    free(w->wk);
+    free(w->wv);
+    free(w->wo);
     free(w->norm_ffn);
-    free(w->gate); free(w->gate_t); free(w->up); free(w->up_t); free(w->down); free(w->down_t);
+    free(w->gate);
+    free(w->up);
+    free(w->down);
+    free(w->norm_out);
     memset(w, 0, sizeof(*w));
-    (void)L;
 }
 
 static void rmsnorm(float *o, const float *x, const float *weight, int n, float eps) {
@@ -1530,170 +1956,6 @@ static void softmax(float *x, int n) {
         sum += x[i];
     }
     for (int i = 0; i < n; i++) x[i] /= sum;
-}
-
-static void mm_f32(float *o, const float *x, const float *w, int n, int d) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; i++) {
-        const float *row = w + (size_t)i * n;
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) val += x[j] * row[j];
-        o[i] = val;
-    }
-}
-
-static void mm_f16(float *o, const float *x, const uint16_t *w, int n, int d) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; i++) {
-        const uint16_t *row = w + (size_t)i * n;
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) val += x[j] * host_f16f32(row[j]);
-        o[i] = val;
-    }
-}
-
-static void mm_quant_rows(float *o, const float *x, const void *w, int n, int d, int type) {
-    if (n % QK_K) {
-        fprintf(stderr, "mm_quant_rows: n=%d not multiple of QK_K\n", n);
-        exit(1);
-    }
-    int nb = n / QK_K;
-    size_t row_sz = row_bytes_quant(type, n);
-    size_t bs = block_size_quant(type);
-    const uint8_t *wb = (const uint8_t *)w;
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; i++) {
-        float blk[QK_K];
-        const uint8_t *row = wb + (size_t)i * row_sz;
-        float val = 0.0f;
-        for (int b = 0; b < nb; b++) {
-            dequant_one_block_to(row + (size_t)b * bs, type, blk);
-            const float *xp = x + b * QK_K;
-            for (int j = 0; j < QK_K; j++) val += xp[j] * blk[j];
-        }
-        o[i] = val;
-    }
-}
-
-static void mm(float *o, const float *x, const void *w, int n, int d, int type) {
-    switch (type) {
-    case DT_F32: mm_f32(o, x, (const float *)w, n, d); break;
-    case DT_F16: mm_f16(o, x, (const uint16_t *)w, n, d); break;
-    case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S:
-        mm_quant_rows(o, x, w, n, d, type);
-        break;
-    default:
-        fprintf(stderr, "Unsupported tensor type %d in matmul\n", type);
-        exit(1);
-    }
-}
-
-static void mm_slice(float *o, const float *x, const void *w,
-                     int n, int row0, int nrows, int type) {
-    if (nrows <= 0) return;
-    switch (type) {
-    case DT_F32: {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int i = 0; i < nrows; i++) {
-            const float *row = (const float *)w + (size_t)(row0 + i) * (size_t)n;
-            float val = 0.0f;
-            for (int j = 0; j < n; j++) val += x[j] * row[j];
-            o[i] = val;
-        }
-        break;
-    }
-    case DT_F16: {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int i = 0; i < nrows; i++) {
-            const uint16_t *row = (const uint16_t *)w + (size_t)(row0 + i) * (size_t)n;
-            float val = 0.0f;
-            for (int j = 0; j < n; j++) val += x[j] * host_f16f32(row[j]);
-            o[i] = val;
-        }
-        break;
-    }
-    case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S: {
-        if (n % QK_K) {
-            fprintf(stderr, "mm_slice: n=%d not multiple of QK_K\n", n);
-            exit(1);
-        }
-        int nb = n / QK_K;
-        size_t row_sz = row_bytes_quant(type, n);
-        size_t bs = block_size_quant(type);
-        const uint8_t *wb = (const uint8_t *)w;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-        for (int i = 0; i < nrows; i++) {
-            float blk[QK_K];
-            const uint8_t *row = wb + (size_t)(row0 + i) * row_sz;
-            float val = 0.0f;
-            for (int b = 0; b < nb; b++) {
-                dequant_one_block_to(row + (size_t)b * bs, type, blk);
-                const float *xp = x + b * QK_K;
-                for (int j = 0; j < QK_K; j++) val += xp[j] * blk[j];
-            }
-            o[i] = val;
-        }
-        break;
-    }
-    default:
-        fprintf(stderr, "Unsupported tensor type %d in mm_slice\n", type);
-        exit(1);
-    }
-}
-
-static void dequant_rows_bf16(const void *w, int type, int n, int row0, int nrows,
-                              uint16_t *dst) {
-    if (n % QK_K) {
-        fprintf(stderr, "dequant_rows_bf16: n %% QK_K != 0\n");
-        exit(1);
-    }
-    int nb = n / QK_K;
-    size_t row_sz = row_bytes_quant(type, n);
-    size_t bs = block_size_quant(type);
-    const uint8_t *wb = (const uint8_t *)w;
-    float blk[QK_K];
-    for (int r = 0; r < nrows; r++) {
-        const uint8_t *row = wb + (size_t)(row0 + r) * row_sz;
-        uint16_t *drow = dst + (size_t)r * (size_t)n;
-        for (int b = 0; b < nb; b++) {
-            dequant_one_block_to(row + (size_t)b * bs, type, blk);
-            for (int j = 0; j < QK_K; j++)
-                drow[b * QK_K + j] = host_f32bf16(blk[j]);
-        }
-    }
-}
-
-static void stage_weight_rows_bf16(const void *w, int type, int n, int row0, int nrows,
-                                   uint16_t *dst) {
-    switch (type) {
-    case DT_F32: {
-        const float *wf = (const float *)w;
-        for (int r = 0; r < nrows; r++) {
-            const float *row = wf + (size_t)(row0 + r) * (size_t)n;
-            uint16_t *drow = dst + (size_t)r * (size_t)n;
-            for (int j = 0; j < n; j++) drow[j] = host_f32bf16(row[j]);
-        }
-        break;
-    }
-    case DT_F16: {
-        const uint16_t *wf = (const uint16_t *)w;
-        for (int r = 0; r < nrows; r++) {
-            const uint16_t *row = wf + (size_t)(row0 + r) * (size_t)n;
-            uint16_t *drow = dst + (size_t)r * (size_t)n;
-            for (int j = 0; j < n; j++) drow[j] = host_f32bf16(host_f16f32(row[j]));
-        }
-        break;
-    }
-    default:
-        dequant_rows_bf16(w, type, n, row0, nrows, dst);
-        break;
-    }
 }
 
 /* Prefer /dev/accel/accel* (documented amdxdna UAPI node); fallback renderDn.
@@ -2117,7 +2379,7 @@ static void npu_gemv_scratch_alloc(Model *m) {
     size_t isz = (size_t)max_n * sizeof(uint16_t);
     size_t osz = (size_t)chunk * sizeof(float);
 
-    printf("XDNA tiny: GEMV staging max BF16 weights %.2f MiB (chunk_rows=%d max_n=%d)\n",
+    printf("XDNA BFPX: GEMV staging max BF16 weights %.2f MiB (chunk_rows=%d max_n=%d)\n",
            wsz / (1024.0 * 1024.0), chunk, max_n);
 
     npu_create_bo(dev, &dev->gemv_w_bo,   AMDXDNA_BO_SHMEM, wsz);
@@ -2132,11 +2394,13 @@ static void f32_to_bf16_buf(const float *src, uint16_t *dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = host_f32bf16(src[i]);
 }
 
-static void launch_mm_xdna(Model *m, float *o, const float *x,
-                           const void *w, int n, int d, int type) {
+static void launch_mm_xdna(Model *m, float *o, const float *x, const BfpxMat *W) {
     XdnaDev *dev = &m->npu;
+    int n = W->n_in;
+    int d = W->n_out;
     if (!dev->have_device || dev->force_cpu || dev->fd < 0) {
-        mm(o, x, w, n, d, type);
+        mm_bfpx(o, x, W);
+        dev->cpu_gemv_calls++;
         return;
     }
 
@@ -2147,23 +2411,24 @@ static void launch_mm_xdna(Model *m, float *o, const float *x,
     if (!dev->gemv_w_bo.mapped || dev->gemv_w_bo.size < need_w ||
         !dev->gemv_in_bo.mapped || dev->gemv_in_bo.size < (size_t)n * sizeof(uint16_t) ||
         !dev->gemv_out_bo.mapped || dev->gemv_out_bo.size < (size_t)chunk * sizeof(float)) {
-        mm(o, x, w, n, d, type);
+        mm_bfpx(o, x, W);
+        dev->cpu_gemv_calls++;
         return;
     }
 
-    for (int row0 = 0; row0 < d; ) {
+    for (int row0 = 0; row0 < d;) {
         int cd = d - row0;
         if (cd > chunk) cd = chunk;
 
         GemvKernel *kern = gemv_kernel_get(dev, n, cd);
         if (!kern) {
-            mm_slice(o + row0, x, w, n, row0, cd, type);
+            mm_bfpx_slice(o + row0, x, W, row0, cd);
             dev->cpu_gemv_calls++;
             row0 += cd;
             continue;
         }
 
-        stage_weight_rows_bf16(w, type, n, row0, cd, (uint16_t *)dev->gemv_w_bo.mapped);
+        bfpx_rows_to_bf16(W, row0, cd, (uint16_t *)dev->gemv_w_bo.mapped);
         npu_sync_bo(dev, &dev->gemv_w_bo, SYNC_DIRECT_TO_DEVICE);
 
         f32_to_bf16_buf(x, (uint16_t *)dev->gemv_in_bo.mapped, n);
@@ -2178,7 +2443,7 @@ static void launch_mm_xdna(Model *m, float *o, const float *x,
         if (npu_submit_start_npu(dev, kern->insn_xdna, kern->insn_size,
                                  args, 3, &seq) != 0 ||
             npu_wait(dev, seq, 5ULL * 1000 * 1000 * 1000) != 0) {
-            mm_slice(o + row0, x, w, n, row0, cd, type);
+            mm_bfpx_slice(o + row0, x, W, row0, cd);
             dev->cpu_gemv_calls++;
         } else {
             npu_sync_bo(dev, &dev->gemv_out_bo, SYNC_DIRECT_FROM_DEVICE);
@@ -2189,38 +2454,13 @@ static void launch_mm_xdna(Model *m, float *o, const float *x,
     }
 }
 
-static void emb_lookup(float *o, const void *w, int type, int id, int dim) {
-    if (dim % QK_K && (type == DT_Q4_K || type == DT_Q5_K || type == DT_IQ2_S || type == DT_IQ3_S)) {
-        fprintf(stderr, "emb_lookup: dim %% QK_K != 0 for quant\n");
-        exit(1);
+static void emb_lookup(float *o, const BfpxMat *E, int id) {
+    if (id < 0 || id >= E->n_out) {
+        fprintf(stderr, "emb_lookup: token id %d out of range [0,%d)\n", id, E->n_out);
+        memset(o, 0, (size_t)E->n_in * sizeof(float));
+        return;
     }
-    switch (type) {
-    case DT_F32:
-        memcpy(o, (const float *)w + (size_t)id * dim, dim * sizeof(float));
-        break;
-    case DT_F16: {
-        const uint16_t *row = (const uint16_t *)w + (size_t)id * dim;
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < dim; i++) o[i] = host_f16f32(row[i]);
-        break;
-    }
-    case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S: {
-        int nb = dim / QK_K;
-        size_t row_sz = row_bytes_quant(type, dim);
-        size_t bs = block_size_quant(type);
-        const uint8_t *row = (const uint8_t *)w + (size_t)id * row_sz;
-        #pragma omp parallel for schedule(static)
-        for (int b = 0; b < nb; b++) {
-            float blk[QK_K];
-            dequant_one_block_to(row + (size_t)b * bs, type, blk);
-            memcpy(o + b * QK_K, blk, QK_K * sizeof(float));
-        }
-        break;
-    }
-    default:
-        fprintf(stderr, "Unsupported emb type %d\n", type);
-        exit(1);
-    }
+    bfpx_row_to_float(E, id, o);
 }
 
 static void apply_rope(float *vec, int n_heads, int head_dim, int pos, float theta) {
@@ -2252,14 +2492,14 @@ static void forward(Model *m, int token, int pos) {
     int max_seq  = c->max_seq;
     int hidden   = c->hidden_dim;
 
-    emb_lookup(s->x, w->embd, w->embd_t, token, dim);
+    emb_lookup(s->x, w->embd, token);
 
     for (int l = 0; l < c->n_layers; l++) {
         rmsnorm(s->xb, s->x, w->norm_att[l], dim, c->norm_eps);
 
-        launch_mm_xdna(m, s->q, s->xb, w->wq[l], dim, dim,    w->wq_t[l]);
-        launch_mm_xdna(m, s->k, s->xb, w->wk[l], dim, kv_dim, w->wk_t[l]);
-        launch_mm_xdna(m, s->v, s->xb, w->wv[l], dim, kv_dim, w->wv_t[l]);
+        launch_mm_xdna(m, s->q, s->xb, w->wq[l]);
+        launch_mm_xdna(m, s->k, s->xb, w->wk[l]);
+        launch_mm_xdna(m, s->v, s->xb, w->wv[l]);
 
         rmsnorm_head_inplace(s->q, w->q_norm[l], n_heads, hd, c->norm_eps);
         rmsnorm_head_inplace(s->k, w->k_norm[l], n_kv, hd, c->norm_eps);
@@ -2301,14 +2541,14 @@ static void forward(Model *m, int token, int pos) {
             }
         }
 
-        launch_mm_xdna(m, s->xb2, s->xb, w->wo[l], dim, dim, w->wo_t[l]);
+        launch_mm_xdna(m, s->xb2, s->xb, w->wo[l]);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
         rmsnorm(s->xb, s->x, w->norm_ffn[l], dim, c->norm_eps);
 
-        launch_mm_xdna(m, s->hb,  s->xb, w->gate[l], dim, hidden, w->gate_t[l]);
-        launch_mm_xdna(m, s->hb2, s->xb, w->up[l],   dim, hidden, w->up_t[l]);
+        launch_mm_xdna(m, s->hb, s->xb, w->gate[l]);
+        launch_mm_xdna(m, s->hb2, s->xb, w->up[l]);
 
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < hidden; i++) {
@@ -2317,13 +2557,13 @@ static void forward(Model *m, int token, int pos) {
             s->hb[i] = val * s->hb2[i];
         }
 
-        launch_mm_xdna(m, s->xb, s->hb, w->down[l], hidden, dim, w->down_t[l]);
+        launch_mm_xdna(m, s->xb, s->hb, w->down[l]);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
     rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
-    launch_mm_xdna(m, s->logits, s->x, w->out, dim, c->vocab_size, w->out_t);
+    launch_mm_xdna(m, s->logits, s->x, w->out);
 }
 
 static float rng_f32(uint64_t *state) {
@@ -2364,6 +2604,12 @@ static int sample_token(float *logits, int n, float temp, float topp, uint64_t *
     }
 
     ProbIdx *pi = (ProbIdx *)malloc(n * sizeof(ProbIdx));
+    if (!pi) {
+        int best = 0;
+        for (int i = 1; i < n; i++)
+            if (logits[i] > logits[best]) best = i;
+        return best;
+    }
     int np = 0;
     float cutoff = (1.0f - topp) / (n - 1);
     for (int i = 0; i < n; i++) {
@@ -2372,6 +2618,13 @@ static int sample_token(float *logits, int n, float temp, float topp, uint64_t *
             pi[np].idx = i;
             np++;
         }
+    }
+    if (np == 0) {
+        free(pi);
+        int best = 0;
+        for (int i = 1; i < n; i++)
+            if (logits[i] > logits[best]) best = i;
+        return best;
     }
     qsort(pi, np, sizeof(ProbIdx), cmp_prob_desc);
 
@@ -2456,7 +2709,7 @@ static void generate(Model *m, int *prompt, int n_prompt,
     printf("\n\n--- %d prompt tokens + %d generated tokens ---\n", n_prompt, gen);
     printf("--- %.1fs total (%.2f tok/s) ---\n", elapsed,
            (gen > 0) ? gen / elapsed : 0.0);
-    printf("--- XDNA tiny: %llu NPU GEMV chunk submits / %llu CPU GEMV chunk fallbacks ---\n",
+    printf("--- XDNA BFPX: %llu NPU GEMV chunk submits / %llu CPU matmul path ---\n",
            (unsigned long long)m->npu.npu_gemv_calls,
            (unsigned long long)m->npu.cpu_gemv_calls);
 }
@@ -2549,14 +2802,11 @@ int main(int argc, char *argv[]) {
     free(prompt_tokens);
     free_state(&model.s);
     free_weight_ptrs(&model.w, c->n_layers);
-    free(model.ti);
     free(model.tok.vocab);
     free(model.tok.vlen);
     free(model.tok.scores);
     free(model.tok.htab);
-    munmap(model.fdata, model.fsz);
     npu_close(&model.npu);
-    close(model.fd);
 
     return 0;
 }

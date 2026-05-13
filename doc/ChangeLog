@@ -4,6 +4,41 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-14 01:18:09
+
+**`README.md`**: 冒頭で **PyTorch・TensorFlow・JAX・ONNX Runtime** 等への非依存と、**標準 C / ROCm-HIP / OpenMP / `amdxdna` ioctl** の役割を明示。ROCm/HIP が NN フレームワークではない旨を補足。**「なぜライブラリ非依存なのか」** をフォーマルに整理（理解可能性・依存の単純化・実験の自由度・参照実装としての価値。主眼は性能網羅ではなく実装の観察・改造可能性）。
+
+**`doc/design.md`**: **`概要` → `リポジトリの目的とスコープ`** に README と整合するライブラリ非依存の範囲と **`ライブラリ非依存とその意義`** 小節を追加。**`補足：ドキュメント間の役割`** に **`README.md`** の位置づけを追記。
+
+- **`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-14 01:09:19
+
+**`qwen3-8b/main-xdna2-bfpx.c`** を追加（出力バイナリ **`qwen3-xdna2-bfpx`**、`make build.xdna2.bfpx`）。`main-xdna2.c` と同じ **amdxdna DRM ioctl + チャンク BF16 GEMV（`ERT_START_NPU`）** 経路を使うが、線形重みは GGUF mmap を長時間載せず、ロード時に **ブロック浮動小数点（各ブロックに BF16 スケール + int8 係数、`BFPU_BLK=64`）** に変換してホストに保持する。RMSNorm 等の小さいテンソルは従来どおり F32 をヒーブに複製。論理形状は **`main-omp.c` の `mm(o,x,w,n_in,n_out)`** と整合させ、`GGUF` が **`[n_in,n_out]`** と並んでいるテンソル（例: **`ffn_down`**）は転置レイアウトとしてフルデ量子化してから行単位でエンコードする。**`token_embd.weight` / `output.weight`** も同じ **`bfpx_convert_weight_2d`** で `[dim,vocab]` / IQ 時のストライド布局を吸収。
+
+### 実装ハイライト
+
+- **`BfpxMat` / `bfpx_convert_weight_2d`**: GEMV の `n_out × n_in` と GGUF の `(ne[0], ne[1])` を対応づけ。正方行列では転置 memcpy 分岐に誤入しないよう **`n_in != n_out`** でゲート。
+- **mmap の寿命**: `parse_gguf` → `load_weights`（変換）後 **`model_drop_gguf_mmap`** で tensor メタデータ・mmap・モデル fd を解放。
+- **堅牢性**: **`bfpx_mat_destroy`** は内側バッファのみ開放（構造体は **`free_weight_ptrs`** が開放）。**`sample_token`** の top-p で **`np==0`** のとき **`pi[-1]`** を読まないガード。**`emb_lookup`** のトークン ID 範囲チェック。
+- **NPU**: **`CREATE_HWCTX`** が失敗した環境でも **`npu_close` が fd=-1 で早期 return** する既存動作と整合（GEMV 未確保時の二重解放を避ける）。CREATE_HWCTX 失敗時は CPU **`mm_bfpx`** のみ。
+
+### 周辺更新
+
+- **`qwen3-8b/Makefile`**: **`build.xdna2.bfpx` / `run.xdna2.bfpx`**、`TARGET_XDNA2_BFPX`、`clean`。旧 **`build.xdna2.mmap`** は削除済み。
+- **`.gitignore`**: **`qwen3-xdna2-bfpx`**（旧 mmap バイナリ名は削除）。
+- **`doc/design.md`**: バリアント表・ファイル構成・Make ターゲット表・XDNA2 実行例・実行時挙動・XDNA2 メモに **`main-xdna2-bfpx.c`** を追記。
+- **`doc/ChangeLog`**: 本エントリ。
+
+### ビルド・実行
+
+```bash
+cd qwen3-8b
+make build.xdna2.bfpx
+./qwen3-xdna2-bfpx path/to/model.gguf -p "Hi" -n 8
+# NPU 制御コード・環境変数は main-xdna2.c と同様（XDNA_GEMV_DIR / XDNA_FORCE_CPU / XDNA_NUM_COL 等）
+```
+
 ## 2026-05-13 23:57:46
 
 **`qwen3-8b/main-xdna2.c`** を新規追加。AMD Ryzen AI 内蔵 **XDNA2 NPU** 用推論バックエンドを、`amdxdna` カーネルモジュール（`drivers/accel/amdxdna`）の DRM ioctl を直接叩く形で実装した。XRT (Xilinx Runtime) や xdna-driver の C++ shim 等の外部ユーザランドに依存しない単一 C ソース構成。

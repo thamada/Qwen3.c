@@ -5,7 +5,7 @@ TARGET_CPU                     = qwen3-cpu
 TARGET_CPU_OMP                 = qwen3-cpu-omp
 TARGET_ROCM                    = qwen3-rocm
 TARGET_XDNA2                   = qwen3-xdna2
-TARGET_XDNA2_TINY              = qwen3-xdna2-tiny
+TARGET_XDNA2_BFPX              = qwen3-xdna2-bfpx
 
 MODEL   ?= Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
@@ -57,15 +57,16 @@ build.xdna2:
 run.xdna2: build.xdna2
 	./$(TARGET_XDNA2) $(MODEL) -p "$(PROMPT)"
 
-# Low-host-RAM XDNA2 path: mmap quantized weights + chunked BF16 staging GEMV.
-build.xdna2.tiny:
+# Low-host-RAM XDNA2 path: convert linear weights to block FP16 (BF16 scale + int8)
+# on load; mmap GGUF only during conversion, then munmap. GEMV uses chunked BF16 staging.
+build.xdna2.bfpx:
 	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) \
-		-o $(TARGET_XDNA2_TINY) main-xdna2-tiny.c $(LDFLAGS)
+		-o $(TARGET_XDNA2_BFPX) main-xdna2-bfpx.c $(LDFLAGS)
 
-run.xdna2.tiny: build.xdna2.tiny
-	./$(TARGET_XDNA2_TINY) $(MODEL) -p "$(PROMPT)"
+run.xdna2.bfpx: build.xdna2.bfpx
+	./$(TARGET_XDNA2_BFPX) $(MODEL) -p "$(PROMPT)"
 
 clean:
-	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_XDNA2) $(TARGET_XDNA2_TINY)
+	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_XDNA2) $(TARGET_XDNA2_BFPX)
 
-.PHONY: build run build.omp run.omp build.rocm run.rocm build.xdna2 run.xdna2 build.xdna2.tiny run.xdna2.tiny clean
+.PHONY: build run build.omp run.omp build.rocm run.rocm build.xdna2 run.xdna2 build.xdna2.bfpx run.xdna2.bfpx clean
