@@ -1,72 +1,75 @@
+# CPU / OpenMP / XDNA2: CC・CFLAGS は make CC=clang CFLAGS=-O2 などで上書き可
 CC      ?= cc
 CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter
 LDFLAGS ?= -lm
-TARGET_CPU                     = qwen3-cpu
-TARGET_CPU_OMP                 = qwen3-cpu-omp
-TARGET_ROCM                    = qwen3-rocm
-TARGET_XDNA2                   = qwen3-xdna2
-TARGET_XDNA2_BFPX              = qwen3-xdna2-bfpx
 
+# 実行例で使う既定（runtime）
 MODEL   ?= Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
 
-ROCM    ?= /opt/rocm
-HIPCC   ?= $(ROCM)/bin/hipcc
-# gfx1201 = AMD Radeon AI PRO R9700 (matches the llama3-8b sibling target).
-GPU_ARCH ?= gfx1201
+# ROCM（HIP）
+ROCM     ?= /opt/rocm
+HIPCC    ?= $(ROCM)/bin/hipcc
+GPU_ARCH ?= gfx1201 # gfx1201 = AMD Radeon AI PRO R9700（llama3-8b 兄弟ターゲットと同じ）
 
-# Linux UAPI headers shipping <drm/drm.h>; on most distros installed under
-# /usr/include. Override e.g. XDNA_INCS=-I/path/to/linux-headers if you build
-# against an out-of-tree kernel.
+# XDNA2: Linux UAPI（<drm/drm.h>）。通常は追加不要。
+# カスタムカーネルヘッダに向けるときは例: XDNA_INCS=-I/path/to/linux-headers/usr/include
 XDNA_INCS ?=
 
-# CPU reference inference (llama3-8b/main.c 相当)
+# -----------------------------------------------------------------------------
+# CPU 参照実装（llama3-8b/main.c 相当）
+
 build:
-	$(CC) $(CFLAGS) -o $(TARGET_CPU) main.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o qwen3-cpu main.c $(LDFLAGS)
 
 run: build
-	./$(TARGET_CPU) $(MODEL) -p "$(PROMPT)"
+	./qwen3-cpu $(MODEL) -p "$(PROMPT)"
 
+# -----------------------------------------------------------------------------
 # OpenMP 並列（main-omp.c）
+
 build.omp:
-	$(CC) $(CFLAGS) -fopenmp -o $(TARGET_CPU_OMP) main-omp.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -fopenmp -o qwen3-cpu-omp main-omp.c $(LDFLAGS)
 
 run.omp: build.omp
-	./$(TARGET_CPU_OMP) $(MODEL) -p "$(PROMPT)"
+	./qwen3-cpu-omp $(MODEL) -p "$(PROMPT)"
 
-# Qwen3-VL-8B (IQ2_M) — text-only decoder, layer-fused, FlashAttention pipeline.
-# 既定エントリ: main-rocm.c（llama3-8b の main-rocm.c に相当する Make ターゲット名）
+# -----------------------------------------------------------------------------
+# AMD Radeon GPU（ROCm / HIP）。hipcc が GPU にオフロードするバックエンド。
+# ソースは main-rocm.c。Qwen3-VL-8B（IQ2_M）向けの text-only / fused layer / FA パイプライン。
+
 build.rocm:
 	$(HIPCC) -O3 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
 		--offload-arch=$(GPU_ARCH) \
 		-I$(ROCM)/include \
-		-o $(TARGET_ROCM) -x hip main-rocm.c \
+		-o qwen3-rocm -x hip main-rocm.c \
 		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib
 
 run.rocm: build.rocm
-	./$(TARGET_ROCM) $(MODEL) -p "$(PROMPT)"
+	./qwen3-rocm $(MODEL) -p "$(PROMPT)"
 
-# AMD Ryzen AI XDNA2 NPU backend — direct amdxdna DRM ioctl interface.
-# Requires Linux kernel >= 6.10 with the in-tree amdxdna driver and a
-# /dev/accel/accel0 node accessible to the running user. Without an NPU the
-# binary still runs, transparently falling back to an OpenMP CPU GEMV path.
+# -----------------------------------------------------------------------------
+# AMD Ryzen AI XDNA2 NPU（amdxdna DRM ioctl）。
+# Kernel >= 6.10、/dev/accel/accel0。NPU なしでも OpenMP CPU GEMV にフォールバック。
+
 build.xdna2:
-	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) \
-		-o $(TARGET_XDNA2) main-xdna2.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) -o qwen3-xdna2 main-xdna2.c $(LDFLAGS)
 
 run.xdna2: build.xdna2
-	./$(TARGET_XDNA2) $(MODEL) -p "$(PROMPT)"
+	./qwen3-xdna2 $(MODEL) -p "$(PROMPT)"
 
-# Low-host-RAM XDNA2 path: convert linear weights to block FP16 (BF16 scale + int8)
-# on load; mmap GGUF only during conversion, then munmap. GEMV uses chunked BF16 staging.
+# -----------------------------------------------------------------------------
+# 省ホスト RAM の XDNA2: 線形重み→ブロック FP16（BF16 スケール+int8）変換読み込み
+
 build.xdna2.bfpx:
-	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) \
-		-o $(TARGET_XDNA2_BFPX) main-xdna2-bfpx.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) -o qwen3-xdna2-bfpx main-xdna2-bfpx.c $(LDFLAGS)
 
 run.xdna2.bfpx: build.xdna2.bfpx
-	./$(TARGET_XDNA2_BFPX) $(MODEL) -p "$(PROMPT)"
+	./qwen3-xdna2-bfpx $(MODEL) -p "$(PROMPT)"
+
+# -----------------------------------------------------------------------------
 
 clean:
-	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_XDNA2) $(TARGET_XDNA2_BFPX)
+	rm -f qwen3-cpu qwen3-cpu-omp qwen3-rocm qwen3-xdna2 qwen3-xdna2-bfpx
 
 .PHONY: build run build.omp run.omp build.rocm run.rocm build.xdna2 run.xdna2 build.xdna2.bfpx run.xdna2.bfpx clean
