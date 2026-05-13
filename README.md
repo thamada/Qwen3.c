@@ -1,4 +1,4 @@
-# gguf.Qwen3.c
+# Qwen3.c
 
 Qwen3 系 GGUF モデルを、C 言語と ROCm/HIP で直接動かすための小さな推論実装です。
 
@@ -102,10 +102,12 @@ rocminfo | grep -m 1 gfx
 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ```
 
-モデルファイルはリポジトリに含まれない想定です。入手した GGUF ファイルを `qwen3-8b/` の直下に置いてください。
+モデルファイルは著作権とファイルサイズの都合により、リポジトリには含めません。各自で `qwen3-8b/gguf.txt` に記載してある URL から GGUF ファイルをダウンロードし、`qwen3-8b/` の直下に置いてください。
 
 ```bash
-cp /path/to/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf qwen3-8b/
+cd qwen3-8b
+url=$(sed 's|/blob/main/|/resolve/main/|' gguf.txt)
+wget -O Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf "$url"
 ```
 
 配置後、次のようになっていれば準備完了です。

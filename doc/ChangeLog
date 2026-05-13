@@ -1,0 +1,33 @@
+# 変更履歴
+
+> **注意**:
+>   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
+>   最も最新のものから順に並べて記入します。
+
+## 2026-05-13 23:12:27
+
+**`README.md`** のモデル配置手順を更新。プロジェクト見出しを **Qwen3.c** に整理し、GGUF 本体をリポジトリに含めない方針を明記したうえで、**`qwen3-8b/gguf.txt`** の Hugging Face URL から `blob/main` を `resolve/main` に置換して `wget` する手順を追加した。
+
+- **`doc/design.md`**: ファイル構成に **`qwen3-8b/gguf.txt`** を追加し、モデル参照節に取得元 URL と SHA256 確認の役割を反映。
+- **`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-13 22:57:14
+
+**`README.md`** を新規作成。Qwen3 系 GGUF テキスト推論エンジンとしての概要、必要環境、モデル配置、SHA256 確認、CPU / OpenMP / ROCm のビルド方法、推論実行方法、主要オプション、トラブルシューティング、実装を読む順序を初心者向けに整理した。
+
+- **`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-13 22:41:41
+
+**`qwen3-8b/`** の **CPU OpenMP** 実装（`main-omp.c`、`make build.omp` → `qwen3-cpu-omp`）および **`doc/design.md`** への **Qwen3-8B 専用節**の追記、`ChangeLog` の更新。
+
+### ソース・ビルド（既存の整理を文書化）
+
+- **`qwen3-8b/main-omp.c`**: `main.c` をベースに OpenMP を付与。**GEMV** は出力行並列、**Attention** はヘッド並列、**RoPE**・**RMSNorm**（全体／ヘッド）・残差・SiLU は `main-rocm.c` の並列単位に相当する粒度で並列化。
+- **`qwen3-8b/Makefile`**: `build.omp` / `run.omp`、**`clean`** に `qwen3-cpu-omp` を含む（既存）。
+
+### ドキュメント
+
+- **`doc/design.md`**: 概要に **`qwen3-8b/`** を現行ツリーとして明記。**[Qwen3-8B（`qwen3-8b/`）](#qwen3-8bqwen3-8b)** 節を追加（スコープ、`qwen3vl.*`、IQ デ量子化方針、Q/K norm、ChatML、`main.c` / `main-omp.c` / `main-rocm*.c`、Make ターゲットとバイナリ、ビルド例）。**ビルドと実行**に `qwen3-8b` 向け CPU/OpenMP/ROCm のサブ節を追加。
+- **`doc/ChangeLog`**: 本エントリ。
+

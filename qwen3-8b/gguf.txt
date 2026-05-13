@@ -1,0 +1,1 @@
+https://huggingface.co/bartowski/Qwen_Qwen3-VL-8B-Instruct-GGUF/blob/main/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
