@@ -1107,6 +1107,8 @@ typedef struct {
     uint32_t  aie_cols;
     uint32_t  aie_rows;
     uint32_t  aie_core_row_count; /* QUERY_AIE_METADATA.core.row_count */
+    uint32_t  aie_mem_row_count;  /* QUERY_AIE_METADATA.mem.row_count  */
+    uint32_t  aie_shim_row_count; /* QUERY_AIE_METADATA.shim.row_count */
     uint32_t  aie_version_major;
     uint32_t  aie_version_minor;
     uint32_t  fw_major, fw_minor, fw_patch, fw_build;
@@ -1635,6 +1637,64 @@ static void dequant_one_block_to_xdna(const void *blk, int type, float *dst) {
     }
 }
 
+/* Fused per-row quantized GEMV — same shape and parallelism as the omp build's
+ * mm_quant_rows().  Used when the NPU is unavailable so we avoid round-tripping
+ * every weight matrix through a BF16 SHMEM scratch on each call. */
+static void mm_quant_rows_xdna(float *o, const float *x,
+                               const void *w, int type, int n, int d) {
+    if (n % QK_K) XDNA_DIE("mm_quant_rows_xdna: n=%d not multiple of QK_K", n);
+    int nb = n / QK_K;
+    size_t row_sz = row_bytes_quant(type, n);
+    size_t bs     = block_size_quant(type);
+    const uint8_t *wb = (const uint8_t *)w;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < d; i++) {
+        float blk[QK_K];
+        const uint8_t *row = wb + (size_t)i * row_sz;
+        float val = 0.f;
+        for (int b = 0; b < nb; b++) {
+            dequant_one_block_to_xdna(row + (size_t)b * bs, type, blk);
+            const float *xp = x + b * QK_K;
+            for (int j = 0; j < QK_K; j++) val += xp[j] * blk[j];
+        }
+        o[i] = val;
+    }
+}
+
+static void mm_f32_xdna(float *o, const float *x, const float *w, int n, int d) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < d; i++) {
+        const float *row = w + (size_t)i * n;
+        float val = 0.f;
+        for (int j = 0; j < n; j++) val += x[j] * row[j];
+        o[i] = val;
+    }
+}
+
+static void mm_f16_xdna(float *o, const float *x, const uint16_t *w, int n, int d) {
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < d; i++) {
+        const uint16_t *row = w + (size_t)i * n;
+        float val = 0.f;
+        for (int j = 0; j < n; j++) val += x[j] * host_f16f32(row[j]);
+        o[i] = val;
+    }
+}
+
+/* True iff the runtime has any plausible chance of dispatching this GEMV on
+ * the NPU (device + hwctx present, NPU not forced off, and a ctrlcode dir is
+ * set so load_gemv_kernel() has somewhere to look). */
+static int npu_gemv_is_feasible(const XdnaDev *dev) {
+    return dev->have_device && !dev->force_cpu
+        && dev->gemv_dir && dev->gemv_dir[0] != '\0';
+}
+
 static void emb_lookup_xdna(float *o, const void *w, int type, int id, int dim) {
     if (dim % QK_K && (type == DT_Q4_K || type == DT_Q5_K || type == DT_IQ2_S || type == DT_IQ3_S))
         XDNA_DIE("emb_lookup: dim %% QK_K != 0 for quant");
@@ -1759,6 +1819,18 @@ static void load_weights_xdna(Model *m) {
 static void alloc_weight_scratch(Model *m) {
     if (m->gemv_max_elems == 0) XDNA_DIE("gemv_max_elems is zero");
     WeightsDev *wd = &m->wd;
+
+    /* No point keeping a ~1 GiB BF16 SHMEM BO + ~2 GiB FP32 staging when the
+     * NPU GEMV path will never be exercised this run (no device, force_cpu,
+     * or no ctrlcode directory): launch_mm_bf16 takes the quantized
+     * mm_quant_rows fast path instead. */
+    if (!npu_gemv_is_feasible(&m->npu)) {
+        printf("Alloc GEMV BF16 scratch: skipped (NPU GEMV not feasible — using quantized fast path)\n");
+        memset(&wd->w_scratch_bo, 0, sizeof(wd->w_scratch_bo));
+        wd->scratch_f32 = NULL;
+        return;
+    }
+
     size_t nbytes = m->gemv_max_elems * sizeof(uint16_t);
     printf("Alloc GEMV BF16 scratch: %zu elems (%.1f MiB BO) + FP32 staging (%.1f MiB)\n",
            m->gemv_max_elems,
@@ -1916,11 +1988,13 @@ static int npu_query_topology(XdnaDev *dev) {
     memset(&md, 0, sizeof(md));
     if (npu_get_info(dev, DRM_AMDXDNA_QUERY_AIE_METADATA, &md, sizeof(md)) < 0)
         return -1;
-    dev->aie_cols           = md.cols;
-    dev->aie_rows           = md.rows;
-    dev->aie_core_row_count = md.core.row_count;
-    dev->aie_version_major = md.version.major;
-    dev->aie_version_minor = md.version.minor;
+    dev->aie_cols            = md.cols;
+    dev->aie_rows            = md.rows;
+    dev->aie_core_row_count  = md.core.row_count;
+    dev->aie_mem_row_count   = md.mem.row_count;
+    dev->aie_shim_row_count  = md.shim.row_count;
+    dev->aie_version_major   = md.version.major;
+    dev->aie_version_minor   = md.version.minor;
 
     struct amdxdna_drm_query_firmware_version fw;
     memset(&fw, 0, sizeof(fw));
@@ -1953,11 +2027,36 @@ static void npu_create_bo(XdnaDev *dev, XdnaBo *bo, uint32_t type, size_t size) 
         bo->xdna_addr = (uint64_t)(uintptr_t)bo->mapped;
         return;
     }
+
+    /* The in-tree amdxdna driver rejects CREATE_BO with non-zero vaddr (see
+     * amdxdna_drm_create_bo_ioctl: `if (args->vaddr) return -EINVAL`).  Even
+     * DEV_HEAP is allocated as shmem internally, and its userptr field is
+     * populated when *userspace* mmaps the BO (amdxdna_hmm_register sets
+     * abo->mem.userptr = vma->vm_start).  CREATE_HWCTX then validates that
+     * userptr is no longer AMDXDNA_INVALID_ADDR.
+     *
+     * Therefore the protocol is:
+     *   1. CREATE_BO(type, size, vaddr=0)
+     *   2. GET_BO_INFO  (read map_offset, xdna_addr)
+     *   3. mmap(fd, size, ..., map_offset)   <-- registers userptr
+     *   4. CREATE_HWCTX
+     *
+     * We must *always* mmap shmem-backed types (SHMEM, DEV_HEAP, CMD), and
+     * not rely on the gi.vaddr returned by GET_BO_INFO — it can be
+     * AMDXDNA_INVALID_ADDR (~0UL) before mmap, which is falsely "truthy".
+     */
     struct amdxdna_drm_create_bo c;
     memset(&c, 0, sizeof(c));
-    c.size = size;
-    c.type = type;
-    XDNACHK(ioctl(dev->fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &c));
+    c.size  = size;
+    c.type  = type;
+    c.vaddr = 0;
+    c.flags = 0;
+
+    if (ioctl(dev->fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &c) < 0) {
+        int e = errno;
+        XDNA_DIE("CREATE_BO(type=%u size=%zu) failed: %s",
+                 type, size, strerror(e));
+    }
     bo->handle = c.handle;
     bo->size   = size;
     bo->type   = type;
@@ -1969,16 +2068,34 @@ static void npu_create_bo(XdnaDev *dev, XdnaBo *bo, uint32_t type, size_t size) 
     bo->map_offset = gi.map_offset;
     bo->xdna_addr  = gi.xdna_addr;
 
-    if (gi.vaddr) {
-        bo->mapped = (void *)(uintptr_t)gi.vaddr;
-    } else if (type != AMDXDNA_BO_DEV) {
+    if (type != AMDXDNA_BO_DEV) {
         void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                        dev->fd, (off_t)bo->map_offset);
         if (p == MAP_FAILED)
-            XDNA_DIE("mmap(BO handle=%u size=%zu offset=0x%llx) failed: %s",
-                     bo->handle, size,
+            XDNA_DIE("mmap(BO handle=%u type=%u size=%zu offset=0x%llx) failed: %s",
+                     bo->handle, type, size,
                      (unsigned long long)bo->map_offset, strerror(errno));
         bo->mapped = p;
+
+        /* For DEV_HEAP the firmware "map host buffer" command (opcode 0x106)
+         * walks the user-space VA range, so the pages must be present and
+         * stable.  Touch every page to force fault-in, then mlock the region
+         * so the kernel will not unmap it before CREATE_HWCTX has finished. */
+        if (type == AMDXDNA_BO_DEV_HEAP) {
+            volatile uint8_t *q = (volatile uint8_t *)p;
+            size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            if (!page) page = 4096;
+            for (size_t off = 0; off < size; off += page) q[off] = 0;
+            if (mlock(p, size) < 0) {
+                /* mlock failure is non-fatal but the firmware mapping may
+                 * still fail.  Surface a warning so callers can raise the
+                 * RLIMIT_MEMLOCK ulimit if needed. */
+                fprintf(stderr,
+                        "XDNA: warning: mlock(DEV_HEAP size=%zu) failed: %s "
+                        "— try `ulimit -l unlimited`\n",
+                        size, strerror(errno));
+            }
+        }
     }
 }
 
@@ -1989,7 +2106,7 @@ static void npu_destroy_bo(XdnaDev *dev, XdnaBo *bo) {
         memset(bo, 0, sizeof(*bo));
         return;
     }
-    if (bo->mapped && bo->mapped != (void *)(uintptr_t)bo->xdna_addr)
+    if (bo->mapped)
         munmap(bo->mapped, bo->size);
     struct drm_gem_close gc;
     memset(&gc, 0, sizeof(gc));
@@ -2059,62 +2176,114 @@ static void npu_open(XdnaDev *dev) {
 
     dev->have_device = 1;
 
-    /* Allocate per-context instruction buffer (64 MiB DEV_HEAP).  This is the
-     * arena into which we stage ctrlcode blobs and arg lists referenced by
-     * ERT_START_NPU packets. */
-    npu_create_bo(dev, &dev->insn_heap, AMDXDNA_BO_DEV_HEAP, 64UL * 1024 * 1024);
+    /* Allocate per-context instruction buffer (DEV_HEAP).  Drives the arena
+     * into which we stage ctrlcode blobs and arg lists referenced by
+     * ERT_START_NPU packets.
+     *
+     * The amdxdna firmware's MAP_HOST_BUFFER (opcode 0x106) is sensitive to
+     * the requested size — anything beyond what the running firmware/SoC was
+     * provisioned for is rejected with status 0x4000003 (the upstream limit
+     * is AIE2_DEVM_SIZE = 64 MiB).  Let the user override via XDNA_HEAP_SIZE
+     * (bytes) so a too-large default does not block bring-up. */
+    size_t heap_sz = 64UL * 1024 * 1024;
+    const char *xhs = getenv("XDNA_HEAP_SIZE");
+    if (xhs && atoll(xhs) > 0) heap_sz = (size_t)atoll(xhs);
+    npu_create_bo(dev, &dev->insn_heap, AMDXDNA_BO_DEV_HEAP, heap_sz);
     npu_create_bo(dev, &dev->umq_bo,    AMDXDNA_BO_SHMEM,    64UL * 1024);
     npu_create_bo(dev, &dev->log_bo,    AMDXDNA_BO_SHMEM,    64UL * 1024);
     npu_create_bo(dev, &dev->cmd_bo,    AMDXDNA_BO_CMD,      4096);
 
-    /* Create the hwctx bound to available AIE columns (driver may reject full md.cols). */
+    /* Create the hwctx bound to available AIE columns (driver may reject full md.cols).
+     *
+     * QoS sanity_check() in aie2_solver.c does:
+     *   request_gops = calculate_gops(qos) * sys_eff_factor
+     *   cgops        = max_opc * cu_clk_freq / 1000
+     *   if (request_gops > cgops) return -EINVAL
+     * With gops=30000, fps=1 the request is 30000 which trivially exceeds the
+     * device-capable cgops (~3686 GOPs for NPU2 at peak clock). Leaving all
+     * QoS fields at 0 makes the solver pick the max DPM level by default
+     * (`is_valid_qos_dpm_params` returns false → fall-through path).
+     */
     struct amdxdna_qos_info qos;
     memset(&qos, 0, sizeof(qos));
-    qos.gops              = 30000;
-    qos.fps               = 1;
-    qos.dma_bandwidth     = 0;
-    qos.latency           = 0;
-    qos.frame_exec_time   = 0;
-    qos.priority          = 0;
 
-    uint32_t nrow = dev->aie_core_row_count ? dev->aie_core_row_count : dev->aie_rows;
-    if (!nrow) nrow = 1;
+    /* aie2_hwctx_col_list() computes  num_col = num_tiles / metadata.core.row_count.
+     * The original upstream contract is therefore  num_tiles = ncol * core_rows.
+     * Some integrators also accept (shim + mem + core) per column, so we keep
+     * that as a fallback before degrading to 1 tile/col. */
+    uint32_t core_rows = dev->aie_core_row_count;
+    uint32_t mem_rows  = dev->aie_mem_row_count;
+    uint32_t shim_rows = dev->aie_shim_row_count;
+    if (!core_rows) core_rows = dev->aie_rows ? dev->aie_rows : 4;
 
-    uint32_t max_ncol = dev->aie_cols ? dev->aie_cols : 32;
+    uint32_t tiles_per_col_candidates[4];
+    int n_tiles_per_col = 0;
+    tiles_per_col_candidates[n_tiles_per_col++] = core_rows;
+    if (mem_rows + shim_rows)
+        tiles_per_col_candidates[n_tiles_per_col++] = core_rows + mem_rows + shim_rows;
+    if (core_rows != 1)
+        tiles_per_col_candidates[n_tiles_per_col++] = 1;
+
+    uint32_t max_ncol = dev->aie_cols ? dev->aie_cols : 8;
     const char *xncol = getenv("XDNA_NUM_COL");
     if (xncol && atoi(xncol) > 0)
         max_ncol = (uint32_t)atoi(xncol);
 
+    /* XDNA_NUM_TILES forces a specific num_tiles value (advanced override). */
+    uint32_t forced_num_tiles = 0;
+    const char *xtiles = getenv("XDNA_NUM_TILES");
+    if (xtiles && atoi(xtiles) > 0)
+        forced_num_tiles = (uint32_t)atoi(xtiles);
+
     struct amdxdna_drm_create_hwctx h;
     int last_errno = EINVAL;
     uint32_t ncol_ok = 0;
+    uint32_t tiles_ok = 0;
+    uint32_t per_col_ok = 0;
 
-    for (int ncol = (int)max_ncol; ncol >= 1; ncol--) {
-        memset(&h, 0, sizeof(h));
-        h.ext             = 0;
-        h.ext_flags       = 0;
-        h.qos_p           = (uint64_t)(uintptr_t)&qos;
-        h.umq_bo          = dev->umq_bo.handle;
-        h.log_buf_bo      = dev->log_bo.handle;
-        h.max_opc         = 0x800;
-        h.num_tiles       = (uint32_t)ncol * nrow;
-        h.mem_size        = 0;
+    for (int ti = 0; ti < n_tiles_per_col && !ncol_ok; ti++) {
+        uint32_t per_col = tiles_per_col_candidates[ti];
+        if (!per_col) continue;
 
-        if (ioctl(dev->fd, DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &h) == 0) {
-            dev->hwctx_handle   = h.handle;
-            dev->syncobj_handle = h.syncobj_handle;
-            ncol_ok = (uint32_t)ncol;
-            break;
+        for (int ncol = (int)max_ncol; ncol >= 1; ncol--) {
+            uint32_t num_tiles = forced_num_tiles
+                                 ? forced_num_tiles
+                                 : (uint32_t)ncol * per_col;
+
+            memset(&h, 0, sizeof(h));
+            h.ext             = 0;
+            h.ext_flags       = 0;
+            h.qos_p           = (uint64_t)(uintptr_t)&qos;
+            h.umq_bo          = dev->umq_bo.handle;
+            h.log_buf_bo      = dev->log_bo.handle;
+            h.max_opc         = 0x800;
+            h.num_tiles       = num_tiles;
+            h.mem_size        = 0;
+
+            if (ioctl(dev->fd, DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &h) == 0) {
+                dev->hwctx_handle   = h.handle;
+                dev->syncobj_handle = h.syncobj_handle;
+                ncol_ok    = (uint32_t)ncol;
+                tiles_ok   = num_tiles;
+                per_col_ok = per_col;
+                break;
+            }
+            last_errno = errno;
+
+            if (forced_num_tiles) break;
         }
-        last_errno = errno;
+        if (forced_num_tiles) break;
     }
 
     if (!ncol_ok) {
         fprintf(stderr,
-                "XDNA: CREATE_HWCTX failed ncol=1..%u nrow=%u errno=%d %s\n",
-                max_ncol, nrow, last_errno, strerror(last_errno));
+                "XDNA: CREATE_HWCTX failed for all (num_tiles_per_col x ncol) combos "
+                "(core=%u mem=%u shim=%u rows=%u cols=%u) — last errno=%d %s\n",
+                core_rows, mem_rows, shim_rows, dev->aie_rows, dev->aie_cols,
+                last_errno, strerror(last_errno));
         fprintf(stderr,
-                "XDNA: try XDNA_NUM_COL=1 or check dmesg (Invalid num_col / col list)\n");
+                "XDNA: try XDNA_NUM_COL=1, XDNA_NUM_TILES=<n>, or check dmesg "
+                "(amdxdna: invalid num_col / partition).\n");
         npu_destroy_bo(dev, &dev->cmd_bo);
         npu_destroy_bo(dev, &dev->log_bo);
         npu_destroy_bo(dev, &dev->umq_bo);
@@ -2125,10 +2294,12 @@ static void npu_open(XdnaDev *dev) {
         return;
     }
 
-    printf("XDNA: hwctx handle=%u syncobj=%u num_col=%u num_tiles=%u nrow=%u doorbell=0x%x | md cols=%u rows=%u core.row_count=%u\n",
+    printf("XDNA: hwctx handle=%u syncobj=%u num_col=%u num_tiles=%u tiles_per_col=%u "
+           "doorbell=0x%x | md cols=%u rows=%u core=%u mem=%u shim=%u\n",
            dev->hwctx_handle, dev->syncobj_handle,
-           ncol_ok, ncol_ok * nrow, nrow, h.umq_doorbell,
-           dev->aie_cols, dev->aie_rows, dev->aie_core_row_count);
+           ncol_ok, tiles_ok, per_col_ok, h.umq_doorbell,
+           dev->aie_cols, dev->aie_rows,
+           core_rows, mem_rows, shim_rows);
 }
 
 static void npu_close(XdnaDev *dev) {
@@ -2320,6 +2491,9 @@ static void weight_prepare_bf16(Model *m, const void *raw, int type, size_t nel)
     }
 
     uint16_t *dst = (uint16_t *)bo->mapped;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
     for (size_t i = 0; i < nel; i++) dst[i] = host_f32bf16(f32[i]);
 
     npu_sync_bo(&m->npu, bo, SYNC_DIRECT_TO_DEVICE);
@@ -2359,13 +2533,40 @@ static void f32_to_bf16(const float *src, uint16_t *dst, int n) {
 }
 
 /* Dispatch a BF16 GEMV. Quantized mmap weights → scratch BO, then tries NPU
- * (if available + kernel exists), else OpenMP CPU BF16 GEMV. */
+ * (if available + kernel exists), else OpenMP CPU BF16 GEMV.
+ *
+ * Fast paths:
+ *   - When NPU dispatch is not feasible at all (no device, force_cpu, or no
+ *     ctrlcode directory) we skip the full BF16 weight expansion entirely and
+ *     run the same fused per-row quantized GEMV that main-omp.c uses.  This
+ *     avoids paying ~(n*d) FP32 dequant + BF16 conversion + SYNC_BO cost on
+ *     every single linear layer of every token.
+ */
 static void launch_mm_bf16(Model *m, float *o, const float *x,
                            const void *w_raw, int w_type, int n, int d) {
+    XdnaDev *dev = &m->npu;
+
+    if (!npu_gemv_is_feasible(dev)) {
+        switch (w_type) {
+        case DT_F32:
+            mm_f32_xdna(o, x, (const float *)w_raw, n, d);
+            break;
+        case DT_F16:
+            mm_f16_xdna(o, x, (const uint16_t *)w_raw, n, d);
+            break;
+        case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S:
+            mm_quant_rows_xdna(o, x, w_raw, w_type, n, d);
+            break;
+        default:
+            XDNA_DIE("launch_mm_bf16 fallback: unsupported dtype %d", w_type);
+        }
+        dev->cpu_gemv_calls++;
+        return;
+    }
+
     size_t nel = (size_t)n * (size_t)d;
     weight_prepare_bf16(m, w_raw, w_type, nel);
 
-    XdnaDev *dev = &m->npu;
     const XdnaBo *w_bo = &m->wd.w_scratch_bo;
     const uint16_t *w_host = (const uint16_t *)w_bo->mapped;
 

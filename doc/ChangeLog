@@ -4,6 +4,18 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-14 04:03:53
+
+**`qwen3-8b/main-xdna2.c`**: NPU 経路の `amdxdna` UAPI 適合を全面修正。
+
+- **`CREATE_BO`**：`amdxdna_drm_create_bo_ioctl` は `args->vaddr != 0` を **無条件で `-EINVAL`** にするため、**常に `vaddr=0`** で発行。**`DEV_HEAP` の `userptr`** は **ユーザー側 `mmap()` 時**に `amdxdna_hmm_register` が `vma->vm_start` を記録する仕様なので、`GET_BO_INFO` の戻り `vaddr` 値（`AMDXDNA_INVALID_ADDR` = `~0UL` を返しうる）に依らず **`SHMEM` / `DEV_HEAP` / `CMD` は必ず `mmap()`** するよう経路を整理。`DEV_HEAP` は `MAP_HOST_BUFFER` 直前にページフォールトを起こすため**全頁タッチ＋`mlock()`**（失敗時は警告）。
+- **`CREATE_HWCTX`**：`aie2_solver.c::sanity_check` の `qos_meet` が **`gops=30000, fps=1`** で必ず失敗していた（`request_gops` が NPU の `max_opc × cu_clk` から導く `cgops ≈ 3686` を超過）ため、**`amdxdna_qos_info` を全フィールド 0** に変更（`is_valid_qos_dpm_params == false` で最大 DPM へフォールバック）。`num_tiles` は `aie2_hwctx_col_list` の契約に従い **`ncol × core.row_count` を最優先**、`shim + mem + core` 合算と `1` 行をフォールバックとして順次試行。**`XDNA_NUM_COL`** に加え **`XDNA_NUM_TILES`**（強制値）・**`XDNA_HEAP_SIZE`**（DEV_HEAP バイト数）の上書きを追加。失敗時のエラーログに `core/mem/shim` 行数と試行ヒントを表示。
+- **`launch_mm_bf16` の CPU フォールバック高速路**：NPU ディスパッチが**最初から不可**な条件（`have_device == 0`、`XDNA_FORCE_CPU`、`XDNA_GEMV_DIR` 未設定）では、GEMV ごとの **フル行列 BF16 展開・`SYNC_BO`・スクラッチ往復**を**省略**し、`main-omp.c` と同じ **ブロック単位の量子化直 GEMV**（`mm_quant_rows_xdna`／`mm_f32_xdna`／`mm_f16_xdna`）で出力するよう分岐。
+- **`alloc_weight_scratch` の条件化**：上記 NPU 不可条件では **`w_scratch_bo`（GEMV 最大の BF16 SHMEM、典型 1.2 GiB）と `scratch_f32`（典型 2.4 GiB）を確保せず**スキップ。
+- **`weight_prepare_bf16`**：BF16 量子化変換ループを `#pragma omp parallel for` で並列化。
+
+**`doc/design.md`** / **`doc/ChangeLog`**: 上記の追加環境変数と挙動を反映。
+
 ## 2026-05-14 03:28:55
 
 **`qwen3-8b/main-xdna2.c`**: **`print_xdna_gemv_ctrlcode_report`** を追加。`npu_open` 後に **`XDNA_FORCE_CPU`**・DRM オープン可否・**`XDNA_GEMV_DIR`**・テキスト経路 **6 形状**の **`bf16-gemv-<n>x<d>.bin`** の読み取り可否（フルパス付き）を標準出力へ一覧する。推論終了後は **NPU GEMV / CPU GEMV** 件数に加え、**すべて NPU／すべて CPU／混在**を短文で表示。コマンドライン **`--xdna-status`** / **`-X`** は GGUF パース・トークナイザ初期化・`npu_open` のみ行い当該レポート出力後に終了する（重みロード・生成なし）。
