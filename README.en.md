@@ -38,12 +38,12 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU single-thread | `qwen3-8b/main.c` | `qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/main-omp.c` | `qwen3-cpu-omp` | Faster CPU trials |
 | ROCm/HIP GPU | `qwen3-8b/main-rocm.c` | `qwen3-rocm` | Practical speed on AMD GPUs |
-| AMD Ryzen AI XDNA2 NPU (BF16 resident) | `qwen3-8b/main-xdna2.c` | `qwen3-xdna2` | NPU via direct `amdxdna` module ioctl |
+| AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/main-xdna2.c` | `qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **`main-omp.c`**; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/main-xdna2-bfpx.c` | `qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
 For an **overview of AMD XDNA** (design goals, tile-level architecture, generational changes, dtypes and accuracy, software stack, comparison with other NPUs, etc.), see the companion write-up: [thamada/xdna-overview](https://github.com/thamada/xdna-overview) (`main.md` plus a PDF).
 
-An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable token throughput, use ROCm/HIP or the XDNA2 NPU builds. If VRAM / resident DRAM is tight, **`qwen3-xdna2-bfpx`** may use **less resident memory** than **`qwen3-xdna2`** (conversion can still cause a large **load-time** peak).
+An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable token throughput, use ROCm/HIP or the XDNA2 NPU builds. **`qwen3-xdna2`** avoids **persistent BF16 copies of every layer**—it keeps quantized weights **mmap'd** (**`main-omp.c`**-style residency) and decodes **one GEMV matrix at a time** into a BF16 scratch for the NPU, so latency per matmul rises. For tighter residency or another host layout, **`qwen3-xdna2-bfpx`** converts to **BFPX** and drops the GGUF mmap after conversion (**large load-time peak possible**); output is **not** bit-aligned with **`qwen3-xdna2`**.
 
 ## Repository layout
 
@@ -329,7 +329,7 @@ make run.xdna2 PROMPT="Short explanation in English."
 
 ### XDNA2 + BFPX host weights (`qwen3-xdna2-bfpx`)
 
-`main-xdna2-bfpx.c` shares the **same DRM ioctl and chunked BF16 GEMV** as `main-xdna2.c`, but converts linear weights at load time to **BFPX (per-block BF16 scale + int8)** on the host and releases the GGUF mmap afterward. CPU fallback uses **`mm_bfpx`** (float activations × BFPX weights) and is **not numerically aligned** with `qwen3-xdna2`. Output **may be worse** than `qwen3-xdna2` due to quantization plus block approximation.
+`main-xdna2-bfpx.c` shares the **same DRM ioctl and chunked BF16 GEMV** as `main-xdna2.c`, but converts linear weights at load time to **BFPX (per-block BF16 scale + int8)** on the host and releases the GGUF mmap afterward. CPU fallback uses **`mm_bfpx`** (float activations × BFPX weights) and is **not numerically aligned** with `qwen3-xdna2`. Block approximation means **behavior differs** from **`qwen3-xdna2`**, which decodes quantized mmap weights into BF16 **on each GEMV**; neither quality nor speed dominates in all cases.
 
 ```bash
 cd qwen3-8b
@@ -345,8 +345,8 @@ make run.xdna2.bfpx PROMPT="Short explanation in English."
 
 ### Notes
 
-- **`qwen3-xdna2`**: Dequantizes weights to **BF16** and keeps them in DRM-visible buffers—about **~16 GB resident DDR** for an 8B model. Insufficient RAM may trigger the OOM killer.
-- **`qwen3-xdna2-bfpx`**: Inference residency is often **lighter** (BFPX + norm buffers), but **conversion** can **spike memory** (GGUF mmap plus temporary full-tensor buffers).
+- **`qwen3-xdna2`**: Linear weights stay **mmap'd** (**`main-omp.c`**-like). One **BF16 scratch** sized for the **largest text-path GEMV** (often **LM head / embedding scale**) may still require substantial **DRAM**. There is **no** persistent duplicate BF16 copy of **all** layers. Insufficient RAM can still kill the process or fail mmap/allocs.
+- **`qwen3-xdna2-bfpx`**: Inference residency is often dominated by **BFPX + norm buffers** with mmap released early, but **conversion** can **spike memory** (GGUF mmap plus temporary full-tensor staging).
 - On NPU runs you reserve AIE columns; other NPU workloads (e.g. Windows Studio Effects) may contend.
 
 ## Common CLI options
@@ -482,7 +482,7 @@ Suggested order:
 3. `qwen3-8b/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/main-omp.c` — OpenMP parallelization.
 5. `qwen3-8b/main-rocm.c` — GPU memory, HIP kernels, GPU sampling.
-6. `qwen3-8b/main-xdna2.c` / `qwen3-8b/main-xdna2-bfpx.c` — `amdxdna` ioctl, ERT/NPU GEMV, CPU fallback; BFPX: read `bfpx_convert_weight_2d` and the mmap release path.
+6. `qwen3-8b/main-xdna2.c` / `qwen3-8b/main-xdna2-bfpx.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **`main-xdna2.c`**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope
 

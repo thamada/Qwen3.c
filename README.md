@@ -38,12 +38,12 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/main.c` | `qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/main-omp.c` | `qwen3-cpu-omp` | CPU で少しでも速く試す |
 | ROCm/HIP GPU | `qwen3-8b/main-rocm.c` | `qwen3-rocm` | AMD GPU で実用的な速度を狙う |
-| AMD Ryzen AI XDNA2 NPU（BF16常駐） | `qwen3-8b/main-xdna2.c` | `qwen3-xdna2` | `amdxdna` カーネルモジュール直叩きで NPU を使う |
+| AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/main-xdna2.c` | `qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（`main-omp.c` 同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/main-xdna2-bfpx.c` | `qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
 **AMD XDNA の概要**（設計思想、アーキテクチャの基本構造とタイル、世代別の進化、データ型と精度、ソフトウェアスタック、他社 NPU との比較など）については、別リポジトリに解説記事としてまとめてあります：[thamada/xdna-overview](https://github.com/thamada/xdna-overview)（本文は `main.md`、PDF 付き）。
 
-8B 級モデルの CPU 実行は非常に重いです。最初の動作確認としては CPU でも試せますが、実用的な生成速度を期待する場合は ROCm/HIP 版または XDNA2 NPU 版を使う想定です。VRAM／常駐 DRAM が厳しい場合は **`qwen3-xdna2-bfpx`** が **`qwen3-xdna2`** より常駐が軽くなることがあります（ロード時ピークは別途発生します）。
+8B 級モデルの CPU 実行は非常に重いです。最初の動作確認としては CPU でも試せますが、実用的な生成速度を期待する場合は ROCm/HIP 版または XDNA2 NPU 版を使う想定です。`qwen3-xdna2` は **恒久の全重み BF16 複製をしない**構成のため、mmap と **最大 GEMV 用スクラッチ**に近い **`main-omp.c`** 寄りの常駐感になりやすい一方、**GEMV のたび全行列を復号**するためレイテンシは増えがちです。さらに常駐を絞ったい場合や別表現が必要な場合は **`qwen3-xdna2-bfpx`**（BFPX 変換後に mmap を解放。**ロードピークあり**。出力は `qwen3-xdna2` とビット一致しない）。
 
 ## ディレクトリ構成
 
@@ -327,7 +327,7 @@ make run.xdna2 PROMPT="日本語で短く説明してください。"
 
 ### XDNA2 + BFPX ホスト重み版（`qwen3-xdna2-bfpx`）
 
-`main-xdna2-bfpx.c` は、**`main-xdna2.c` と同一の DRM ioctl** および **チャンク構成の BF16 GEMV（NPU 経路の枠組み）** を用います。一方で、密な行列レイアウトの重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 の係数）** へ変換し、ホストメモリ上にのみ保持します。GGUF への mmap は、この変換が終わってから解放します。NPU が使えないときの CPU 側のフォールバックでは **`mm_bfpx`** が用いられ、活性値は単精度浮動小数点数のまま、BFPX 形式の重みとの一般行列ベクトル積を計算します。**`qwen3-xdna2` とビット単位で完全一致するとは限りません**。量子化に加えブロック近似の誤差があるため、**`qwen3-xdna2` に比べ出力が劣化することがあります**。
+`main-xdna2-bfpx.c` は、**`main-xdna2.c` と同一の DRM ioctl** および **チャンク構成の BF16 GEMV（NPU 経路の枠組み）** を用います。一方で、密な行列レイアウトの重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 の係数）** へ変換し、ホストメモリ上にのみ保持します。GGUF への mmap は、この変換が終わってから解放します。NPU が使えないときの CPU 側のフォールバックでは **`mm_bfpx`** が用いられ、活性値は単精度浮動小数点数のまま、BFPX 形式の重みとの一般行列ベクトル積を計算します。**`qwen3-xdna2` とビット単位で完全一致するとは限りません**。量子化に加えブロック近似の誤差があります。**GEMV で量子化 mmap から直接 BF16 へ展開する `qwen3-xdna2`** とは経路も誤差の立ち方も異なるため、品質の優劣はケースによります。
 
 ```bash
 cd qwen3-8b
@@ -343,8 +343,8 @@ make run.xdna2.bfpx PROMPT="日本語で短く説明してください。"
 
 ### 注意
 
-- **`qwen3-xdna2`**: 量子化重みをロード時に **BF16** に一括展開して NPU からも見える DRM バッファに常駐させるため、8B モデルでは **常駐 DDR が ~16 GB** 必要です。RAM が足りない場合は OOM Killer に落とされます。
-- **`qwen3-xdna2-bfpx`**: 推論中は BFPX とノルム用 F32 が中心で **常駐は軽め**になりやすい一方、**変換中**は GGUF mmap とフルテンソル用の一時バッファなどで **ピークメモリが大きくなります**。
+- **`qwen3-xdna2`**: 線形ウェイトは **mmap**（`main-omp.c` 相当）。GEMV に使う単一 BF16 スクラッチは **語彙×次元クラスの最大行列**サイズになり得るので、モデルサイズと **VRAM／DRAM に余裕**が必要になる場合があります。恒久の「全レイヤー BF16 二重複製」は行いません。RAM 不足では従来通りプロセスや mmap が失敗し得ます。
+- **`qwen3-xdna2-bfpx`**: 推論中は BFPX とノルム用 F32 が中心で mmap を早めに離せる一方、**変換中**は GGUF mmap とフルテンソル用の一時バッファなどで **ピークメモリが大きくなります**。
 - NPU 側で実行する場合は AIE 列を予約するため、同時に動いているほかの NPU ワークロード（Windows Studio Effects 等）と競合する可能性があります。
 
 ## よく使うオプション
@@ -491,7 +491,7 @@ make build.rocm GPU_ARCH=gfx1100
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
 6. `qwen3-8b/main-xdna2.c` / `qwen3-8b/main-xdna2-bfpx.c`  
-   `amdxdna` ioctl、ERT/NPU GEMV、CPU フォールバック。BFPX 版は `bfpx_convert_weight_2d` と mmap 解放パスを読む。
+   `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。`main-xdna2.c` は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
 
 ## このリポジトリで扱わないもの
 

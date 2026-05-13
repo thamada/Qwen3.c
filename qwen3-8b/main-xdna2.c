@@ -53,15 +53,15 @@
  *
  * For this reference inference engine the strategy is:
  *
- *  - At load time, dequantize *all* IQ2_S / IQ3_S / Q4_K / Q5_K weights to
- *    BF16 on the CPU (BF16 is XDNA2-native and roughly halves the bandwidth
- *    requirement vs. FP32 with negligible quality loss for inference).
- *  - Wrap each BF16 weight buffer as an AMDXDNA_BO_SHMEM buffer object that
- *    is *also* mapped into the NPU's DMA address space, so the per-token
- *    GEMV kernels can stream the weights directly from host memory through
- *    the column-local DMA engines.
- *  - Allocate per-layer SHMEM BOs for the activation vectors (small) and a
- *    single CMD BO that we recycle for each GEMV submission.
+ *  - Keep quantized / narrow weights in the mmap'd GGUF (same residency model
+ *    as main-omp.c — no BF16 duplication of every layer at rest).
+ *  - On each GEMV, dequantize the needed weight tensor into a single BF16 SHMEM
+ *    scratch BO (sized for the largest *text-stack* GEMV blob) plus a FP32 row
+ *    buffer reused for fused dequant staging; synchronize to the device and
+ *    stream from that scratch the same way as before.
+ *  - GEMV submits still allocate ephemeral SHMEM BOs for the activation row
+ *    and FP32 logits as before (small); the weight matrix DMA source is always
+ *    the reused scratch mapped as a single AMDXDNA_BO_SHMEM.
  *  - For each linear (GEMV) layer the host fills the input BO, builds an
  *    ERT_START_NPU command pointing at a precompiled BF16 GEMV ctrlcode
  *    living in the per-context Instruction Buffer, submits with EXEC_CMD,
@@ -1127,25 +1127,27 @@ typedef struct {
     uint64_t  cpu_gemv_calls;
 } XdnaDev;
 
-/* Device-resident weights.  Everything that goes through GEMV is stored as
- * BF16 in an XDNA SHMEM BO so that both the CPU fallback and the NPU
- * column-DMA can stream the same bytes; norms stay as plain F32 host buffers
- * (they are tiny and only touched by CPU code). */
+/* Text-path weights live in mmap (quantized dtypes like main-omp.c). RMSNorm /
+ * LM norm stay as mmap'd F32. Each GEMV dequantizes the weight matrix row-major
+ * into w_scratch_bf16 (SHMEM BO) on demand. */
 typedef struct {
-    XdnaBo   embd_bo;    /* BF16 [vocab, dim] */
-    uint16_t *embd;      /* mapped view */
-    float **norm_att;    /* per-layer F32 [dim] */
-    XdnaBo  *wq_bo, *wk_bo, *wv_bo, *wo_bo;
-    uint16_t **wq, **wk, **wv, **wo; /* per-layer BF16 mapped views */
-    float **q_norm;      /* per-layer F32 [head_dim] */
-    float **k_norm;      /* per-layer F32 [head_dim] */
-    float **norm_ffn;    /* per-layer F32 [dim] */
-    XdnaBo  *gate_bo, *up_bo, *down_bo;
-    uint16_t **gate, **up, **down;
-    float  *norm_out;    /* F32 [dim] */
-    XdnaBo   out_bo;     /* BF16 [vocab, dim] */
-    uint16_t *out;
-    int      tied_output;
+    void      *embd;    int embd_t;
+    float    **norm_att;
+    void     **wq;      int *wq_t;
+    void     **wk;      int *wk_t;
+    void     **wv;      int *wv_t;
+    void     **wo;      int *wo_t;
+    float    **q_norm;
+    float    **k_norm;
+    float    **norm_ffn;
+    void     **gate;    int *gate_t;
+    void     **up;      int *up_t;
+    void     **down;    int *down_t;
+    float     *norm_out;
+    void      *out;     int out_t;
+    int        tied_output;
+    XdnaBo     w_scratch_bo;
+    float     *scratch_f32;
 } WeightsDev;
 
 /* Activation / KV state.  Lives entirely in host memory: tokens are streamed
@@ -1170,6 +1172,8 @@ typedef struct {
     TensorInfo *ti;
     int nti;
     uint64_t doff;
+    /* Largest element count among text-path GEMV/embed tensors (excluding VL vision blobs). */
+    size_t gemv_max_elems;
     XdnaDev npu;
 } Model;
 
@@ -1188,21 +1192,6 @@ static size_t ti_nelements(const TensorInfo *ti) {
     uint64_t el = 1;
     for (int i = 0; i < ti->n_dims; i++) el *= ti->ne[i];
     return (size_t)el;
-}
-
-static size_t ti_nbytes(const TensorInfo *ti) {
-    size_t el = ti_nelements(ti);
-    switch (ti->type) {
-    case DT_F32:   return el * sizeof(float);
-    case DT_F16:   return el * sizeof(uint16_t);
-    case DT_Q4_K:  return (el / QK_K) * sizeof(BlockQ4_K);
-    case DT_Q5_K:  return (el / QK_K) * sizeof(BlockQ5_K);
-    case DT_IQ2_S: return (el / QK_K) * sizeof(BlockIQ2_S);
-    case DT_IQ3_S: return (el / QK_K) * sizeof(BlockIQ3_S);
-    default:
-        fprintf(stderr, "Error: unsupported tensor dtype %d\n", ti->type);
-        exit(1);
-    }
 }
 
 /* ================================================================
@@ -1593,198 +1582,235 @@ static int *chat_encode(Tok *tk, const char *prompt, int *out_n) {
 }
 
 /* ================================================================
- * Weight Loading: dequantize → FP16 staging → upload to device
+ * Weight Loading — mmap quantized tensors (main-omp.c parity) plus one
+ * reusable BF16 SHMEM scratch sized to the largest *text-stack* GEMV tensor.
  * ================================================================ */
 
-static const void *raw_tensor_ptr(Model *m, const TensorInfo *ti) {
-    return m->fdata + m->doff + ti->offset;
-}
-
-/* ================================================================
- * Weight Loading helpers — NPU side
- *
- *   Weights are dequantized once on the CPU into FP32, then converted
- *   to BF16 (which is the native XDNA2 vector type), and stored in an
- *   AMDXDNA_BO_SHMEM buffer object so that:
- *
- *     - the CPU can read it directly (the BO is mmap()'d into user space)
- *     - the NPU column-DMA engines can stream the same bytes during a
- *       GEMV submission via the xdna virtual address returned by the
- *       GET_BO_INFO ioctl.
- *
- *   Norm tensors are tiny (`dim` F32 elements per layer) and only touched
- *   by CPU code, so they are kept as plain host allocations.
- * ================================================================ */
-
-/* Forward declarations of the NPU device layer; defined further down. */
 static void npu_create_bo(XdnaDev *dev, XdnaBo *bo, uint32_t type, size_t size);
 static void npu_destroy_bo(XdnaDev *dev, XdnaBo *bo);
 
-static void upload_bf16_dequant(Model *m, const char *name, XdnaBo *bo,
-                                uint16_t **mapped_out,
-                                float *f32_buf, uint16_t *bf16_buf) {
-    TensorInfo *ti = ti_find(m, name);
-    if (!ti) { *mapped_out = NULL; memset(bo, 0, sizeof(*bo)); return; }
-    size_t nel = ti_nelements(ti);
-    const void *raw = raw_tensor_ptr(m, ti);
-
-    /* Dequantize to FP32 (or use as-is if already F32/F16). */
-    if (ti->type == DT_F32) {
-        memcpy(f32_buf, raw, nel * sizeof(float));
-    } else if (ti->type == DT_F16) {
-        const uint16_t *r = (const uint16_t *)raw;
-        for (size_t i = 0; i < nel; i++) f32_buf[i] = host_f16f32(r[i]);
-    } else {
-        if (nel % QK_K) XDNA_DIE("tensor %s nelements %zu not a multiple of QK_K", name, nel);
-        size_t nb = nel / QK_K;
-        switch (ti->type) {
-        case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)raw,  f32_buf, nb); break;
-        case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)raw,  f32_buf, nb); break;
-        case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)raw, f32_buf, nb); break;
-        case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)raw, f32_buf, nb); break;
-        default:
-            XDNA_DIE("unsupported dtype %d for tensor %s", ti->type, name);
-        }
-    }
-
-    /* FP32 -> BF16. */
-    for (size_t i = 0; i < nel; i++) bf16_buf[i] = host_f32bf16(f32_buf[i]);
-
-    /* Allocate SHMEM BO and copy. */
-    size_t nbytes = nel * sizeof(uint16_t);
-    npu_create_bo(&m->npu, bo, AMDXDNA_BO_SHMEM, nbytes);
-    if (!bo->mapped) XDNA_DIE("BO for %s was not mapped", name);
-    memcpy(bo->mapped, bf16_buf, nbytes);
-
-    *mapped_out = (uint16_t *)bo->mapped;
-}
-
-static float *upload_norm_f32(Model *m, const char *name) {
+static void *find_tensor_mmap(Model *m, const char *name, int *out_type) {
     TensorInfo *ti = ti_find(m, name);
     if (!ti) return NULL;
-    if (ti->type != DT_F32)
-        XDNA_DIE("tensor %s expected F32, got type=%d", name, ti->type);
-    size_t nb = ti_nbytes(ti);
-    float *p = (float *)aligned_alloc(64, (nb + 63) & ~(size_t)63);
-    if (!p) XDNA_DIE("aligned_alloc failed for %s (%zu bytes)", name, nb);
-    memcpy(p, raw_tensor_ptr(m, ti), nb);
-    return p;
+    if (out_type) *out_type = ti->type;
+    return (void *)(m->fdata + m->doff + ti->offset);
 }
 
-static void free_dev_weights(WeightsDev *wd, int L) {
-    extern Model *_xdna_active_model;
-    XdnaDev *dev = &_xdna_active_model->npu;
-    if (wd->embd_bo.handle) npu_destroy_bo(dev, &wd->embd_bo);
-    for (int l = 0; l < L; l++) {
-        free(wd->norm_att[l]);
-        npu_destroy_bo(dev, &wd->wq_bo[l]);
-        npu_destroy_bo(dev, &wd->wk_bo[l]);
-        npu_destroy_bo(dev, &wd->wv_bo[l]);
-        npu_destroy_bo(dev, &wd->wo_bo[l]);
-        free(wd->q_norm[l]);
-        free(wd->k_norm[l]);
-        free(wd->norm_ffn[l]);
-        npu_destroy_bo(dev, &wd->gate_bo[l]);
-        npu_destroy_bo(dev, &wd->up_bo[l]);
-        npu_destroy_bo(dev, &wd->down_bo[l]);
+static void bump_gemv_max(Model *m, const char *name) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) return;
+    size_t n = ti_nelements(ti);
+    if (n > m->gemv_max_elems) m->gemv_max_elems = n;
+}
+
+static size_t row_bytes_quant(int type, int n_in) {
+    int nb = n_in / QK_K;
+    switch (type) {
+    case DT_Q4_K:  return (size_t)nb * sizeof(BlockQ4_K);
+    case DT_Q5_K:  return (size_t)nb * sizeof(BlockQ5_K);
+    case DT_IQ2_S: return (size_t)nb * sizeof(BlockIQ2_S);
+    case DT_IQ3_S: return (size_t)nb * sizeof(BlockIQ3_S);
+    default: return 0;
     }
-    free(wd->norm_att); free(wd->wq_bo); free(wd->wk_bo); free(wd->wv_bo); free(wd->wo_bo);
-    free(wd->wq); free(wd->wk); free(wd->wv); free(wd->wo);
-    free(wd->q_norm); free(wd->k_norm);
-    free(wd->norm_ffn); free(wd->gate_bo); free(wd->up_bo); free(wd->down_bo);
-    free(wd->gate); free(wd->up); free(wd->down);
-    free(wd->norm_out);
-    if (wd->out_bo.handle && !wd->tied_output)
-        npu_destroy_bo(dev, &wd->out_bo);
-    memset(wd, 0, sizeof(*wd));
 }
 
-static size_t max_tensor_nelements(Model *m) {
-    size_t mx = 0;
-    for (int i = 0; i < m->nti; i++) {
-        size_t n = ti_nelements(&m->ti[i]);
-        if (n > mx) mx = n;
+static size_t block_size_quant(int type) {
+    switch (type) {
+    case DT_Q4_K:  return sizeof(BlockQ4_K);
+    case DT_Q5_K:  return sizeof(BlockQ5_K);
+    case DT_IQ2_S: return sizeof(BlockIQ2_S);
+    case DT_IQ3_S: return sizeof(BlockIQ3_S);
+    default: return 0;
     }
-    return mx;
 }
 
-/* Single-translation-unit pointer to the currently-being-initialized Model so
- * that free_dev_weights() can find the NPU device without changing the
- * signature shared with the ROCm variant. */
-Model *_xdna_active_model = NULL;
+static void dequant_one_block_to_xdna(const void *blk, int type, float *dst) {
+    switch (type) {
+    case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)blk,  dst, 1); break;
+    case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)blk,  dst, 1); break;
+    case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)blk, dst, 1); break;
+    case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)blk, dst, 1); break;
+    default:
+        XDNA_DIE("dequant_one_block_to: bad type %d", type);
+    }
+}
 
-static void upload_weights_npu(Model *m) {
+static void emb_lookup_xdna(float *o, const void *w, int type, int id, int dim) {
+    if (dim % QK_K && (type == DT_Q4_K || type == DT_Q5_K || type == DT_IQ2_S || type == DT_IQ3_S))
+        XDNA_DIE("emb_lookup: dim %% QK_K != 0 for quant");
+    switch (type) {
+    case DT_F32:
+        memcpy(o, (const float *)w + (size_t)id * dim, (size_t)dim * sizeof(float));
+        break;
+    case DT_F16: {
+        const uint16_t *row = (const uint16_t *)w + (size_t)id * dim;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int i = 0; i < dim; i++) o[i] = host_f16f32(row[i]);
+        break;
+    }
+    case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S: {
+        int nb = dim / QK_K;
+        size_t row_sz = row_bytes_quant(type, dim);
+        size_t bs = block_size_quant(type);
+        const uint8_t *row = (const uint8_t *)w + (size_t)id * row_sz;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int b = 0; b < nb; b++) {
+            float blk[QK_K];
+            dequant_one_block_to_xdna(row + (size_t)b * bs, type, blk);
+            memcpy(o + (size_t)b * QK_K, blk, QK_K * sizeof(float));
+        }
+        break;
+    }
+    default:
+        XDNA_DIE("Unsupported emb type %d", type);
+    }
+}
+
+static void load_weights_xdna(Model *m) {
     Config *c = &m->cfg;
-    int L = c->n_layers;
     WeightsDev *wd = &m->wd;
-    _xdna_active_model = m;
+    int L = c->n_layers;
 
-    size_t max_nel = max_tensor_nelements(m);
-    printf("Allocating dequant staging: max tensor = %zu elements (%.1f MiB F32 + %.1f MiB BF16)\n",
-           max_nel, (max_nel * 4.0) / (1024.0 * 1024.0), (max_nel * 2.0) / (1024.0 * 1024.0));
+    memset(wd, 0, sizeof(*wd));
+    m->gemv_max_elems = 0;
 
-    float    *f32  = (float    *)aligned_alloc(64, ((max_nel * sizeof(float))  + 63) & ~(size_t)63);
-    uint16_t *bf16 = (uint16_t *)aligned_alloc(64, ((max_nel * sizeof(uint16_t)) + 63) & ~(size_t)63);
-    if (!f32 || !bf16) XDNA_DIE("failed to allocate dequant staging buffers");
+    bump_gemv_max(m, "token_embd.weight");
+    bump_gemv_max(m, "output.weight");
 
-    wd->norm_att = (float **)calloc(L, sizeof(float *));
-    wd->wq_bo    = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->wk_bo    = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->wv_bo    = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->wo_bo    = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->wq       = (uint16_t **)calloc(L, sizeof(uint16_t *));
-    wd->wk       = (uint16_t **)calloc(L, sizeof(uint16_t *));
-    wd->wv       = (uint16_t **)calloc(L, sizeof(uint16_t *));
-    wd->wo       = (uint16_t **)calloc(L, sizeof(uint16_t *));
-    wd->q_norm   = (float **)calloc(L, sizeof(float *));
-    wd->k_norm   = (float **)calloc(L, sizeof(float *));
-    wd->norm_ffn = (float **)calloc(L, sizeof(float *));
-    wd->gate_bo  = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->up_bo    = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->down_bo  = (XdnaBo *)calloc(L, sizeof(XdnaBo));
-    wd->gate     = (uint16_t **)calloc(L, sizeof(uint16_t *));
-    wd->up       = (uint16_t **)calloc(L, sizeof(uint16_t *));
-    wd->down     = (uint16_t **)calloc(L, sizeof(uint16_t *));
-
-    printf("Uploading weights to NPU (dequantizing IQ2_S / IQ3_S / Q4_K / Q5_K -> BF16 SHMEM BOs)...\n");
-
-    upload_bf16_dequant(m, "token_embd.weight", &wd->embd_bo, &wd->embd, f32, bf16);
+    wd->embd = find_tensor_mmap(m, "token_embd.weight", &wd->embd_t);
     if (!wd->embd) XDNA_DIE("missing token_embd.weight");
+
+    wd->norm_att = (float **)calloc((size_t)L, sizeof(float *));
+    wd->q_norm   = (float **)calloc((size_t)L, sizeof(float *));
+    wd->k_norm   = (float **)calloc((size_t)L, sizeof(float *));
+    wd->wq       = (void **)calloc((size_t)L, sizeof(void *));
+    wd->wq_t     = (int *)calloc((size_t)L, sizeof(int));
+    wd->wk       = (void **)calloc((size_t)L, sizeof(void *));
+    wd->wk_t     = (int *)calloc((size_t)L, sizeof(int));
+    wd->wv       = (void **)calloc((size_t)L, sizeof(void *));
+    wd->wv_t     = (int *)calloc((size_t)L, sizeof(int));
+    wd->wo       = (void **)calloc((size_t)L, sizeof(void *));
+    wd->wo_t     = (int *)calloc((size_t)L, sizeof(int));
+    wd->norm_ffn = (float **)calloc((size_t)L, sizeof(float *));
+    wd->gate     = (void **)calloc((size_t)L, sizeof(void *));
+    wd->gate_t   = (int *)calloc((size_t)L, sizeof(int));
+    wd->up       = (void **)calloc((size_t)L, sizeof(void *));
+    wd->up_t     = (int *)calloc((size_t)L, sizeof(int));
+    wd->down     = (void **)calloc((size_t)L, sizeof(void *));
+    wd->down_t   = (int *)calloc((size_t)L, sizeof(int));
 
     char name[128];
     for (int l = 0; l < L; l++) {
-        sprintf(name, "blk.%d.attn_norm.weight", l);     wd->norm_att[l] = upload_norm_f32(m, name);
-        sprintf(name, "blk.%d.attn_q.weight", l);        upload_bf16_dequant(m, name, &wd->wq_bo[l], &wd->wq[l], f32, bf16);
-        sprintf(name, "blk.%d.attn_k.weight", l);        upload_bf16_dequant(m, name, &wd->wk_bo[l], &wd->wk[l], f32, bf16);
-        sprintf(name, "blk.%d.attn_v.weight", l);        upload_bf16_dequant(m, name, &wd->wv_bo[l], &wd->wv[l], f32, bf16);
-        sprintf(name, "blk.%d.attn_output.weight", l);   upload_bf16_dequant(m, name, &wd->wo_bo[l], &wd->wo[l], f32, bf16);
-        sprintf(name, "blk.%d.attn_q_norm.weight", l);   wd->q_norm[l]   = upload_norm_f32(m, name);
-        sprintf(name, "blk.%d.attn_k_norm.weight", l);   wd->k_norm[l]   = upload_norm_f32(m, name);
-        sprintf(name, "blk.%d.ffn_norm.weight", l);      wd->norm_ffn[l] = upload_norm_f32(m, name);
-        sprintf(name, "blk.%d.ffn_gate.weight", l);      upload_bf16_dequant(m, name, &wd->gate_bo[l], &wd->gate[l], f32, bf16);
-        sprintf(name, "blk.%d.ffn_up.weight", l);        upload_bf16_dequant(m, name, &wd->up_bo[l],   &wd->up[l],   f32, bf16);
-        sprintf(name, "blk.%d.ffn_down.weight", l);      upload_bf16_dequant(m, name, &wd->down_bo[l], &wd->down[l], f32, bf16);
+        sprintf(name, "blk.%d.attn_norm.weight", l);
+        wd->norm_att[l] = (float *)find_tensor_mmap(m, name, NULL);
+        sprintf(name, "blk.%d.attn_q.weight", l);
+        bump_gemv_max(m, name);
+        wd->wq[l] = find_tensor_mmap(m, name, &wd->wq_t[l]);
+        sprintf(name, "blk.%d.attn_k.weight", l);
+        bump_gemv_max(m, name);
+        wd->wk[l] = find_tensor_mmap(m, name, &wd->wk_t[l]);
+        sprintf(name, "blk.%d.attn_v.weight", l);
+        bump_gemv_max(m, name);
+        wd->wv[l] = find_tensor_mmap(m, name, &wd->wv_t[l]);
+        sprintf(name, "blk.%d.attn_output.weight", l);
+        bump_gemv_max(m, name);
+        wd->wo[l] = find_tensor_mmap(m, name, &wd->wo_t[l]);
+        sprintf(name, "blk.%d.attn_q_norm.weight", l);
+        wd->q_norm[l] = (float *)find_tensor_mmap(m, name, NULL);
+        sprintf(name, "blk.%d.attn_k_norm.weight", l);
+        wd->k_norm[l] = (float *)find_tensor_mmap(m, name, NULL);
+        sprintf(name, "blk.%d.ffn_norm.weight", l);
+        wd->norm_ffn[l] = (float *)find_tensor_mmap(m, name, NULL);
+        sprintf(name, "blk.%d.ffn_gate.weight", l);
+        bump_gemv_max(m, name);
+        wd->gate[l] = find_tensor_mmap(m, name, &wd->gate_t[l]);
+        sprintf(name, "blk.%d.ffn_up.weight", l);
+        bump_gemv_max(m, name);
+        wd->up[l] = find_tensor_mmap(m, name, &wd->up_t[l]);
+        sprintf(name, "blk.%d.ffn_down.weight", l);
+        bump_gemv_max(m, name);
+        wd->down[l] = find_tensor_mmap(m, name, &wd->down_t[l]);
+
         if (!wd->norm_att[l] || !wd->wq[l] || !wd->wk[l] || !wd->wv[l] ||
             !wd->wo[l] || !wd->q_norm[l] || !wd->k_norm[l] || !wd->norm_ffn[l] ||
             !wd->gate[l] || !wd->up[l] || !wd->down[l])
             XDNA_DIE("layer %d missing weight tensor", l);
-        if ((l + 1) % 8 == 0)
-            printf("  layer %d/%d uploaded\n", l + 1, L);
     }
 
-    wd->norm_out = upload_norm_f32(m, "output_norm.weight");
-    upload_bf16_dequant(m, "output.weight", &wd->out_bo, &wd->out, f32, bf16);
+    wd->norm_out = (float *)find_tensor_mmap(m, "output_norm.weight", NULL);
+    wd->out = find_tensor_mmap(m, "output.weight", &wd->out_t);
     if (!wd->out) {
-        /* Tied embedding fallback: reuse token_embd. */
         wd->out = wd->embd;
-        wd->out_bo = wd->embd_bo;
+        wd->out_t = wd->embd_t;
         wd->tied_output = 1;
     }
-    if (!wd->norm_out) XDNA_DIE("missing output_norm.weight");
 
-    free(f32);
-    free(bf16);
-    printf("Upload complete.\n");
+    if (!wd->norm_out || !wd->out)
+        XDNA_DIE("missing output tensors");
+
+    printf("Weights: mmap GGUF tensors (text GEMV max %zu elements → BF16 scratch)\n",
+           m->gemv_max_elems);
+}
+
+static void alloc_weight_scratch(Model *m) {
+    if (m->gemv_max_elems == 0) XDNA_DIE("gemv_max_elems is zero");
+    WeightsDev *wd = &m->wd;
+    size_t nbytes = m->gemv_max_elems * sizeof(uint16_t);
+    printf("Alloc GEMV BF16 scratch: %zu elems (%.1f MiB BO) + FP32 staging (%.1f MiB)\n",
+           m->gemv_max_elems,
+           nbytes / (1024.0 * 1024.0),
+           (double)(m->gemv_max_elems * sizeof(float)) / (1024.0 * 1024.0));
+
+    wd->scratch_f32 = (float *)aligned_alloc(64, ((m->gemv_max_elems * sizeof(float)) + 63) & ~(size_t)63);
+    if (!wd->scratch_f32) XDNA_DIE("scratch_f32 alloc failed");
+
+    memset(&wd->w_scratch_bo, 0, sizeof(wd->w_scratch_bo));
+    npu_create_bo(&m->npu, &wd->w_scratch_bo, AMDXDNA_BO_SHMEM, nbytes);
+    if (!wd->w_scratch_bo.mapped) XDNA_DIE("scratch BO not mapped");
+}
+
+static void free_tensor_index(Model *m) {
+    for (int i = 0; i < m->nti; i++)
+        free(m->ti[i].name);
+    free(m->ti);
+    m->ti = NULL;
+    m->nti = 0;
+}
+
+static void free_dev_weights(Model *m) {
+    int L = m->cfg.n_layers;
+    WeightsDev *wd = &m->wd;
+    XdnaDev *dev = &m->npu;
+
+    if (wd->w_scratch_bo.mapped || wd->w_scratch_bo.handle != 0)
+        npu_destroy_bo(dev, &wd->w_scratch_bo);
+    free(wd->scratch_f32);
+
+    free(wd->norm_att);
+    free(wd->wq);
+    free(wd->wq_t);
+    free(wd->wk);
+    free(wd->wk_t);
+    free(wd->wv);
+    free(wd->wv_t);
+    free(wd->wo);
+    free(wd->wo_t);
+    free(wd->q_norm);
+    free(wd->k_norm);
+    free(wd->norm_ffn);
+    free(wd->gate);
+    free(wd->gate_t);
+    free(wd->up);
+    free(wd->up_t);
+    free(wd->down);
+    free(wd->down_t);
+
+    memset(wd, 0, sizeof(*wd));
+    (void)L;
 }
 
 /* ================================================================
@@ -2262,6 +2288,43 @@ static int load_gemv_kernel(XdnaDev *dev, int n, int d, GemvKernel *out) {
  *   the original ROCm GEMV kernel where one warp handled one row.
  * ================================================================ */
 
+/* Dequantize a full row-major GEMV matrix from mmap'd GGUF weights into the
+ * model's single BF16 scratch BO (+ FP32 staging in scratch_f32). */
+static void weight_prepare_bf16(Model *m, const void *raw, int type, size_t nel) {
+    WeightsDev *wd = &m->wd;
+    XdnaBo *bo = &wd->w_scratch_bo;
+
+    if (!bo->mapped) XDNA_DIE("weight scratch BO not initialized");
+    if (!wd->scratch_f32) XDNA_DIE("scratch_f32 unset");
+    if (nel > SIZE_MAX / sizeof(uint16_t) || nel * sizeof(uint16_t) > bo->size)
+        XDNA_DIE("weight nel=%zu exceeds scratch (%zu bytes)", nel, (size_t)bo->size);
+
+    float *f32 = wd->scratch_f32;
+
+    if (type == DT_F32) {
+        memcpy(f32, raw, nel * sizeof(float));
+    } else if (type == DT_F16) {
+        const uint16_t *r = (const uint16_t *)raw;
+        for (size_t i = 0; i < nel; i++) f32[i] = host_f16f32(r[i]);
+    } else {
+        if (nel % QK_K) XDNA_DIE("quant weight nel %% QK_K != 0 (nel=%zu)", nel);
+        size_t nb = nel / QK_K;
+        switch (type) {
+        case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)raw,  f32, nb); break;
+        case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)raw,  f32, nb); break;
+        case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)raw, f32, nb); break;
+        case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)raw, f32, nb); break;
+        default:
+            XDNA_DIE("unsupported GEMV weight dtype %d", type);
+        }
+    }
+
+    uint16_t *dst = (uint16_t *)bo->mapped;
+    for (size_t i = 0; i < nel; i++) dst[i] = host_f32bf16(f32[i]);
+
+    npu_sync_bo(&m->npu, bo, SYNC_DIRECT_TO_DEVICE);
+}
+
 static void cpu_bf16_gemv(float *o, const float *x, const uint16_t *w,
                           int n, int d) {
 #ifdef _OPENMP
@@ -2295,12 +2358,16 @@ static void f32_to_bf16(const float *src, uint16_t *dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = host_f32bf16(src[i]);
 }
 
-/* Dispatch a BF16 GEMV. Tries NPU first (if available + kernel exists), then
- * falls back to the OpenMP CPU path. */
+/* Dispatch a BF16 GEMV. Quantized mmap weights → scratch BO, then tries NPU
+ * (if available + kernel exists), else OpenMP CPU BF16 GEMV. */
 static void launch_mm_bf16(Model *m, float *o, const float *x,
-                           const XdnaBo *w_bo, const uint16_t *w_host,
-                           int n, int d) {
+                           const void *w_raw, int w_type, int n, int d) {
+    size_t nel = (size_t)n * (size_t)d;
+    weight_prepare_bf16(m, w_raw, w_type, nel);
+
     XdnaDev *dev = &m->npu;
+    const XdnaBo *w_bo = &m->wd.w_scratch_bo;
+    const uint16_t *w_host = (const uint16_t *)w_bo->mapped;
 
     if (dev->have_device && !dev->force_cpu) {
         GemvKernel k;
@@ -2344,15 +2411,6 @@ static void launch_mm_bf16(Model *m, float *o, const float *x,
     }
     cpu_bf16_gemv(o, x, w_host, n, d);
     dev->cpu_gemv_calls++;
-}
-
-/* Embedding lookup: copy a single row out of the BF16 token_embd matrix. */
-static void launch_emb_bf16(float *o, const uint16_t *w, int id, int dim) {
-    const uint16_t *row = w + (size_t)id * dim;
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
-    for (int i = 0; i < dim; i++) o[i] = host_bf16f32(row[i]);
 }
 
 /* ================================================================
@@ -2491,14 +2549,14 @@ static void forward_xdna(Model *m, int token, int pos, int need_logits) {
     int hidden   = c->hidden_dim;
     int qdim     = n_heads * hd;
 
-    launch_emb_bf16(s->x, wd->embd, token, dim);
+    emb_lookup_xdna(s->x, wd->embd, wd->embd_t, token, dim);
 
     for (int l = 0; l < c->n_layers; l++) {
         launch_rmsnorm(s->xb, s->x, wd->norm_att[l], dim, c->norm_eps);
 
-        launch_mm_bf16(m, s->q, s->xb, &wd->wq_bo[l], wd->wq[l], dim, qdim);
-        launch_mm_bf16(m, s->k, s->xb, &wd->wk_bo[l], wd->wk[l], dim, kv_dim);
-        launch_mm_bf16(m, s->v, s->xb, &wd->wv_bo[l], wd->wv[l], dim, kv_dim);
+        launch_mm_bf16(m, s->q, s->xb, wd->wq[l], wd->wq_t[l], dim, qdim);
+        launch_mm_bf16(m, s->k, s->xb, wd->wk[l], wd->wk_t[l], dim, kv_dim);
+        launch_mm_bf16(m, s->v, s->xb, wd->wv[l], wd->wv_t[l], dim, kv_dim);
 
         launch_rmsnorm_head(s->q, wd->q_norm[l], n_heads, hd, c->norm_eps);
         launch_rmsnorm_head(s->k, wd->k_norm[l], n_kv,    hd, c->norm_eps);
@@ -2514,23 +2572,23 @@ static void forward_xdna(Model *m, int token, int pos, int need_logits) {
         launch_attn(s->xb, s->q, s->kc, s->vc, s->att,
                     loff, pos, n_heads, kv_mul, hd, kv_dim, max_seq);
 
-        launch_mm_bf16(m, s->xb2, s->xb, &wd->wo_bo[l], wd->wo[l], qdim, dim);
+        launch_mm_bf16(m, s->xb2, s->xb, wd->wo[l], wd->wo_t[l], qdim, dim);
         launch_vec_add(s->x, s->xb2, dim);
 
         launch_rmsnorm(s->xb, s->x, wd->norm_ffn[l], dim, c->norm_eps);
 
-        launch_mm_bf16(m, s->hb,  s->xb, &wd->gate_bo[l], wd->gate[l], dim, hidden);
-        launch_mm_bf16(m, s->hb2, s->xb, &wd->up_bo[l],   wd->up[l],   dim, hidden);
+        launch_mm_bf16(m, s->hb,  s->xb, wd->gate[l], wd->gate_t[l], dim, hidden);
+        launch_mm_bf16(m, s->hb2, s->xb, wd->up[l],   wd->up_t[l],   dim, hidden);
 
         launch_silu_mul(s->hb, s->hb2, hidden);
 
-        launch_mm_bf16(m, s->xb, s->hb, &wd->down_bo[l], wd->down[l], hidden, dim);
+        launch_mm_bf16(m, s->xb, s->hb, wd->down[l], wd->down_t[l], hidden, dim);
         launch_vec_add(s->x, s->xb, dim);
     }
 
     if (need_logits) {
         launch_rmsnorm(s->x, s->x, wd->norm_out, dim, c->norm_eps);
-        launch_mm_bf16(m, s->logits, s->x, &wd->out_bo, wd->out, dim, c->vocab_size);
+        launch_mm_bf16(m, s->logits, s->x, wd->out, wd->out_t, dim, c->vocab_size);
     }
 }
 
@@ -2757,9 +2815,7 @@ int main(int argc, char *argv[]) {
 
     init_tokenizer(&model.tok, merges, n_merges);
 
-    /* Initialize the XDNA2 NPU before allocating any BO-backed buffers so that
-     * upload_weights_npu can route through the NPU device whenever it is
-     * available. */
+    /* Open NPU first so GEMV scratch uses real SHMEM BOs when hardware exists. */
     npu_open(&model.npu);
     if (model.npu.have_device) {
         printf("XDNA2: NPU device opened (fd=%d)\n", model.npu.fd);
@@ -2778,7 +2834,9 @@ int main(int argc, char *argv[]) {
         printf("XDNA2: NPU device unavailable; running fully on CPU OpenMP fallback\n");
     }
 
-    upload_weights_npu(&model);
+    load_weights_xdna(&model);
+    alloc_weight_scratch(&model);
+    free_tensor_index(&model);
     alloc_state_cpu(&model);
 
     int n_prompt_tokens;
@@ -2789,7 +2847,7 @@ int main(int argc, char *argv[]) {
 
     free(prompt_tokens);
     free_state_cpu(&model);
-    free_dev_weights(&model.wd, c->n_layers);
+    free_dev_weights(&model);
     npu_close(&model.npu);
     munmap(model.fdata, model.fsz);
     close(model.fd);
