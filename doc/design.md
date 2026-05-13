@@ -29,7 +29,7 @@
 | `main-omp.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`main-rocm.c` のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
 | `main-rocm.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.rocm` の既定エントリ**。 |
 | `main-xdna2.c` | **AMD Ryzen AI NPU (XDNA2)** | ロード時に量子化重みを CPU で **BF16** に展開し、`amdxdna` カーネルモジュールの DRM ioctl（`/dev/accel/accelN`）で直接 BO に載せる。GEMV を NPU で実行し、RMSNorm/Qwen3 ヘッド RMSNorm/RoPE/Attention/SwiGLU/サンプリング等は CPU（OpenMP）で実行する**ハイブリッド構成**。XRT 等のユーザランド SDK を必要とせず、UAPI ヘッダ相当を inline で持つ自己完結ビルド。`/dev/accel/accelN` が利用不可な場合・GEMM/GEMV 制御コード未配置の場合は、bit-identical な OpenMP CPU フォールバックに透過的に切り替わる。 |
-| `main-xdna2-bfpx.c` | **AMD Ryzen AI NPU (XDNA2) + BFPX ホスト重み** | **`main-xdna2.c` と同じ DRM ioctl・チャンク BF16 GEMV パイプライン**を共有するが、線形重みはロード時に **ブロック FP（BF16 スケール + int8、ブロック長 64）** に変換してホストに保持する（GGUF mmap は変換後に解放）。**論理形状は `main-omp.c` の `mm(..., n_in, n_out)` と一致**させ、`[n_in,n_out]` 型の GGUF 転置は **`bfpx_convert_weight_2d`** で吸収。精度は量子化に加えブロック近似があるため **`main-xdna2.c` より劣化しうる**。NPU 不可時は **`mm_bfpx`（float 活性 × BFPX 重み）** のみ。 |
+| `main-xdna2-bfpx.c` | **AMD Ryzen AI NPU (XDNA2) + BFPX ホスト重み** | **`main-xdna2.c` と同一の DRM ioctl** および **チャンク BF16 GEMV（NPU 経路の枠組み）** を共有する。**密行列レイアウト**の重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 係数、ブロック長 64）** に変換しホストのみ保持し、GGUF mmap は変換完了後に解放する。**論理形状は `main-omp.c` の `mm(..., n_in, n_out)` と一致**させ、`[n_in,n_out]` 型の GGUF 転置は **`bfpx_convert_weight_2d`** で吸収。量子化に加えブロック近似のため **`main-xdna2.c` と同一ビットでの一致は期待できず**、`main-xdna2.c` より品質が劣ることがある。NPU 不可時の CPU は **`mm_bfpx`** が単精度浮動小数点数の活性と BFPX 形式の重みの積を計算する。 |
 
 メタデータキーは **`qwen3vl.*`**。Qwen3 固有として、線形射影の直後に **`attn_q_norm` / `attn_k_norm`**（ヘッド長に対する RMSNorm）を挟み、その後 **RoPE** を適用する。チャットは **ChatML**（`<|im_start|>` / `<|im_end|>` 等）。
 
@@ -43,7 +43,7 @@
 | `qwen3-8b/main-omp.c` | CPU OpenMP 並列推論。 |
 | `qwen3-8b/main-rocm.c` | ROCm 推論（既定の HIP ビルド対象）。 |
 | `qwen3-8b/main-xdna2.c` | AMD Ryzen AI（XDNA2）NPU 推論。`amdxdna` カーネルモジュール直叩き。 |
-| `qwen3-8b/main-xdna2-bfpx.c` | 同上パイプラインだが線形重みを **BFPX（BF16 スケール + int8）** でホスト常駐、mmap は変換後解放。 |
+| `qwen3-8b/main-xdna2-bfpx.c` | **`main-xdna2.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
 | `qwen3-8b/Makefile` | 各ソース向け **`build*` / `run*` / `clean`**。**`qwen3-*`** 出力名はレシピに直書き（**`TARGET_*` は使わない**）。上書き用 **`?=` 変数**は下記「共通」を参照（**`.PHONY` / `clean` は複数行で列挙**）。 |
 | `doc/design.md` | 本書。 |
 | `doc/ChangeLog` | 変更履歴。 |
@@ -140,7 +140,7 @@ make build.xdna2.bfpx
 
 **XDNA2（`qwen3-xdna2`）**: ロード時に量子化重みを CPU で **BF16** に展開し、`AMDXDNA_BO_SHMEM` 型の DRM バッファオブジェクトに格納する（`/dev/accel/accelN` 経由）。各 GEMV ステップごとに、入力 BF16 ベクトル・重み BO・出力バッファのアドレスを `ERT_START_NPU` パケットに詰めて `DRM_IOCTL_AMDXDNA_EXEC_CMD` で NPU マイクロコントローラ（MERT/ERT）に投げ、`drm_syncobj_timeline_wait` で完了を待つ。RMSNorm、Qwen3 ヘッド RMSNorm、RoPE、Attention、SwiGLU、サンプリングはホスト CPU 上で実行する。NPU が使えない場合（`/dev/accel` を開けない、`XDNA_FORCE_CPU=1`、GEMV 制御コードが未配置）には bit-identical な OpenMP BF16 GEMV にシームレスに切り替わる。
 
-**XDNA2 + BFPX（`qwen3-xdna2-bfpx`）**: IOCTL・チャンク GEMV の流れは **`qwen3-xdna2`** と同じだが、DRM BO に載せるのではなく **ホスト上の BFPX バッファ**から、チャンクごとに BF16 へ展開して SHMEM BO にステージングする。活性は float のままなので CPU 側 GEMV は **`mm_bfpx`**（NPU 不可時はこれのみ）。**ロード時ピーク**では GGUF のフル mmap とフルテンソル用の一時 F32 が必要になることがある。精度は量子化＋ブロック近似の影響で **`qwen3-xdna2` の BF16 常駐より劣化しうる**。
+**XDNA2 + BFPX（`qwen3-xdna2-bfpx`）**: IOCTL 系列および **チャンク BF16 GEMV（NPU 経路の枠組み）** は **`qwen3-xdna2`** と同様。ただし常駐重みは **ホストの BFPX バッファ**とし、各チャンクを BF16 に展開して SHMEM BO へステージングしてから NPU に載せる。NPU が使えないときの CPU 側は **`mm_bfpx`** が、単精度浮動小数点数の活性と BFPX 形式の重みとで一般行列ベクトル積を計算する（常に CPU のみになる場合もある）。GGUF mmap は線形～BFPX 変換の完了後に解放する。**ロード時ピーク**には GGUF 全体の mmap とフルテンソル換算の一時 F32 などが乗り、メモリを大きく使う。**`qwen3-xdna2` と出力がビット単位で完全一致するとは限らない**。量子化に加えブロック近似があるため **`qwen3-xdna2` の BF16 常駐に比べ出力が劣化することがある**。
 
 ## コマンドラインオプション
 
@@ -374,7 +374,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 - **重みのレイアウト**: 量子化重みをロード時に CPU で BF16 に展開し、`AMDXDNA_BO_SHMEM` BO に常駐させる。norm 系は CPU 上の通常メモリに留める（小さいため）。
 - **CPU 上の処理**: RMSNorm、Qwen3 ヘッド RMSNorm、RoPE、KV cache 書き込み、FlashAttention 相当、SwiGLU、残差加算、softmax、サンプリングをすべて OpenMP で並列化（`main-omp.c` と同じ粒度）。
 
-NPU 上で実際に高速 GEMV を回すには **MLIR-AIE / IRON** で生成した形状 `(n, d)` 専用 BF16 GEMV 制御コードバイナリが必要（本リポジトリには同梱しない）。バイナリ未配置時は OpenMP CPU 経路にフォールバックする（**`qwen3-xdna2`** は BF16 経路、**`qwen3-xdna2-bfpx`** は **`mm_bfpx`**。bit-identical は保証しない）。
+NPU 上で実際に高速 GEMV を回すには **MLIR-AIE / IRON** で生成した形状 `(n, d)` 専用 BF16 GEMV 制御コードバイナリが必要（本リポジトリには同梱しない）。バイナリ未配置などで CPU に落ちる際、**`qwen3-xdna2`** は BF16 GEMV を OpenMP で実行する（実装では NPU 経路との **bit-identical** が謳われている。**`main-xdna2.c` の先頭コメント**参照）。一方 **`qwen3-xdna2-bfpx`** は **`mm_bfpx`** であり、出力が **`qwen3-xdna2` とビット単位では一致しない**。
 
 ### `main-xdna2-bfpx.c`（BFPX）メモ
 

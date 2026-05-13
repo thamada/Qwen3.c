@@ -23,7 +23,7 @@ So this is **not** aimed at maximum performance or full feature parity. The focu
 
 ---
 
-A small inference implementation that runs Qwen3-family GGUF models directly in **C** and **ROCm/HIP**.
+A small inference implementation that runs Qwen3-family GGUF models from **straightforward C sources** under `qwen3-8b/`. Paths include **CPU**, **OpenMP**, **ROCm/HIP on AMD GPUs**, and **AMD Ryzen AI XDNA2 NPU** (direct **`amdxdna` DRM ioctl** usage).
 
 The scope is the **text decoder of Qwen3-VL-8B-Instruct**. Image input and the vision encoder are **out of scope**; use cases are prompt-in, text-out generation.
 
