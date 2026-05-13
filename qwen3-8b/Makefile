@@ -5,6 +5,7 @@ TARGET_CPU                     = qwen3-cpu
 TARGET_CPU_OMP                 = qwen3-cpu-omp
 TARGET_ROCM                    = qwen3-rocm
 TARGET_XDNA2                   = qwen3-xdna2
+TARGET_XDNA2_TINY              = qwen3-xdna2-tiny
 
 MODEL   ?= Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
@@ -56,7 +57,15 @@ build.xdna2:
 run.xdna2: build.xdna2
 	./$(TARGET_XDNA2) $(MODEL) -p "$(PROMPT)"
 
-clean:
-	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_XDNA2)
+# Low-host-RAM XDNA2 path: mmap quantized weights + chunked BF16 staging GEMV.
+build.xdna2.tiny:
+	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) \
+		-o $(TARGET_XDNA2_TINY) main-xdna2-tiny.c $(LDFLAGS)
 
-.PHONY: build run build.omp run.omp build.rocm run.rocm build.xdna2 run.xdna2 clean
+run.xdna2.tiny: build.xdna2.tiny
+	./$(TARGET_XDNA2_TINY) $(MODEL) -p "$(PROMPT)"
+
+clean:
+	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_XDNA2) $(TARGET_XDNA2_TINY)
+
+.PHONY: build run build.omp run.omp build.rocm run.rocm build.xdna2 run.xdna2 build.xdna2.tiny run.xdna2.tiny clean
