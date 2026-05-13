@@ -4,6 +4,7 @@ LDFLAGS ?= -lm
 TARGET_CPU                     = qwen3-cpu
 TARGET_CPU_OMP                 = qwen3-cpu-omp
 TARGET_ROCM                    = qwen3-rocm
+TARGET_XDNA2                   = qwen3-xdna2
 
 MODEL   ?= Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
@@ -12,6 +13,11 @@ ROCM    ?= /opt/rocm
 HIPCC   ?= $(ROCM)/bin/hipcc
 # gfx1201 = AMD Radeon AI PRO R9700 (matches the llama3-8b sibling target).
 GPU_ARCH ?= gfx1201
+
+# Linux UAPI headers shipping <drm/drm.h>; on most distros installed under
+# /usr/include. Override e.g. XDNA_INCS=-I/path/to/linux-headers if you build
+# against an out-of-tree kernel.
+XDNA_INCS ?=
 
 # CPU reference inference (llama3-8b/main.c 相当)
 build:
@@ -39,7 +45,18 @@ build.rocm:
 run.rocm: build.rocm
 	./$(TARGET_ROCM) $(MODEL) -p "$(PROMPT)"
 
-clean:
-	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM)
+# AMD Ryzen AI XDNA2 NPU backend — direct amdxdna DRM ioctl interface.
+# Requires Linux kernel >= 6.10 with the in-tree amdxdna driver and a
+# /dev/accel/accel0 node accessible to the running user. Without an NPU the
+# binary still runs, transparently falling back to an OpenMP CPU GEMV path.
+build.xdna2:
+	$(CC) $(CFLAGS) -fopenmp $(XDNA_INCS) \
+		-o $(TARGET_XDNA2) main-xdna2.c $(LDFLAGS)
 
-.PHONY: build run build.omp run.omp build.rocm run.rocm clean
+run.xdna2: build.xdna2
+	./$(TARGET_XDNA2) $(MODEL) -p "$(PROMPT)"
+
+clean:
+	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_XDNA2)
+
+.PHONY: build run build.omp run.omp build.rocm run.rocm build.xdna2 run.xdna2 clean

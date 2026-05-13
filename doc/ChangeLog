@@ -4,6 +4,36 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-13 23:57:46
+
+**`qwen3-8b/main-xdna2.c`** を新規追加。AMD Ryzen AI 内蔵 **XDNA2 NPU** 用推論バックエンドを、`amdxdna` カーネルモジュール（`drivers/accel/amdxdna`）の DRM ioctl を直接叩く形で実装した。XRT (Xilinx Runtime) や xdna-driver の C++ shim 等の外部ユーザランドに依存しない単一 C ソース構成。
+
+### 実装ハイライト
+
+- **UAPI セルフコンテイン**: `<drm/amdxdna_accel.h>` 相当（`amdxdna_drm_create_hwctx` / `amdxdna_drm_create_bo` / `amdxdna_drm_get_bo_info` / `amdxdna_drm_sync_bo` / `amdxdna_drm_exec_cmd` / `amdxdna_drm_get_info` / `DRM_IOCTL_AMDXDNA_*` 等）を inline で持つ。
+- **ERT パケット ABI**: `ert_packet_header` / `amdxdna_cmd_start_npu` / `amdxdna_cmd_chain` を実装し、`ERT_START_NPU` 経由でハードウェアコンテキストにコマンドを投げる。
+- **デバイス抽象層**: `npu_open` で `/dev/accel/accelN` を順に開き、`DRM_AMDXDNA_QUERY_AIE_METADATA` / `_VERSION` / `_FIRMWARE_VERSION` / `_CLOCK_METADATA` でトポロジ取得。`DRM_IOCTL_AMDXDNA_CREATE_HWCTX` でハードウェアコンテキストを作成。`DRM_IOCTL_AMDXDNA_CREATE_BO` で 64 MiB の `AMDXDNA_BO_DEV_HEAP` 命令アリーナを確保し、`AMDXDNA_BO_CMD` / `_SHMEM`（umq・ログ）を補助的に確保する。
+- **コマンド投入**: `npu_submit_start_npu` が `ert_packet_header` + `cu_mask` + `amdxdna_cmd_start_npu`（命令バッファアドレス・サイズ・引数）を `CMD` BO に書き込み、`DRM_IOCTL_AMDXDNA_EXEC_CMD` で hwctx に投げる。完了は `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` で待機。
+- **重みのレイアウト**: 量子化重みをロード時に CPU で **BF16** に展開し、`AMDXDNA_BO_SHMEM` 型 DRM バッファオブジェクトに格納（NPU 列 DMA からも CPU からも同じバイト列を見られる）。norm 系は CPU 通常メモリに留める。
+- **GEMV ハイブリッド**: NPU 上での実 GEMV は事前コンパイル済み制御コード `$XDNA_GEMV_DIR/bf16-gemv-<n>x<d>.bin`（MLIR-AIE / IRON ツールチェイン生成）を命令アリーナに読み込んで `ERT_START_NPU` でディスパッチする。制御コードが未配置・`/dev/accel/accelN` 不可・`XDNA_FORCE_CPU=1` のいずれかで透過的に OpenMP BF16 CPU GEMV にフォールバックする（bit-identical な結果）。
+- **CPU 側カーネル**: RMSNorm（全体／ヘッド）、RoPE、Attention（per-head パラレル）、SwiGLU、残差加算、softmax、サンプリングを OpenMP で `main-rocm.c` の GPU カーネル粒度に合わせて並列化。
+
+### 周辺更新
+
+- **`qwen3-8b/Makefile`**: `build.xdna2` / `run.xdna2` ターゲットを追加。`TARGET_XDNA2 = qwen3-xdna2`、`XDNA_INCS` 変数で UAPI ヘッダのパスを上書き可能。`clean` も更新。
+- **`doc/design.md`**: 実装バリアント表、ファイル構成表、Make ターゲット表、ビルド・実行方法、実行時挙動、制約事項、トラブルシューティング、`XDNA2 NPU 実装メモ` の節を追加・更新。
+- **`doc/ChangeLog`**: 本エントリ。
+
+### ビルド・実行
+
+```bash
+cd qwen3-8b
+make build.xdna2
+sudo usermod -aG render "$USER"   # /dev/accel/accel0 アクセスのため
+XDNA_GEMV_DIR=./xdna-kernels ./qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8
+XDNA_FORCE_CPU=1 ./qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8  # CPU 強制
+```
+
 ## 2026-05-13 23:25:34
 
 **`doc/design.md`** のアーキテクチャ説明を拡充。主要データ構造、GGUF パース、重みテンソル対応、量子化と行列積、Tokenizer / ChatML、CPU forward、ROCm forward、生成ループとサンプリングについて、現行実装に沿った詳細説明を追加した。
