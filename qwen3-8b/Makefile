@@ -4,7 +4,6 @@ LDFLAGS ?= -lm
 TARGET_CPU                     = qwen3-cpu
 TARGET_CPU_OMP                 = qwen3-cpu-omp
 TARGET_ROCM                    = qwen3-rocm
-TARGET_ROCM_FULLGPU_FLASH_OPT2 = qwen3-rocm-fullgpu-flash-opt2
 
 MODEL   ?= Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
@@ -40,17 +39,7 @@ build.rocm:
 run.rocm: build.rocm
 	./$(TARGET_ROCM) $(MODEL) -p "$(PROMPT)"
 
-build.rocm.fullgpu.flash.opt2:
-	$(HIPCC) -O3 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
-		--offload-arch=$(GPU_ARCH) \
-		-I$(ROCM)/include \
-		-o $(TARGET_ROCM_FULLGPU_FLASH_OPT2) -x hip main-rocm-fullgpu-flash-opt2.c \
-		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib
-
-run.rocm.fullgpu.flash.opt2: build.rocm.fullgpu.flash.opt2
-	./$(TARGET_ROCM_FULLGPU_FLASH_OPT2) $(MODEL) -p "$(PROMPT)"
-
 clean:
-	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM) $(TARGET_ROCM_FULLGPU_FLASH_OPT2)
+	rm -f $(TARGET_CPU) $(TARGET_CPU_OMP) $(TARGET_ROCM)
 
-.PHONY: build run build.omp run.omp build.rocm run.rocm build.rocm.fullgpu.flash.opt2 run.rocm.fullgpu.flash.opt2 clean
+.PHONY: build run build.omp run.omp build.rocm run.rocm clean

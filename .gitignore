@@ -7,4 +7,3 @@ Meta-Llama-3-8B-Instruct.Q8_0.gguf
 qwen3-8b/qwen3-cpu
 qwen3-8b/qwen3-cpu-omp
 qwen3-8b/qwen3-rocm
-qwen3-8b/qwen3-rocm-fullgpu-flash-opt2

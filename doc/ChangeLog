@@ -4,6 +4,18 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-13 23:25:34
+
+**`doc/design.md`** のアーキテクチャ説明を拡充。主要データ構造、GGUF パース、重みテンソル対応、量子化と行列積、Tokenizer / ChatML、CPU forward、ROCm forward、生成ループとサンプリングについて、現行実装に沿った詳細説明を追加した。
+
+- **`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-13 23:21:20
+
+**`qwen3-8b/main-rocm-fullgpu-flash-opt2.c`** を削除。`make build.rocm.fullgpu.flash.opt2` と同一ロジックの別名ソース・バイナリは不要となったため。**`qwen3-8b/Makefile`** から対応ターゲットを削除し、**`README.md`**・**`doc/design.md`**・**`.gitignore`**・**`qwen3-8b/main-rocm.c`** のビルド注記を **`build.rocm` / `qwen3-rocm` に一本化**。
+
+- **`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-13 23:12:27
 
 **`README.md`** のモデル配置手順を更新。プロジェクト見出しを **Qwen3.c** に整理し、GGUF 本体をリポジトリに含めない方針を明記したうえで、**`qwen3-8b/gguf.txt`** の Hugging Face URL から `blob/main` を `resolve/main` に置換して `wget` する手順を追加した。

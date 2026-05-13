@@ -26,8 +26,7 @@
  * area while keeping the run-time on the GPU end-to-end.
  *
  * Build:
- *   make build.rocm              -> qwen3-rocm（本ファイル）
- *   make build.rocm.fullgpu.flash.opt2 -> qwen3-rocm-fullgpu-flash-opt2（main-rocm-fullgpu-flash-opt2.c）
+ *   make build.rocm -> qwen3-rocm（本ファイル）
  */
 
 #include <stdio.h>
