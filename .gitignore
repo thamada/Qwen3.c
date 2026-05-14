@@ -3,11 +3,11 @@
 *.gguf
 Meta-Llama-3-8B-Instruct.Q8_0.gguf
 
-# qwen3-8b ビルド成果物（Makefile の TARGET_*）
-qwen3-8b/qwen3-cpu
-qwen3-8b/qwen3-cpu-omp
-qwen3-8b/qwen3-rocm
-qwen3-8b/qwen3-xdna2
-qwen3-8b/qwen3-xdna2-bfpx
+# qwen3-8b ビルド成果物（各サブディレクトリの Makefile）
+qwen3-8b/cpu/qwen3-cpu
+qwen3-8b/cpu-multicore/qwen3-cpu-omp
+qwen3-8b/gpu/qwen3-rocm
+qwen3-8b/xdna2/qwen3-xdna2
+qwen3-8b/xdna2-bfp16/qwen3-xdna2-bfpx
 qwen3-8b/qwen3-xdna2-tiny
 qwen3-8b/qwen3-xdna2-mmap

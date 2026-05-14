@@ -35,15 +35,15 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 
 | Mode | Source | Binary | Good for |
 |---|---|---|---|
-| CPU single-thread | `qwen3-8b/main.c` | `qwen3-cpu` | Learning the flow, minimal setup |
-| CPU OpenMP | `qwen3-8b/main-omp.c` | `qwen3-cpu-omp` | Faster CPU trials |
-| ROCm/HIP GPU | `qwen3-8b/main-rocm.c` | `qwen3-rocm` | Practical speed on AMD GPUs |
-| AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/main-xdna2.c` | `qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **`main-omp.c`**; single BF16 scratch BO filled **per GEMV** |
-| AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/main-xdna2-bfpx.c` | `qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
+| CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
+| CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
+| ROCm/HIP GPU | `qwen3-8b/gpu/main.c` | `gpu/qwen3-rocm` | Practical speed on AMD GPUs |
+| AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
+| AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
 For an **overview of AMD XDNA** (design goals, tile-level architecture, generational changes, dtypes and accuracy, software stack, comparison with other NPUs, etc.), see the companion write-up: [thamada/xdna-overview](https://github.com/thamada/xdna-overview) (`main.md` plus a PDF).
 
-An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable token throughput, use ROCm/HIP or the XDNA2 NPU builds. **`qwen3-xdna2`** avoids **persistent BF16 copies of every layer**—it keeps quantized weights **mmap'd** (**`main-omp.c`**-style residency) and decodes **one GEMV matrix at a time** into a BF16 scratch for the NPU, so latency per matmul rises. For tighter residency or another host layout, **`qwen3-xdna2-bfpx`** converts to **BFPX** and drops the GGUF mmap after conversion (**large load-time peak possible**); output is **not** bit-aligned with **`qwen3-xdna2`**.
+An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable token throughput, use ROCm/HIP or the XDNA2 NPU builds. **`xdna2/qwen3-xdna2`** avoids **persistent BF16 copies of every layer**—it keeps quantized weights **mmap'd** (**CPU OpenMP** build–style residency) and decodes **one GEMV matrix at a time** into a BF16 scratch for the NPU, so latency per matmul rises. For tighter residency or another host layout, **`xdna2-bfp16/qwen3-xdna2-bfpx`** converts to **BFPX** and drops the GGUF mmap after conversion (**large load-time peak possible**); output is **not** bit-aligned with **`xdna2/qwen3-xdna2`**.
 
 ## Repository layout
 
@@ -61,11 +61,22 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
 │   └── toolchain/
 └── qwen3-8b/
     ├── Makefile
-    ├── main.c
-    ├── main-omp.c
-    ├── main-rocm.c
-    ├── main-xdna2.c
-    ├── main-xdna2-bfpx.c
+    ├── gguf.txt
+    ├── cpu/
+    │   ├── Makefile
+    │   └── main.c
+    ├── cpu-multicore/
+    │   ├── Makefile
+    │   └── main.c
+    ├── gpu/
+    │   ├── Makefile
+    │   └── main.c
+    ├── xdna2/
+    │   ├── Makefile
+    │   └── main.c
+    ├── xdna2-bfp16/
+    │   ├── Makefile
+    │   └── main.c
     └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
@@ -151,11 +162,11 @@ You should then have:
 ```text
 qwen3-8b/
 ├── Makefile
-├── main.c
-├── main-omp.c
-├── main-rocm.c
-├── main-xdna2.c
-├── main-xdna2-bfpx.c
+├── cpu/ … (`main.c` → `cpu/qwen3-cpu`)
+├── cpu-multicore/ …
+├── gpu/ …
+├── xdna2/ …
+├── xdna2-bfp16/ …
 └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ```
 
@@ -175,7 +186,7 @@ Build the CPU binary first. An 8B model is slow on CPU; use a small `-n` (e.g. `
 ```bash
 cd qwen3-8b
 make build
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
 On success, text should appear gradually after load.
@@ -189,16 +200,16 @@ cd qwen3-8b
 make build
 ```
 
-Produces `qwen3-cpu`.
+Produces **`cpu/qwen3-cpu`**.
 
 ```bash
-ls -lh qwen3-cpu
+ls -lh cpu/qwen3-cpu
 ```
 
 ### Run
 
 ```bash
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Give a one-sentence introduction of yourself." \
   -n 16
 ```
@@ -226,12 +237,12 @@ cd qwen3-8b
 make build.omp
 ```
 
-Produces `qwen3-cpu-omp`.
+Produces **`cpu-multicore/qwen3-cpu-omp`**.
 
 ### Run
 
 ```bash
-OMP_NUM_THREADS=8 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Explain in bullet points what quantization is." \
   -n 32
 ```
@@ -239,8 +250,8 @@ OMP_NUM_THREADS=8 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
 `OMP_NUM_THREADS` sets thread count; try 4 or 8 first.
 
 ```bash
-OMP_NUM_THREADS=4 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-OMP_NUM_THREADS=8 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+OMP_NUM_THREADS=4 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 Speedup depends on core count, memory bandwidth, and quantization.
@@ -270,12 +281,12 @@ If ROCm is not under `/opt/rocm`:
 make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
-Produces `qwen3-rocm`.
+Produces **`gpu/qwen3-rocm`**.
 
 ### Run
 
 ```bash
-./qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Explain what ROCm is for beginners." \
   -n 64
 ```
@@ -309,7 +320,7 @@ cd qwen3-8b
 make build.xdna2
 ```
 
-Produces `qwen3-xdna2`.
+Produces **`xdna2/qwen3-xdna2`**.
 
 ### Run
 
@@ -321,14 +332,14 @@ Useful env vars: `XDNA_GEMV_DIR` (search path for control blobs), `XDNA_FORCE_CP
 
 ```bash
 # Force CPU fallback
-XDNA_FORCE_CPU=1 ./qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 
 # Repo stub placeholders (from qwen3-8b/): not real NPU ctrlcode — `--xdna-status` shows [STUB]
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2 \
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
 
 # With real MLIR-AIE blobs under XDNA_GEMV_DIR: NPU path
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2 \
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
@@ -338,15 +349,15 @@ Or:
 make run.xdna2 PROMPT="Short explanation in English."
 ```
 
-### XDNA2 + BFPX host weights (`qwen3-xdna2-bfpx`)
+### XDNA2 + BFPX host weights (`xdna2-bfp16/qwen3-xdna2-bfpx`)
 
-`main-xdna2-bfpx.c` shares the **same DRM ioctl and chunked BF16 GEMV** as `main-xdna2.c`, but converts linear weights at load time to **BFPX (per-block BF16 scale + int8)** on the host and releases the GGUF mmap afterward. CPU fallback uses **`mm_bfpx`** (float activations × BFPX weights) and is **not numerically aligned** with `qwen3-xdna2`. Block approximation means **behavior differs** from **`qwen3-xdna2`**, which decodes quantized mmap weights into BF16 **on each GEMV**; neither quality nor speed dominates in all cases.
+`xdna2-bfp16/main.c` shares the **same DRM ioctl and chunked BF16 GEMV** as `xdna2/main.c`, but converts linear weights at load time to **BFPX (per-block BF16 scale + int8)** on the host and releases the GGUF mmap afterward. CPU fallback uses **`mm_bfpx`** (float activations × BFPX weights) and is **not numerically aligned** with `xdna2/qwen3-xdna2`. Block approximation means **behavior differs** from **`xdna2/qwen3-xdna2`**, which decodes quantized mmap weights into BF16 **on each GEMV**; neither quality nor speed dominates in all cases.
 
 ```bash
 cd qwen3-8b
 make build.xdna2.bfpx
-XDNA_FORCE_CPU=1 ./qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2-bfpx \
+XDNA_FORCE_CPU=1 ./xdna2-bfp16/qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
@@ -356,8 +367,8 @@ make run.xdna2.bfpx PROMPT="Short explanation in English."
 
 ### Notes
 
-- **`qwen3-xdna2`**: Linear weights stay **mmap'd** (**`main-omp.c`**-like). One **BF16 scratch** sized for the **largest text-path GEMV** (often **LM head / embedding scale**) may still require substantial **DRAM**. There is **no** persistent duplicate BF16 copy of **all** layers. Insufficient RAM can still kill the process or fail mmap/allocs.
-- **`qwen3-xdna2-bfpx`**: Inference residency is often dominated by **BFPX + norm buffers** with mmap released early, but **conversion** can **spike memory** (GGUF mmap plus temporary full-tensor staging).
+- **`xdna2/qwen3-xdna2`**: Linear weights stay **mmap'd** (**CPU OpenMP** build–like). One **BF16 scratch** sized for the **largest text-path GEMV** (often **LM head / embedding scale**) may still require substantial **DRAM**. There is **no** persistent duplicate BF16 copy of **all** layers. Insufficient RAM can still kill the process or fail mmap/allocs.
+- **`xdna2-bfp16/qwen3-xdna2-bfpx`**: Inference residency is often dominated by **BFPX + norm buffers** with mmap released early, but **conversion** can **spike memory** (GGUF mmap plus temporary full-tensor staging).
 - On NPU runs you reserve AIE columns; other NPU workloads (e.g. Windows Studio Effects) may contend.
 
 ## Common CLI options
@@ -374,13 +385,13 @@ make run.xdna2.bfpx PROMPT="Short explanation in English."
 Start small:
 
 ```bash
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 Then increase `-n`:
 
 ```bash
-./qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Write a short poem." \
   -n 128
 ```
@@ -390,7 +401,7 @@ Then increase `-n`:
 Lower temperature and fix the seed when comparing runs:
 
 ```bash
-./qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "One sentence: what is GGUF?" \
   -n 32 \
   -t 0.2 \
@@ -410,11 +421,11 @@ make clean
 
 Typical files removed:
 
-- `qwen3-cpu`
-- `qwen3-cpu-omp`
-- `qwen3-rocm`
-- `qwen3-xdna2`
-- `qwen3-xdna2-bfpx`
+- `cpu/qwen3-cpu`
+- `cpu-multicore/qwen3-cpu-omp`
+- `gpu/qwen3-rocm`
+- `xdna2/qwen3-xdna2`
+- `xdna2-bfp16/qwen3-xdna2-bfpx`
 
 `make clean` does **not** delete the GGUF model.
 
@@ -431,7 +442,7 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 Put the model under `qwen3-8b/` or pass an absolute path:
 
 ```bash
-./qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+./cpu/qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 ### CPU is slow
@@ -439,10 +450,10 @@ Put the model under `qwen3-8b/` or pass an absolute path:
 Expected for 8B on CPU alone. Try `-n 1` or `-n 4`:
 
 ```bash
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-For speed, use `qwen3-rocm`.
+For speed, use `./gpu/qwen3-rocm`.
 
 ### `hipcc` not found
 
@@ -490,10 +501,10 @@ Suggested order:
 
 1. `README.en.md` (or `README.md`) — build and run successfully first.
 2. `doc/design.md` — design, quantization, Qwen3 specifics.
-3. `qwen3-8b/main.c` — GGUF load through one-token generation on CPU.
-4. `qwen3-8b/main-omp.c` — OpenMP parallelization.
-5. `qwen3-8b/main-rocm.c` — GPU memory, HIP kernels, GPU sampling.
-6. `qwen3-8b/main-xdna2.c` / `qwen3-8b/main-xdna2-bfpx.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **`main-xdna2.c`**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
+3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
+4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
+5. `qwen3-8b/gpu/main.c` — GPU memory, HIP kernels, GPU sampling.
+6. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope
 

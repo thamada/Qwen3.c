@@ -2413,7 +2413,7 @@ static int npu_submit_start_npu(XdnaDev *dev,
  *   AMD IRON / MLIR-AIE toolchain for that exact (n,d) GEMV shape. If the
  *   file is missing we fall back to CPU.
  *
- *   Repository placeholders use magic bytes "GQF3XDNA" (see xdna-gemv/gen-xdna-gemv-stubs.py);
+ *   Repository placeholders use magic bytes "GQF3XDNA" (see ../../xdna-gemv/gen-xdna-gemv-stubs.py);
  *   load_gemv_kernel rejects them so they never reach ERT_START_NPU.
  * ================================================================ */
 

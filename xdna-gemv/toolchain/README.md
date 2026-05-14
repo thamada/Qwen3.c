@@ -2,7 +2,7 @@
 
 このディレクトリの文書は、**本リポジトリの `qwen3-xdna2`** が環境変数 `XDNA_GEMV_DIR` から読み込む **`bf16-gemv-<n>x<d>.bin`** を、公開されている **MLIR-AIE／IRON／Peano** 一式を揃えて生成するところまでの入口です。このファイルは XAie のトランザクション列に相当するバイナリを想定しています。
 
-実装側の説明は `qwen3-8b/main-xdna2.c` の `load_gemv_kernel` 付近のコメント、および形状リストがある [`xdna-gemv/gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) を参照してください。
+実装側の説明は `qwen3-8b/xdna2/main.c` の `load_gemv_kernel` 付近のコメント、および形状リストがある [`xdna-gemv/gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) を参照してください。
 
 ---
 
@@ -17,7 +17,7 @@
 
 1. **開発用マシンに、XRT と mlir-aie／IRON が求める構成をそろえ、`aiecc` や IRON が出力する「NPU 向けバイナリ」の意味を把握する。**  
 2. **そのうち、`ERT_START_NPU` に載せられる「txn／NPU insts」に相当する部分だけを `bf16-gemv-*.bin` として取り出し、`XDNA_GEMV_DIR` に置く。**  
-   ここで、公式が「この C ランタイム用に、このファイル名でこの中身を置け」と一本化した文書が必ずあるわけではないため、**`aiecc` の出力と `main-xdna2.c` が期待するレイアウトが一致するかは、ビルドごとに確認・調査が必要**です。
+   ここで、公式が「この C ランタイム用に、このファイル名でこの中身を置け」と一本化した文書が必ずあるわけではないため、**`aiecc` の出力と `qwen3-8b/xdna2/main.c` が期待するレイアウトが一致するかは、ビルドごとに確認・調査が必要**です。
 
 **正直な整理:** 以下のコマンド列は、[Xilinx mlir-aie の README](https://github.com/Xilinx/mlir-aie)、[mlir-aie のサイト](https://xilinx.github.io/mlir-aie/)、[AMD IRON](https://github.com/amd/IRON) が示す標準的なセットアップに沿っています。**最終的に `bf16-gemv-<n>x<d>.bin` と機械的に対応づける自動スクリプトは、本リポジトリにはまだ含めていません**（環境やアーキテクチャの差をこちらで吸収しきれないためです）。
 
@@ -230,7 +230,7 @@ aiecc --verbose --aie-generate-npu-insts design.mlir
 2. `qwen3-xdna2` に **スタブではない**そのバイナリを渡し、`EXEC_CMD` が成功するか、`--xdna-status` と推論ログの **NPU GEMV 回数**で確認する。  
 3. 必要に応じて [amdnpu.rst（xdna-driver の説明）](https://github.com/amd/xdna-driver/blob/main/src/driver/doc/amdnpu.rst) や mlir-aie の Issue などで、**txn と制御コードのレイアウト**を照らし合わせる。
 
-**オーバーレイ（`CONFIG_HWCTX`）との関係:** `main-xdna2.c` の冒頭コメントでは、`overlay` と `ctrlcode` の**ペア**が必要となる旨が述べられている箇所もあります。`bf16-gemv-*.bin` だけでは足りず、mlir-aie が生成する PDI や xclbin との整合まで必要になる場合があります。**すべてを一致させる作業は、統合側の開発者の責務**となります。
+**オーバーレイ（`CONFIG_HWCTX`）との関係:** `qwen3-8b/xdna2/main.c` の冒頭コメントでは、`overlay` と `ctrlcode` の**ペア**が必要となる旨が述べられている箇所もあります。`bf16-gemv-*.bin` だけでは足りず、mlir-aie が生成する PDI や xclbin との整合まで必要になる場合があります。**すべてを一致させる作業は、統合側の開発者の責務**となります。
 
 別ルートとして `aiecc` には **`--aie-generate-txn`** や **`--aie-generate-ctrlpkt`** もあり、構成や世代によって **txn と制御パケットが分かれる**ことも README にあります。**どの出力が、ご自分のプラットフォーム・ファームウェアでの `ERT_START_NPU` に適合するかは環境依存**です。
 
@@ -254,7 +254,7 @@ export XDNA_GEMV_DIR="/absolute/path/to/gguf.Qwen3.c/xdna-gemv/kernels"
 ls -la "$XDNA_GEMV_DIR"/bf16-gemv-*.bin
 
 cd /absolute/path/to/gguf.Qwen3.c/qwen3-8b
-./qwen3-xdna2 /path/to/model.gguf --xdna-status
+./xdna2/qwen3-xdna2 /path/to/model.gguf --xdna-status
 ```
 
 - **`[STUB]`** のときは、スタブか先頭マジック `GQF3XDNA` のファイルであり、NPU には載りません。  

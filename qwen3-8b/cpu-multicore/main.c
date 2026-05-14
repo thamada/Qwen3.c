@@ -3,7 +3,7 @@
 /*
  * Qwen3-VL-8B GGUF — CPU + OpenMP (main.c の並列版).
  *
- * main-rocm.c の粒度に沿った並列化:
+ * gpu/main.c の粒度に沿った並列化:
  *   - GEMV: 出力行（row）方向 — hip の mm_*_gemv が 1 行ずつ独立と同じ
  *   - attn: ヘッドごと — flash / MHA カーネルが blockIdx.x = head と同様
  *   - RoPE: ヘッド並列 — rope_kernel のヘッド次元と同様

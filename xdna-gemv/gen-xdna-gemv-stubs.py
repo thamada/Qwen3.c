@@ -3,7 +3,7 @@
 """Generate bf16-gemv-<n>x<d>.bin placeholder files for qwen3-xdna2 status checks.
 
 These binaries are NOT executable control microcode. They carry an 8-byte magic
-``GQF3XDNA`` so ``main-xdna2.c`` rejects them for ERT_START_NPU and falls back
+``GQF3XDNA`` so ``qwen3-8b/xdna2/main.c`` rejects them for ERT_START_NPU and falls back
 to CPU. Replace them with MLIR-AIE / IRON produced txn blobs for real NPU GEMV.
 
 Usage:
@@ -17,7 +17,7 @@ import os
 import struct
 import sys
 
-# Must match main-xdna2.c / main-xdna2-bfpx.c
+# Must match qwen3-8b/xdna2/main.c and qwen3-8b/xdna2-bfp16/main.c
 MAGIC = b"GQF3XDNA"
 VERSION = 1
 FLAG_PLACEHOLDER = 1

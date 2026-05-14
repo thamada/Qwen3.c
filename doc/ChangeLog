@@ -4,9 +4,15 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-14 14:12:50
+
+**`qwen3-8b/` の実行経路ごとにディレクトリを分割**し、いずれも **`main.c`** に統一。**`cpu/`**・**`cpu-multicore/`**・**`gpu/`**・**`xdna2/`**・**`xdna2-bfp16/`** にそれぞれ **`Makefile`** を配置。ルートの **`qwen3-8b/Makefile`** は **`make -C`** で各サブディレクトリに委譲し、実行ファイルパスも **`cpu/qwen3-cpu`** 等に変更。**`.gitignore`**・**`README.md`**・**`README.en.md`**・**`doc/design.md`**・**`doc/ChangeLog`**（コード例の実行パスのみ一部更新）・**`xdna-gemv/`** 配下の参照を追随。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-14 13:40:39
 
-**`xdna-gemv/`** に **NPU GEMV 用 ctrlcode 準備**（**`bf16-gemv-*.bin`**）関連を集約。旧 **`tools/gen-xdna-gemv-stubs.py`** → **`xdna-gemv/gen-xdna-gemv-stubs.py`**（既定出力 **`xdna-gemv/kernels/`**）、旧 **`xdna-kernels/`** → **`xdna-gemv/kernels/`**（**`README.md`**・**`Makefile`**・スタブ **`.bin`**）、旧 **`xdna-gemv-toolchain/README.md`** → **`xdna-gemv/toolchain/README.md`**。入口として **`xdna-gemv/README.md`** を追加。**`qwen3-8b/Makefile`** の **`gen-xdna-kernels`**、**`README.md`** / **`README.en.md`** / **`doc/design.md`** / **`qwen3-8b/main-xdna2.c`** / **`xdna-gemv/toolchain/README.md`** / **`xdna-gemv/kernels/README.md`** のパス・記述を追随。
+**`xdna-gemv/`** に **NPU GEMV 用 ctrlcode 準備**（**`bf16-gemv-*.bin`**）関連を集約。旧 **`tools/gen-xdna-gemv-stubs.py`** → **`xdna-gemv/gen-xdna-gemv-stubs.py`**（既定出力 **`xdna-gemv/kernels/`**）、旧 **`xdna-kernels/`** → **`xdna-gemv/kernels/`**（**`README.md`**・**`Makefile`**・スタブ **`.bin`**）、旧 **`xdna-gemv-toolchain/README.md`** → **`xdna-gemv/toolchain/README.md`**。入口として **`xdna-gemv/README.md`** を追加。**`qwen3-8b/Makefile`** の **`gen-xdna-kernels`**、**`README.md`** / **`README.en.md`** / **`doc/design.md`** / **`qwen3-8b/xdna2/main.c`** / **`xdna-gemv/toolchain/README.md`** / **`xdna-gemv/kernels/README.md`** のパス・記述を追随。
 
 **`doc/ChangeLog`**: 本エントリ（あわせて過去ブロック内の **`XDNA_GEMV_DIR`** 例を **`../xdna-gemv/kernels`** に更新）。
 
@@ -153,8 +159,8 @@
 ```bash
 cd qwen3-8b
 make build.xdna2.bfpx
-./qwen3-xdna2-bfpx path/to/model.gguf -p "Hi" -n 8
-# NPU 制御コード・環境変数は main-xdna2.c と同様（XDNA_GEMV_DIR / XDNA_FORCE_CPU / XDNA_NUM_COL 等）
+./xdna2-bfp16/qwen3-xdna2-bfpx path/to/model.gguf -p "Hi" -n 8
+# NPU 制御コード・環境変数は xdna2/main.c と同様（XDNA_GEMV_DIR / XDNA_FORCE_CPU / XDNA_NUM_COL 等）
 ```
 
 ## 2026-05-13 23:57:46
@@ -183,8 +189,8 @@ make build.xdna2.bfpx
 cd qwen3-8b
 make build.xdna2
 sudo usermod -aG render "$USER"   # /dev/accel/accel0 アクセスのため
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8
-XDNA_FORCE_CPU=1 ./qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8  # CPU 強制
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8
+XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8  # CPU 強制
 ```
 
 ## 2026-05-13 23:25:34

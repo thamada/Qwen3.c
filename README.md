@@ -35,15 +35,15 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 
 | 実行方法 | 使うファイル | 作られる実行ファイル | 向いている用途 |
 |---|---|---|---|
-| CPU 単スレッド | `qwen3-8b/main.c` | `qwen3-cpu` | 仕組みを追う、最小構成で動かす |
-| CPU OpenMP 並列 | `qwen3-8b/main-omp.c` | `qwen3-cpu-omp` | CPU で少しでも速く試す |
-| ROCm/HIP GPU | `qwen3-8b/main-rocm.c` | `qwen3-rocm` | AMD GPU で実用的な速度を狙う |
-| AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/main-xdna2.c` | `qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（`main-omp.c` 同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
-| AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/main-xdna2-bfpx.c` | `qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
+| CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
+| CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
+| ROCm/HIP GPU | `qwen3-8b/gpu/main.c` | `gpu/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
+| AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
+| AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
 **AMD XDNA の概要**（設計思想、アーキテクチャの基本構造とタイル、世代別の進化、データ型と精度、ソフトウェアスタック、他社 NPU との比較など）については、別リポジトリに解説記事としてまとめてあります：[thamada/xdna-overview](https://github.com/thamada/xdna-overview)（本文は `main.md`、PDF 付き）。
 
-8B 級モデルの CPU 実行は非常に重いです。最初の動作確認としては CPU でも構いませんが、実用的な生成速度が必要な場合は ROCm/HIP 版か XDNA2 NPU 版を使う想定です。`qwen3-xdna2` は **全重みを恒久に BF16 へ複製しない**ため、推論中にメモリへ置く主なデータは **GGUF の mmap** と **最大 GEMV 向けスクラッチ**になり、`main-omp.c` に近い構成です。一方で、**GEMV のたびに行列全体を復号する**ためレイテンシは増えやすいです。**推論中のメモリ使用量をさらに減らしたい**ときや別の重み表現が必要なときは **`qwen3-xdna2-bfpx`** を検討してください（BFPX 変換後に mmap を解放。**ロード時のメモリピークは大きくなり得る**。出力は `qwen3-xdna2` とビット単位では一致しません）。
+8B 級モデルの CPU 実行は非常に重いです。最初の動作確認としては CPU でも構いませんが、実用的な生成速度が必要な場合は ROCm/HIP 版か XDNA2 NPU 版を使う想定です。**`xdna2/qwen3-xdna2`** は **全重みを恒久に BF16 へ複製しない**ため、推論中にメモリへ置く主なデータは **GGUF の mmap** と **最大 GEMV 向けスクラッチ**になり、CPU OpenMP 版に近い構成です。一方で、**GEMV のたびに行列全体を復号する**ためレイテンシは増えやすいです。**推論中のメモリ使用量をさらに減らしたい**ときや別の重み表現が必要なときは **`xdna2-bfp16/qwen3-xdna2-bfpx`** を検討してください（BFPX 変換後に mmap を解放。**ロード時のメモリピークは大きくなり得る**。出力は **`xdna2/qwen3-xdna2`** とビット単位では一致しません）。
 
 ## ディレクトリ構成
 
@@ -61,11 +61,22 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 │   └── toolchain/
 └── qwen3-8b/
     ├── Makefile
-    ├── main.c
-    ├── main-omp.c
-    ├── main-rocm.c
-    ├── main-xdna2.c
-    ├── main-xdna2-bfpx.c
+    ├── gguf.txt
+    ├── cpu/
+    │   ├── Makefile
+    │   └── main.c
+    ├── cpu-multicore/
+    │   ├── Makefile
+    │   └── main.c
+    ├── gpu/
+    │   ├── Makefile
+    │   └── main.c
+    ├── xdna2/
+    │   ├── Makefile
+    │   └── main.c
+    ├── xdna2-bfp16/
+    │   ├── Makefile
+    │   └── main.c
     └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
@@ -151,11 +162,11 @@ wget -O Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf "$url"
 ```text
 qwen3-8b/
 ├── Makefile
-├── main.c
-├── main-omp.c
-├── main-rocm.c
-├── main-xdna2.c
-├── main-xdna2-bfpx.c
+├── cpu/ … （`main.c` → `cpu/qwen3-cpu`）
+├── cpu-multicore/ …
+├── gpu/ …
+├── xdna2/ …
+├── xdna2-bfp16/ …
 └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ```
 
@@ -175,7 +186,7 @@ sha256sum -c Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```bash
 cd qwen3-8b
 make build
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
 うまくいくと、モデル読み込み後に少しずつテキストが表示されます。
@@ -189,16 +200,16 @@ cd qwen3-8b
 make build
 ```
 
-成功すると `qwen3-cpu` ができます。
+成功すると **`cpu/qwen3-cpu`** ができます。
 
 ```bash
-ls -lh qwen3-cpu
+ls -lh cpu/qwen3-cpu
 ```
 
 ### 実行
 
 ```bash
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で短く自己紹介してください。" -n 16
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で短く自己紹介してください。" -n 16
 ```
 
 `Makefile` の `run` ターゲットを使う場合:
@@ -224,12 +235,12 @@ cd qwen3-8b
 make build.omp
 ```
 
-成功すると `qwen3-cpu-omp` ができます。
+成功すると **`cpu-multicore/qwen3-cpu-omp`** ができます。
 
 ### 実行
 
 ```bash
-OMP_NUM_THREADS=8 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "箇条書きで、量子化とは何かを説明してください。" \
   -n 32
 ```
@@ -237,8 +248,8 @@ OMP_NUM_THREADS=8 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
 `OMP_NUM_THREADS` は使う CPU スレッド数です。迷ったら、まずは 4 や 8 から試してください。
 
 ```bash
-OMP_NUM_THREADS=4 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-OMP_NUM_THREADS=8 ./qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+OMP_NUM_THREADS=4 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 速くなるかどうかは CPU のコア数、メモリ帯域、モデルの量子化形式に依存します。
@@ -268,12 +279,12 @@ ROCm が `/opt/rocm` 以外にある場合:
 make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
-成功すると `qwen3-rocm` ができます。
+成功すると **`gpu/qwen3-rocm`** ができます。
 
 ### 実行
 
 ```bash
-./qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "日本語で、ROCmとは何かを初心者向けに説明してください。" \
   -n 64
 ```
@@ -307,7 +318,7 @@ cd qwen3-8b
 make build.xdna2
 ```
 
-成功すると `qwen3-xdna2` ができます。
+成功すると **`xdna2/qwen3-xdna2`** ができます。
 
 ### 実行
 
@@ -319,14 +330,14 @@ NPU 上で実際に高速 GEMV を回すには **MLIR-AIE / IRON ツールチェ
 
 ```bash
 # 強制的に CPU フォールバックで動かす場合
-XDNA_FORCE_CPU=1 ./qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 
 # リポジトリ同梱プレースホルダ（qwen3-8b からの相対パス）。実 NPU ctrlcode ではない。
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2 \
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
 
 # 制御コードが揃っているときは NPU 経路で実行（本物の .bin に差し替え後）
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2 \
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
@@ -336,15 +347,15 @@ XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2 \
 make run.xdna2 PROMPT="日本語で短く説明してください。"
 ```
 
-### XDNA2 + BFPX ホスト重み版（`qwen3-xdna2-bfpx`）
+### XDNA2 + BFPX ホスト重み版（`xdna2-bfp16/qwen3-xdna2-bfpx`）
 
-`main-xdna2-bfpx.c` は、**`main-xdna2.c` と同一の DRM ioctl** および **チャンク構成の BF16 GEMV（NPU 経路の枠組み）** を用います。一方で、密な行列レイアウトの重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 の係数）** へ変換し、ホストメモリ上にのみ保持します。GGUF への mmap は、この変換が終わってから解放します。NPU が使えないときの CPU 側のフォールバックでは **`mm_bfpx`** が用いられ、活性値は単精度浮動小数点数のまま、BFPX 形式の重みとの一般行列ベクトル積を計算します。**`qwen3-xdna2` とビット単位で完全一致するとは限りません**。量子化に加えブロック近似の誤差があります。**GEMV で量子化 mmap から直接 BF16 へ展開する `qwen3-xdna2`** とは経路も誤差の立ち方も異なるため、品質の優劣はケースによります。
+`xdna2-bfp16/main.c` は、**`xdna2/main.c` と同一の DRM ioctl** および **チャンク構成の BF16 GEMV（NPU 経路の枠組み）** を用います。一方で、密な行列レイアウトの重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 の係数）** へ変換し、ホストメモリ上にのみ保持します。GGUF への mmap は、この変換が終わってから解放します。NPU が使えないときの CPU 側のフォールバックでは **`mm_bfpx`** が用いられ、活性値は単精度浮動小数点数のまま、BFPX 形式の重みとの一般行列ベクトル積を計算します。**`xdna2/qwen3-xdna2` とビット単位で完全一致するとは限りません**。量子化に加えブロック近似の誤差があります。**GEMV で量子化 mmap から直接 BF16 へ展開する `xdna2/qwen3-xdna2`** とは経路も誤差の立ち方も異なるため、品質の優劣はケースによります。
 
 ```bash
 cd qwen3-8b
 make build.xdna2.bfpx
-XDNA_FORCE_CPU=1 ./qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./qwen3-xdna2-bfpx \
+XDNA_FORCE_CPU=1 ./xdna2-bfp16/qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
@@ -354,8 +365,8 @@ make run.xdna2.bfpx PROMPT="日本語で短く説明してください。"
 
 ### 注意
 
-- **`qwen3-xdna2`**: 線形ウェイトは **mmap**（`main-omp.c` 相当）。GEMV に使う単一 BF16 スクラッチは **語彙×次元クラスの最大行列**サイズになり得るので、モデルサイズと **VRAM／DRAM に余裕**が必要になる場合があります。恒久の「全レイヤー BF16 二重複製」は行いません。RAM 不足では従来通りプロセスや mmap が失敗し得ます。
-- **`qwen3-xdna2-bfpx`**: 推論中は BFPX とノルム用 F32 が中心で mmap を早めに離せる一方、**変換中**は GGUF mmap とフルテンソル用の一時バッファなどで **ピークメモリが大きくなります**。
+- **`xdna2/qwen3-xdna2`**: 線形ウェイトは **mmap**（CPU OpenMP 版と同様）。GEMV に使う単一 BF16 スクラッチは **語彙×次元クラスの最大行列**サイズになり得るので、モデルサイズと **VRAM／DRAM に余裕**が必要になる場合があります。恒久の「全レイヤー BF16 二重複製」は行いません。RAM 不足では従来通りプロセスや mmap が失敗し得ます。
+- **`xdna2-bfp16/qwen3-xdna2-bfpx`**: 推論中は BFPX とノルム用 F32 が中心で mmap を早めに離せる一方、**変換中**は GGUF mmap とフルテンソル用の一時バッファなどで **ピークメモリが大きくなります**。
 - NPU 側で実行する場合は AIE 列を予約するため、同時に動いているほかの NPU ワークロード（Windows Studio Effects 等）と競合する可能性があります。
 
 ## よく使うオプション
@@ -372,13 +383,13 @@ make run.xdna2.bfpx PROMPT="日本語で短く説明してください。"
 まずは次のように短めに試すのがおすすめです。
 
 ```bash
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 慣れてきたら `-n` を増やします。
 
 ```bash
-./qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で詩を書いてください。" -n 128
+./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で詩を書いてください。" -n 128
 ```
 
 ## 生成を安定させたいとき
@@ -386,7 +397,7 @@ make run.xdna2.bfpx PROMPT="日本語で短く説明してください。"
 同じ入力で結果を比較したい場合は、温度を下げたり seed を固定します。
 
 ```bash
-./qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "1文で説明してください: GGUFとは？" \
   -n 32 \
   -t 0.2 \
@@ -406,11 +417,11 @@ make clean
 
 削除される主なファイル:
 
-- `qwen3-cpu`
-- `qwen3-cpu-omp`
-- `qwen3-rocm`
-- `qwen3-xdna2`
-- `qwen3-xdna2-bfpx`
+- `cpu/qwen3-cpu`
+- `cpu-multicore/qwen3-cpu-omp`
+- `gpu/qwen3-rocm`
+- `xdna2/qwen3-xdna2`
+- `xdna2-bfp16/qwen3-xdna2-bfpx`
 
 モデルファイルは `make clean` では削除されません。
 
@@ -427,7 +438,7 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 見つからない場合は、モデルを `qwen3-8b/` に置くか、実行時に絶対パスを指定してください。
 
 ```bash
-./qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+./cpu/qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 ### CPU 版が遅い
@@ -435,10 +446,10 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 正常です。8B 級モデルは CPU だけで動かすには重いです。まずは `-n 1` や `-n 4` で確認してください。
 
 ```bash
-./qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
+./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-速度が必要なら `qwen3-rocm` を使ってください。
+速度が必要なら `./gpu/qwen3-rocm` を使ってください。
 
 ### `hipcc` が見つからない
 
@@ -492,17 +503,17 @@ make build.rocm GPU_ARCH=gfx1100
 2. `doc/design.md`  
    全体の設計、量子化、Qwen3固有処理を把握する。
 
-3. `qwen3-8b/main.c`  
+3. `qwen3-8b/cpu/main.c`  
    CPU 版で、GGUF 読み込みから 1 トークン生成までを追う。
 
-4. `qwen3-8b/main-omp.c`  
+4. `qwen3-8b/cpu-multicore/main.c`  
    OpenMP による並列化箇所を見る。
 
-5. `qwen3-8b/main-rocm.c`  
+5. `qwen3-8b/gpu/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
-6. `qwen3-8b/main-xdna2.c` / `qwen3-8b/main-xdna2-bfpx.c`  
-   `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。`main-xdna2.c` は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
+6. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
+   `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
 
 ## このリポジトリで扱わないもの
 

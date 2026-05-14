@@ -1,6 +1,6 @@
 # `xdna-gemv/` — NPU GEMV 用 ctrlcode（`bf16-gemv-*.bin`）の準備
 
-`qwen3-xdna2` が環境変数 **`XDNA_GEMV_DIR`** で探す **`bf16-gemv-<n>x<d>.bin`** まわりの、**ドキュメント・取得用 Makefile・スタブ生成スクリプト**は、このディレクトリにまとめてあります（推論本体のソースは **`qwen3-8b/main-xdna2.c`** 側です）。
+**`xdna2/qwen3-xdna2`** が環境変数 **`XDNA_GEMV_DIR`** で探す **`bf16-gemv-<n>x<d>.bin`** まわりの、**ドキュメント・取得用 Makefile・スタブ生成スクリプト**は、このディレクトリにまとめてあります（推論ソースは **`qwen3-8b/xdna2/main.c`**）。
 
 ## 構成
 
@@ -15,7 +15,7 @@
 ```bash
 python3 xdna-gemv/gen-xdna-gemv-stubs.py
 export XDNA_GEMV_DIR="$(pwd)/xdna-gemv/kernels"
-cd qwen3-8b && ./qwen3-xdna2 /path/to/model.gguf --xdna-status
+cd qwen3-8b && ./xdna2/qwen3-xdna2 /path/to/model.gguf --xdna-status
 ```
 
 または **`qwen3-8b`** で `make gen-xdna-kernels`。
