@@ -4,9 +4,17 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-16 03:03:47
+
+**`qwen3-8b/Makefile`**: 集約 **`build.*` / `run.*`** を **サブディレクトリ名**に揃えた（**`build`/`run` → `build.cpu`/`run.cpu`**、**`build.omp`/`run.omp` → `build.cpu-multicore`/`run.cpu-multicore`**、**`build.rocm`/`run.rocm` → `build.gpu`/`run.gpu`**、**`build.xdna2.bfpx`/`run.xdna2.bfpx` → `build.xdna2-bfp16`/`run.xdna2-bfp16`**）。**`build.xdna2` / `run.xdna2`** は不変。
+
+**`doc/design.md`**: 実装バリアント表・ディレクトリ表・Make ターゲット表・ビルド例・**`XDNA_INCS`** 説明を上記に追随。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-16 02:38:57
 
-**`qwen3-8b/cpu-multicore/main.c`**: ファイル先頭コメントを **`qwen3-8b/`** 配下のパス（本ファイル・**`qwen3-8b/gpu/main.c`**）と **`make build.omp`**／**`cpu-multicore/`** 単体 **`make build`**（出力 **`qwen3-cpu-omp`**）に合わせて更新。
+**`qwen3-8b/cpu-multicore/main.c`**: ファイル先頭コメントを **`qwen3-8b/`** 配下のパス（本ファイル・**`qwen3-8b/gpu/main.c`**）とルート **`Makefile`** の **`make build.cpu-multicore`**／**`cpu-multicore/`** 単体 **`make build`**（出力 **`qwen3-cpu-omp`**）に合わせて更新。
 
 **`doc/design.md`**: ディレクトリ表の **`qwen3-8b/cpu-multicore/main.c`** 一行を上記に追随。
 

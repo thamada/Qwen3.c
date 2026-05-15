@@ -27,7 +27,7 @@
 |--------|----------|------|
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
-| `qwen3-8b/gpu/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.rocm` の既定エントリ**。 |
+| `qwen3-8b/gpu/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu` の既定エントリ**。 |
 | `qwen3-8b/xdna2/main.c` | **AMD Ryzen AI NPU (XDNA2)** | **CPU OpenMP 版と同様**に線形ウェイトは **GGUF mmap 上の量子化形式を参照**。埋め込みは行単位ブロック復号。各 **GEMV ごとに**当該重み行列を **`AMDXDNA_BO_SHMEM` の単一 BF16 スクラッチ**へ展開して NPU が DMA、`scratch_f32` でデ量子化～BF16 を兼用。rmsnorm などの小型 F32 も mmap 指す。`DRM ioctl` と **`ERT_START_NPU`** 経路、`/dev/accel/accelN` 不可／制御コード未配置時の **OpenMP BF16 CPU フォールバック（NPU と bit-identical）**は従来どおり。XRT 不要・UAPI inline 持ち運びは不変。**スクラッチサイズはテキスト経路 GEMV に必要な最大要素数のみ**（パーサ済み名前走査、`TensorInfo` は推論前に開放しうる）。**起動時レポートと `--xdna-status` / `-X`** で各形状の **`bf16-gemv-<n>x<d>.bin`** 可否・推論後の NPU/CPU GEMV カウンタを確認できる。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **AMD Ryzen AI NPU (XDNA2) + BFPX ホスト重み** | **`qwen3-8b/xdna2/main.c` と同一の DRM ioctl** および **チャンク BF16 GEMV（NPU 経路の枠組み）** を共有する。**密行列レイアウト**の重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 係数、ブロック長 64）** に変換しホストのみ保持し、GGUF mmap は変換完了後に解放する。**論理形状は OpenMP CPU 版（`cpu-multicore/main.c`）の `mm(..., n_in, n_out)` と一致**させ、`[n_in,n_out]` 型の GGUF 転置は **`bfpx_convert_weight_2d`** で吸収。量子化に加えブロック近似のため、**GEMV で逐次 BF16 に展開する mmap スクラッチ方式（`xdna2/main.c`）と同一ビットでの一致は期待できず**、品質が劣ることがある。NPU 不可時の CPU は **`mm_bfpx`** が単精度浮動小数点数の活性と BFPX 形式の重みの積を計算する。 |
 
@@ -40,11 +40,11 @@
 | `README.md` | ビルド・実行・方針の説明（日本語）。 |
 | `README.en.md` | 同上（英語）。 |
 | `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。 |
-| `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.omp`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
+| `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.cpu-multicore`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
 | `qwen3-8b/gpu/main.c` | ROCm 推論（既定の HIP ビルド対象）。 |
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **`xdna2/main.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
-| `qwen3-8b/Makefile` | **`build*` / `run*` / `clean` / `gen-xdna-kernels`** を **`cpu/`**・**`cpu-multicore/`**・**`gpu/`**・**`xdna2/`**・**`xdna2-bfp16/`** の各 **`Makefile`** に委譲。 |
+| `qwen3-8b/Makefile` | **`build.<サブディレクトリ名>` / `run.<サブディレクトリ名>`**（例: **`build.cpu`**・**`build.gpu`**）および **`clean` / `gen-xdna-kernels`** を **`cpu/`**・**`cpu-multicore/`**・**`gpu/`**・**`xdna2/`**・**`xdna2-bfp16/`** の各 **`Makefile`** に委譲。 |
 | `qwen3-8b/cpu/Makefile` ほか（各経路直下） | 当該サブディレクトリのみの **`make build`** / **`make run`** / **`clean`**（単体開発用）。出力バイナリは **`cpu/qwen3-cpu`** のように経路直下に生成。 |
 | `doc/design.md` | 本書。 |
 | `doc/ChangeLog` | 変更履歴。 |
@@ -63,21 +63,21 @@
 
 | Makefile ターゲット | 出力バイナリ | ソース |
 |---------------------|--------------|--------|
-| `build` / `run` | `cpu/qwen3-cpu` | `cpu/main.c` |
-| `build.omp` / `run.omp` | `cpu-multicore/qwen3-cpu-omp` | `cpu-multicore/main.c`（`-fopenmp`、`OMP_NUM_THREADS`） |
-| `build.rocm` / `run.rocm` | `gpu/qwen3-rocm` | `gpu/main.c` |
+| `build.cpu` / `run.cpu` | `cpu/qwen3-cpu` | `cpu/main.c` |
+| `build.cpu-multicore` / `run.cpu-multicore` | `cpu-multicore/qwen3-cpu-omp` | `cpu-multicore/main.c`（`-fopenmp`、`OMP_NUM_THREADS`） |
+| `build.gpu` / `run.gpu` | `gpu/qwen3-rocm` | `gpu/main.c` |
 | `build.xdna2` / `run.xdna2` | `xdna2/qwen3-xdna2` | `xdna2/main.c`（`-fopenmp`。`amdxdna` カーネルモジュールが `/dev/accel/accelN` を提供） |
 | **`gen-xdna-kernels`** | （出力なし） | `xdna-gemv/gen-xdna-gemv-stubs.py` で **`xdna-gemv/kernels/bf16-gemv-*.bin`** プレースホルダを再生成 |
-| **`build.xdna2.bfpx` / `run.xdna2.bfpx`** | **`xdna2-bfp16/qwen3-xdna2-bfpx`** | **`xdna2-bfp16/main.c`**（`-fopenmp`。NPU 経路・環境変数は `qwen3-xdna2` と同種。ホスト重みは BFPX） |
+| **`build.xdna2-bfp16` / `run.xdna2-bfp16`** | **`xdna2-bfp16/qwen3-xdna2-bfpx`** | **`xdna2-bfp16/main.c`**（`-fopenmp`。NPU 経路・環境変数は `qwen3-xdna2` と同種。ホスト重みは BFPX） |
 
 ```bash
 cd qwen3-8b
-make build
-make build.omp
-make build.rocm              # hipcc・ROCm 必須
+make build.cpu
+make build.cpu-multicore
+make build.gpu               # hipcc・ROCm 必須
 make build.xdna2             # Linux >= 6.10 + amdxdna カーネルモジュール（XRT 不要）
 make gen-xdna-kernels        # ../xdna-gemv/kernels に bf16-gemv-* プレースホルダ生成（実 NPU ctrlcode ではない）
-make build.xdna2.bfpx        # 同上 + BFPX ホスト重み版バイナリ
+make build.xdna2-bfp16       # 同上 + BFPX ホスト重み版バイナリ
 OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp "$(MODEL)" -p "Hello" -n 4
 ```
 
@@ -95,7 +95,7 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp "$(MODEL)" -p "Hello" -n 4
 | `ROCM` | ROCm ルート | `/opt/rocm` |
 | `HIPCC` | HIP コンパイラ | `$(ROCM)/bin/hipcc` |
 | `GPU_ARCH` | `--offload-arch=`（**行末に `# …` と同書きしない**。値末尾空白で HIP が失敗することがあるので、説明は別行コメントへ） | `gfx1201` |
-| `XDNA_INCS` | `<drm/drm.h>` が標準外にあるときだけ付与する `-I…`（`build.xdna2` / `build.xdna2.bfpx`） | 未定義（空で可） |
+| `XDNA_INCS` | `<drm/drm.h>` が標準外にあるときだけ付与する `-I…`（`build.xdna2` / `build.xdna2-bfp16`） | 未定義（空で可） |
 | `MODEL` | GGUF パス | `Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf` |
 | `PROMPT` | ユーザプロンプト文字列 | `Hello, how are you?` |
 
@@ -103,15 +103,15 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp "$(MODEL)" -p "Hello" -n 4
 
 ```bash
 cd qwen3-8b
-make build
-make run PROMPT="質問" MODEL=path/to/model.gguf
+make build.cpu
+make run.cpu PROMPT="質問" MODEL=path/to/model.gguf
 ```
 
 ### CPU（OpenMP）
 
 ```bash
 cd qwen3-8b
-make build.omp
+make build.cpu-multicore
 OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp path/to/model.gguf -p "Hi" -n 8
 ```
 
@@ -119,8 +119,8 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp path/to/model.gguf -p "Hi" -n 8
 
 ```bash
 cd qwen3-8b
-make build.rocm GPU_ARCH=gfx1201
-make run.rocm PROMPT="Hello"
+make build.gpu GPU_ARCH=gfx1201
+make run.gpu PROMPT="Hello"
 ```
 
 ### XDNA2（AMD Ryzen AI NPU）
@@ -146,7 +146,7 @@ XDNA_NUM_COL=1 XDNA_HEAP_SIZE=33554432 ./xdna2/qwen3-xdna2 path/to/model.gguf --
 # 同上の短い別名
 ./xdna2/qwen3-xdna2 path/to/model.gguf -X
 # BFPX ホスト重み版（ビルド後バイナリは qwen3-xdna2-bfpx）
-make build.xdna2.bfpx
+make build.xdna2-bfp16
 ./xdna2-bfp16/qwen3-xdna2-bfpx path/to/model.gguf -p "Hi" -n 8
 ```
 
