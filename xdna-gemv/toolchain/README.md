@@ -10,10 +10,14 @@
 
 ### 本リポジトリ（Qwen3.c）のランタイム
 
-- **`qwen3-xdna2`** は実行時に **XRT に依存しない**実装です（**`amdxdna` の DRM ioctl のみ**で動かします）。
-- **IRON／mlir-aie の公式サンプル**が取る道は、**XRT と Peano でデザインをビルドし、ホストから NPU にロードして検証する**流れです（[Xilinx/mlir-aie README — Getting Started](https://github.com/Xilinx/mlir-aie#getting-started-for-amd-ryzen-ai-on-linux)、[AMD IRON README](https://github.com/amd/IRON/blob/devel/README.md)）。
+- **`qwen3-xdna2`** は、**XRT なし**で動きます。裏では **`amdxdna` の DRM ioctl だけ**を使っています。
+- 一方で **IRON／mlir-aie の公式サンプル**は、**XRT と Peano でデザインをビルドし、ホストから NPU にロードして検証する**のが一般的です（[Xilinx/mlir-aie README — Getting Started](https://github.com/Xilinx/mlir-aie#getting-started-for-amd-ryzen-ai-on-linux)、[AMD IRON README](https://github.com/amd/IRON/blob/devel/README.md)）。
 
-したがって、本書の流れはおおむね次の二段になります。
+Linux カーネル公式の [**AMD NPU**](https://docs.kernel.org/accel/amdxdna/amdnpu.html) では、**ドライバとファームウェアまわりの全体像**が整理されています。クライアント APU 内蔵の NPU は **`amdxdna`** が管理し、ワークロードは **XDNA Array のオーバーレイ**（空間パーティションの設定など）と **`ctrlcode`**（配下のオーケストレーション）の **2 種類のバイナリ**から成ります。**`ctrlcode`** はマイコン上の ERT で **`XAie_TxnOpcode` 列**として実行され、そのあいだにホスト DDR と L2 の間で DMA が走ります。各コンテキストは **命令用ホストバッファ**（ドキュメントでは例として 64 MiB 程度）へ `ctrlcode` を写してから、メールボックス経由で渡します。`qwen3-xdna2` が XRT なしで ioctl に渡しているバイナリが、ここで説明される **`ctrlcode`** に相当する、という整理を押さえるのに便利です。
+
+東京科学大学（2026年現在の名称。旧・東京工業大学）ACRi ルームの [**Ryzen NPU の利用方法**](https://gw.acri.c.titech.ac.jp/wp/manual/ryzen-npu)（リンクは従来どおり `titech.ac.jp`）は、**浮動小数ベクトル加算（`vadd`）** を題材にした日本語チュートリアルで、手を動かしやすくまとまっています。同ルームの **Ryzen NPU サーバー**（記事ではホスト名 `ds001`）向けに、AIE カーネル（C++／Peano）、mlir-aie の **IRON（`aie.iron`）** による AIE プログラム（Python から MLIR を生成）、`aiecc` での **`xclbin` と NPU 向け命令バイナリ（例: `vadd_inst.bin`）** の生成まで、さらに **XRT を使うホスト（C++）からのロードと検証**まで、コマンド例つきで追えるようになっています。文中のパス（例: `/tools/repo/Xilinx/mlir-aie/`）はその環境での一例にすぎないので、自前のマシンでは本 README や mlir-aie／XRT の公式手順に沿って読み替え、同じ「カーネル → MLIR → `aiecc` → バイナリ → ホスト実行」の流れに乗れば十分です。ツールチェインに初めて触れる人にとっても、頼りになる参照になるはずです。**執筆の安藤潤さん**には、公開サーバーでの実践を丁寧に文章化していただきました。ここに敬意と感謝をお伝えします。
+
+以上を前提に、本書の流れはおおむね次の二段になります。
 
 1. **開発用マシンに、XRT と mlir-aie／IRON が求める構成をそろえ、`aiecc` や IRON が出力する「NPU 向けバイナリ」の意味を把握する。**  
 2. **そのうち、`ERT_START_NPU` に載せられる「txn／NPU insts」に相当する部分だけを `bf16-gemv-*.bin` として取り出し、`XDNA_GEMV_DIR` に置く。**  
@@ -228,9 +232,9 @@ aiecc --verbose --aie-generate-npu-insts design.mlir
 
 1. mlir-aie／IRON のサンプルを `--aie-generate-npu-insts` でビルドし、出力ファイルのサイズや先頭バイトなどを記録する。  
 2. `qwen3-xdna2` に **スタブではない**そのバイナリを渡し、`EXEC_CMD` が成功するか、`--xdna-status` と推論ログの **NPU GEMV 回数**で確認する。  
-3. 必要に応じて [amdnpu.rst（xdna-driver の説明）](https://github.com/amd/xdna-driver/blob/main/src/driver/doc/amdnpu.rst) や mlir-aie の Issue などで、**txn と制御コードのレイアウト**を照らし合わせる。
+3. 必要に応じて [amdnpu.rst（xdna-driver の説明）](https://github.com/amd/xdna-driver/blob/main/src/driver/doc/amdnpu.rst)、Linux カーネル文書の [**AMD NPU**](https://docs.kernel.org/accel/amdxdna/amdnpu.html)（Application Binaries／High-level Use Flow など）、または mlir-aie の Issue などで、**txn と制御コードのレイアウト**を照らし合わせる。
 
-**オーバーレイ（`CONFIG_HWCTX`）との関係:** `qwen3-8b/xdna2/main.c` の冒頭コメントでは、`overlay` と `ctrlcode` の**ペア**が必要となる旨が述べられている箇所もあります。`bf16-gemv-*.bin` だけでは足りず、mlir-aie が生成する PDI や xclbin との整合まで必要になる場合があります。**すべてを一致させる作業は、統合側の開発者の責務**となります。
+**オーバーレイ（`CONFIG_HWCTX`）との関係:** `qwen3-8b/xdna2/main.c` の冒頭コメントでは、`overlay` と `ctrlcode` の**ペア**が必要となる旨が述べられている箇所もあります。`bf16-gemv-*.bin` だけでは足りず、mlir-aie が生成する PDI や xclbin との整合まで必要になる場合があります。**すべてを一致させる作業は、統合側の開発者の責務**となります。オーバーレイと `ctrlcode` の分担は、上記カーネル文書の *Application Binaries* でも公式に定義されています。
 
 別ルートとして `aiecc` には **`--aie-generate-txn`** や **`--aie-generate-ctrlpkt`** もあり、構成や世代によって **txn と制御パケットが分かれる**ことも README にあります。**どの出力が、ご自分のプラットフォーム・ファームウェアでの `ERT_START_NPU` に適合するかは環境依存**です。
 
@@ -274,7 +278,9 @@ cd /absolute/path/to/gguf.Qwen3.c/qwen3-8b
 | IRON の GEMV（`GEMV(M,K)` の定義） | [iron/operators/gemv/op.py](https://github.com/amd/IRON/blob/devel/iron/operators/gemv/op.py) |
 | Peano llvm-aie | [https://github.com/Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) |
 | xdna-driver ドキュメント（ctrlcode と DMA の背景） | [amdnpu.rst](https://github.com/amd/xdna-driver/blob/main/src/driver/doc/amdnpu.rst) |
+| Linux カーネル文書：AMD NPU（`amdxdna`／overlay／`ctrlcode`／ERT） | [AMD NPU](https://docs.kernel.org/accel/amdxdna/amdnpu.html) |
 | 本リポジトリ側の GEMV 形状（スタブ生成） | [`xdna-gemv/gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) |
+| 東京科学大学 ACRi ルーム（2026年現在の名称。旧・東京工業大学）：Ryzen NPU サーバー上の vadd チュートリアル（日本語。執筆：安藤潤氏） | [Ryzen NPU の利用方法](https://gw.acri.c.titech.ac.jp/wp/manual/ryzen-npu) |
 
 ---
 
