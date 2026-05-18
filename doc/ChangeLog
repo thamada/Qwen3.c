@@ -4,6 +4,16 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-18 20:38:59
+
+**`qwen3-8b/hf-model.py`**: **`qwen3-8b/gguf.txt`** の Hugging Face **`blob` / `resolve` URL** を解釈し、**`hf download`** で既定配置先（スクリプトと同じディレクトリ、**`--local-dir`** で変更可）に取得。開始時に **`hf auth login`** を実行（**`HF_TOKEN`** または **`--token`** で非対話可）。Hub の tree API から当該ファイルの **LFS `oid`（SHA256）** を取得し、ダウンロード後のファイルと照合する。旧ファイル名 **`download_gguf_hf.py`** は **`hf-model.py`** に変更。
+
+**`.gitignore`**: **`__pycache__/`** と **`*.py[cod]`** を追加（**`qwen3-8b/__pycache__`** 等を Git 対象外に）。
+
+**`doc/design.md`**: ディレクトリ表の **`.gitignore`**・**`gguf.txt`**・**`hf-model.py`** の一行、**「モデル参照」** に上記を反映。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-18 20:18:49
 
 **`xdna-gemv/`** を **`qwen3-8b/xdna2/xdna-gemv/`** に移動。**`gen-xdna-gemv-stubs.py`** はスクリプト隣接の **`kernels/`** を既定出力とするよう変更。**`qwen3-8b/Makefile`**・**`qwen3-8b/xdna2/Makefile`** の **`gen-xdna-kernels`**、`README.md` / **`README.en.md`** / **`doc/design.md`** / 同梱ドキュメント・**`qwen3-8b/xdna2/main.c`** のパス表記を追随（**`qwen3-8b` からの `XDNA_GEMV_DIR`** 例は **`xdna2/xdna-gemv/kernels`**）。

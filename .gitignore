@@ -1,5 +1,9 @@
 .cursor
 *~
+
+# Python
+__pycache__/
+*.py[cod]
 *.gguf
 Meta-Llama-3-8B-Instruct.Q8_0.gguf
 
