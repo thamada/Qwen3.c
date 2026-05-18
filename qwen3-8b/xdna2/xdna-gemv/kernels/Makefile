@@ -16,7 +16,7 @@ XDNA_GEMV_BIN_URL_BASE ?= https://github.com/thamada/Qwen3.c/releases/download/x
 
 .DEFAULT_GOAL := all
 
-# xdna-gemv/gen-xdna-gemv-stubs.py の SHAPES と qwen3-8b/xdna2/main.c のテキスト経路を一致させること
+# このディレクトリの親に gen-xdna-gemv-stubs.py がある。SHAPES は qwen3-8b/xdna2/main.c のテキスト経路と一致させること
 GEMV_BINARIES := \
 	bf16-gemv-4096x4096.bin \
 	bf16-gemv-4096x1024.bin \

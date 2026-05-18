@@ -2413,7 +2413,7 @@ static int npu_submit_start_npu(XdnaDev *dev,
  *   AMD IRON / MLIR-AIE toolchain for that exact (n,d) GEMV shape. If the
  *   file is missing we fall back to CPU.
  *
- *   Repository placeholders use magic bytes "GQF3XDNA" (see ../../xdna-gemv/gen-xdna-gemv-stubs.py);
+ *   Repository placeholders use magic bytes "GQF3XDNA" (see xdna-gemv/gen-xdna-gemv-stubs.py next to this directory);
  *   load_gemv_kernel rejects them so they never reach ERT_START_NPU.
  * ================================================================ */
 
@@ -3010,7 +3010,7 @@ static void print_xdna_gemv_ctrlcode_report(const Model *m) {
                dev->force_cpu ? "XDNA_FORCE_CPU" : "DRM device unavailable");
     } else if (!dir_ok) {
         printf("  Set XDNA_GEMV_DIR to the directory containing bf16-gemv-<n>x<d>.bin "
-               "for the shapes above (repository defaults live under xdna-gemv/kernels).\n");
+               "for the shapes above (repository defaults live under qwen3-8b/xdna2/xdna-gemv/kernels).\n");
     } else if (n_ok == n_shapes) {
         printf("  All %d ctrlcode files are readable non-stub binaries — each `launch_mm_bf16` "
                "will attempt NPU execution (see \"NPU GEMV / CPU GEMV\" counts after a run).\n",

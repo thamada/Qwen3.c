@@ -59,7 +59,7 @@ run.xdna2: build.xdna2
 
 # XDNA: スタブ再生成（リポジトリルート基準）。
 gen-xdna-kernels:
-	cd .. && python3 xdna-gemv/gen-xdna-gemv-stubs.py xdna-gemv/kernels
+	cd .. && python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels
 
 # -----------------------------------------------------------------------------
 # AMD Ryzen AI XDNA2 + BFPX（xdna2-bfp16/main.c）

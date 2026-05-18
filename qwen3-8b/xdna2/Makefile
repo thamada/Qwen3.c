@@ -20,7 +20,7 @@ run: build
 
 # スタブのみ（実 NPU ctrlcode ではない）— リポジトリルート基準。
 gen-xdna-kernels:
-	cd ../.. && python3 xdna-gemv/gen-xdna-gemv-stubs.py xdna-gemv/kernels
+	cd ../.. && python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels
 
 clean:
 	rm -f qwen3-xdna2

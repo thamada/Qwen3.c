@@ -13,8 +13,8 @@
 ## 最短の状態確認・スタブ再生成（リポジトリルートから）
 
 ```bash
-python3 xdna-gemv/gen-xdna-gemv-stubs.py
-export XDNA_GEMV_DIR="$(pwd)/xdna-gemv/kernels"
+python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py
+export XDNA_GEMV_DIR="$(pwd)/qwen3-8b/xdna2/xdna-gemv/kernels"
 cd qwen3-8b && ./xdna2/qwen3-xdna2 /path/to/model.gguf --xdna-status
 ```
 

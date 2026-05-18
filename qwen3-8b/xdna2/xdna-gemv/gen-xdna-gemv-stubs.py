@@ -7,9 +7,9 @@ These binaries are NOT executable control microcode. They carry an 8-byte magic
 to CPU. Replace them with MLIR-AIE / IRON produced txn blobs for real NPU GEMV.
 
 Usage:
-  python3 xdna-gemv/gen-xdna-gemv-stubs.py [output_dir]
+  python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py [output_dir]
 
-Default output_dir: ./xdna-gemv/kernels (repository root relative).
+Default output_dir: sibling ``kernels`` directory next to this script.
 """
 from __future__ import annotations
 
@@ -46,8 +46,8 @@ def write_stub(path: str, n: int, d: int) -> None:
 
 
 def main() -> int:
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    out = os.path.join(repo_root, "xdna-gemv", "kernels")
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    out = os.path.join(pkg_dir, "kernels")
     if len(sys.argv) >= 2:
         out = os.path.abspath(sys.argv[1])
     for n, d in SHAPES:

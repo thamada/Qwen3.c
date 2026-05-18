@@ -54,11 +54,6 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 ├── doc/
 │   ├── ChangeLog
 │   └── design.md
-├── xdna-gemv/
-│   ├── README.md
-│   ├── gen-xdna-gemv-stubs.py
-│   ├── kernels/
-│   └── toolchain/
 └── qwen3-8b/
     ├── Makefile
     ├── gguf.txt
@@ -73,7 +68,12 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     │   └── main.c
     ├── xdna2/
     │   ├── Makefile
-    │   └── main.c
+    │   ├── main.c
+    │   └── xdna-gemv/
+    │       ├── README.md
+    │       ├── gen-xdna-gemv-stubs.py
+    │       ├── kernels/
+    │       └── toolchain/
     ├── xdna2-bfp16/
     │   ├── Makefile
     │   └── main.c
@@ -324,7 +324,7 @@ make build.xdna2
 
 NPU 上で実際に高速 GEMV を回すには **MLIR-AIE / IRON ツールチェイン**で生成した BF16 GEMV 制御コードバイナリ一式が必要です。`bf16-gemv-<n>x<d>.bin` という命名で `XDNA_GEMV_DIR` 配下に配置します。未配置の場合は OpenMP BF16 GEMV にフォールバックします（**NPU 経路とこの CPU フォールバックは bit-identical**）。
 
-**`xdna-gemv/kernels/`** には、名前とレイアウト用の **64 バイト・プレースホルダ**（マジック `GQF3XDNA`）が置いてあります。**実機の ERT には渡されません**（`--xdna-status` では `[STUB]`）。再生成はリポジトリルートで `python3 xdna-gemv/gen-xdna-gemv-stubs.py xdna-gemv/kernels`、または `cd qwen3-8b && make gen-xdna-kernels`。本番の NPU 用には MLIR-AIE 等で生成したバイナリに差し替えてください。
+**`xdna2/xdna-gemv/kernels/`** には、名前とレイアウト用の **64 バイト・プレースホルダ**（マジック `GQF3XDNA`）が置いてあります。**実機の ERT には渡されません**（`--xdna-status` では `[STUB]`）。再生成はリポジトリルートで `python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels`、または `cd qwen3-8b && make gen-xdna-kernels`。本番の NPU 用には MLIR-AIE 等で生成したバイナリに差し替えてください。
 
 環境変数の例: `XDNA_GEMV_DIR`（制御コード検索ディレクトリ）、`XDNA_FORCE_CPU=1`（CPU 強制）、`XDNA_NUM_COL`（列数。`CREATE_HWCTX` が EINVAL になる環境では `XDNA_NUM_COL=1` を試す）。
 
@@ -333,11 +333,11 @@ NPU 上で実際に高速 GEMV を回すには **MLIR-AIE / IRON ツールチェ
 XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 
 # リポジトリ同梱プレースホルダ（qwen3-8b からの相対パス）。実 NPU ctrlcode ではない。
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
+XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
 
 # 制御コードが揃っているときは NPU 経路で実行（本物の .bin に差し替え後）
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
+XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
@@ -355,7 +355,7 @@ make run.xdna2 PROMPT="日本語で短く説明してください。"
 cd qwen3-8b
 make build.xdna2.bfpx
 XDNA_FORCE_CPU=1 ./xdna2-bfp16/qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-XDNA_GEMV_DIR=../xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
+XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 

@@ -2,7 +2,7 @@
 
 このディレクトリの文書は、**本リポジトリの `qwen3-xdna2`** が環境変数 `XDNA_GEMV_DIR` から読み込む **`bf16-gemv-<n>x<d>.bin`** を、公開されている **MLIR-AIE／IRON／Peano** 一式を揃えて生成するところまでの入口です。このファイルは XAie のトランザクション列に相当するバイナリを想定しています。
 
-実装側の説明は `qwen3-8b/xdna2/main.c` の `load_gemv_kernel` 付近のコメント、および形状リストがある [`xdna-gemv/gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) を参照してください。
+実装側の説明は `qwen3-8b/xdna2/main.c` の `load_gemv_kernel` 付近のコメント、および形状リストがある [`gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) を参照してください。
 
 ---
 
@@ -249,11 +249,11 @@ aiecc --verbose --aie-generate-npu-insts design.mlir
 
 ## 9. 成果物を `qwen3-xdna2` に渡す手順の例（ビルド済みである場合）
 
-検証済みの `.bin` を **`xdna-gemv/kernels/`** に置いたと仮定した例です。
+検証済みの `.bin` を **`qwen3-8b/xdna2/xdna-gemv/kernels/`** に置いたと仮定した例です。
 
 ```bash
 # 例（パスはご自身の clone 場所に合わせてください）
-export XDNA_GEMV_DIR="/absolute/path/to/gguf.Qwen3.c/xdna-gemv/kernels"
+export XDNA_GEMV_DIR="/absolute/path/to/gguf.Qwen3.c/qwen3-8b/xdna2/xdna-gemv/kernels"
 
 ls -la "$XDNA_GEMV_DIR"/bf16-gemv-*.bin
 
@@ -279,7 +279,7 @@ cd /absolute/path/to/gguf.Qwen3.c/qwen3-8b
 | Peano llvm-aie | [https://github.com/Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) |
 | xdna-driver ドキュメント（ctrlcode と DMA の背景） | [amdnpu.rst](https://github.com/amd/xdna-driver/blob/main/src/driver/doc/amdnpu.rst) |
 | Linux カーネル文書：AMD NPU（`amdxdna`／overlay／`ctrlcode`／ERT） | [AMD NPU](https://docs.kernel.org/accel/amdxdna/amdnpu.html) |
-| 本リポジトリ側の GEMV 形状（スタブ生成） | [`xdna-gemv/gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) |
+| 本リポジトリ側の GEMV 形状（スタブ生成） | [`gen-xdna-gemv-stubs.py`](../gen-xdna-gemv-stubs.py) |
 | 東京科学大学 ACRi ルーム（2026年現在の名称。旧・東京工業大学）：Ryzen NPU サーバー上の vadd チュートリアル（日本語。執筆：安藤潤氏） | [Ryzen NPU の利用方法](https://gw.acri.c.titech.ac.jp/wp/manual/ryzen-npu) |
 
 ---
