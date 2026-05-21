@@ -7,7 +7,7 @@
  * テキスト処理のみ。Vision deepstack は無視。
  *
  * GPU 方針:
- *   - 起動時に CPU で逆量子化 → FP16 → VRAM アップロード。
+ *   - 起動時に CPU で逆量子化 → FP16 (+ BONSAI_FP4 時 NVFP4) → VRAM アップロード。
  *   - Prefill: 全プロンプトトークンをバッチ並列（gpu_forward_prefill）。
  *   - Decode: 1 トークンずつ gpu_forward。
  *   - 線形層: FP16 GEMV カーネル（mm_f16_gemv_kernel）。
@@ -30,6 +30,9 @@
 #include <unistd.h>
 #include "gpu.h"
 #include <cuda_runtime.h>
+#ifdef BONSAI_FP4
+#include "fp4_qwen3.h"
+#endif
 
 #define CUDACHECK(x) do { \
     cudaError_t _cuda_err = (x); \
@@ -655,6 +658,11 @@ typedef struct {
     void **gate, **up, **down;
     float *norm_out;
     void *out;     int out_t;
+#ifdef BONSAI_FP4
+    void **wq_fp4, **wk_fp4, **wv_fp4, **wo_fp4;
+    void **gate_fp4, **up_fp4, **down_fp4;
+    void *out_fp4;
+#endif
 } WeightsDev;
 
 typedef struct {
@@ -1074,6 +1082,48 @@ static const void *raw_tensor_ptr(Model *m, const TensorInfo *ti) {
     return m->fdata + m->doff + ti->offset;
 }
 
+static void materialize_host_f16(Model *m, const TensorInfo *ti,
+                                 float *f32_buf, uint16_t *f16_buf) {
+    size_t nel = ti_nelements(ti);
+    const void *raw = raw_tensor_ptr(m, ti);
+
+    if (ti->type == DT_F32) {
+        const float *src = (const float *)raw;
+        for (size_t i = 0; i < nel; i++)
+            f16_buf[i] = host_f32f16(src[i]);
+        return;
+    }
+    if (ti->type == DT_F16) {
+        memcpy(f16_buf, raw, nel * sizeof(uint16_t));
+        return;
+    }
+
+    if (nel % QK_K) {
+        fprintf(stderr, "Error: tensor %s nelements %zu not a multiple of QK_K\n",
+                ti->name, nel);
+        exit(1);
+    }
+    size_t nb = nel / QK_K;
+    switch (ti->type) {
+    case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)raw,  f32_buf, nb); break;
+    case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)raw,  f32_buf, nb); break;
+    case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)raw, f32_buf, nb); break;
+    case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)raw, f32_buf, nb); break;
+    default:
+        fprintf(stderr, "Error: unsupported dtype %d for tensor %s\n", ti->type, ti->name);
+        exit(1);
+    }
+    for (size_t i = 0; i < nel; i++)
+        f16_buf[i] = host_f32f16(f32_buf[i]);
+}
+
+static void *upload_host_f16(const uint16_t *f16_buf, size_t nel) {
+    void *dptr = NULL;
+    CUDACHECK(cudaMalloc(&dptr, nel * sizeof(uint16_t)));
+    CUDACHECK(cudaMemcpy(dptr, f16_buf, nel * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    return dptr;
+}
+
 static void *upload_fp16_dequant(Model *m, const char *name,
                                  float *f32_buf, uint16_t *f16_buf, int *out_type) {
     TensorInfo *ti = ti_find(m, name);
@@ -1116,6 +1166,26 @@ static void *upload_fp16_dequant(Model *m, const char *name,
     CUDACHECK(cudaMemcpy(dptr, f16_buf, nel * sizeof(uint16_t), cudaMemcpyHostToDevice));
     return dptr;
 }
+
+#ifdef BONSAI_FP4
+static void upload_linear_fp4(Model *m, const char *name,
+                              float *f32_buf, uint16_t *f16_buf,
+                              void **out_f16, void **out_fp4,
+                              int n_out, int n_in) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) {
+        fprintf(stderr, "missing tensor %s\n", name);
+        exit(1);
+    }
+    materialize_host_f16(m, ti, f32_buf, f16_buf);
+    *out_f16 = upload_host_f16(f16_buf, ti_nelements(ti));
+    *out_fp4 = fp4_qwen3_weight_from_f16_host(f16_buf, n_out, n_in);
+    if (!*out_fp4) {
+        fprintf(stderr, "NVFP4 quantize failed for %s (%dx%d)\n", name, n_out, n_in);
+        exit(1);
+    }
+}
+#endif
 
 static void *upload_f32(Model *m, const char *name) {
     TensorInfo *ti = ti_find(m, name);
@@ -1167,8 +1237,21 @@ static void upload_weights_gpu(Model *m) {
     wd->gate     = (void  **)calloc(L, sizeof(void *));
     wd->up       = (void  **)calloc(L, sizeof(void *));
     wd->down     = (void  **)calloc(L, sizeof(void *));
+#ifdef BONSAI_FP4
+    wd->wq_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->wk_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->wv_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->wo_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->gate_fp4 = (void  **)calloc(L, sizeof(void *));
+    wd->up_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->down_fp4 = (void  **)calloc(L, sizeof(void *));
+#endif
 
+#ifdef BONSAI_FP4
+    printf("Uploading weights to device (dequant -> FP16 decode + NVFP4 prefill)...\n");
+#else
     printf("Uploading weights to device (dequantizing IQ2_S / IQ3_S / Q4_K / Q5_K -> FP16)...\n");
+#endif
 
     wd->embd = upload_fp16_dequant(m, "token_embd.weight", f32, f16, &wd->embd_t);
     if (!wd->embd) { fprintf(stderr, "missing token_embd.weight\n"); exit(1); }
@@ -1176,16 +1259,36 @@ static void upload_weights_gpu(Model *m) {
     char name[128];
     for (int l = 0; l < L; l++) {
         sprintf(name, "blk.%d.attn_norm.weight", l);     wd->norm_att[l] = (float *)upload_f32(m, name);
+#ifdef BONSAI_FP4
+        sprintf(name, "blk.%d.attn_q.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->wq[l], &wd->wq_fp4[l], c->dim, c->dim);
+        sprintf(name, "blk.%d.attn_k.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->wk[l], &wd->wk_fp4[l], c->kv_dim, c->dim);
+        sprintf(name, "blk.%d.attn_v.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->wv[l], &wd->wv_fp4[l], c->kv_dim, c->dim);
+        sprintf(name, "blk.%d.attn_output.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->wo[l], &wd->wo_fp4[l], c->dim, c->dim);
+#else
         sprintf(name, "blk.%d.attn_q.weight", l);        wd->wq[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.attn_k.weight", l);        wd->wk[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.attn_v.weight", l);        wd->wv[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.attn_output.weight", l);   wd->wo[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
+#endif
         sprintf(name, "blk.%d.attn_q_norm.weight", l);   wd->q_norm[l]   = (float *)upload_f32(m, name);
         sprintf(name, "blk.%d.attn_k_norm.weight", l);   wd->k_norm[l]   = (float *)upload_f32(m, name);
         sprintf(name, "blk.%d.ffn_norm.weight", l);      wd->norm_ffn[l] = (float *)upload_f32(m, name);
+#ifdef BONSAI_FP4
+        sprintf(name, "blk.%d.ffn_gate.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->gate[l], &wd->gate_fp4[l], c->hidden_dim, c->dim);
+        sprintf(name, "blk.%d.ffn_up.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->up[l], &wd->up_fp4[l], c->hidden_dim, c->dim);
+        sprintf(name, "blk.%d.ffn_down.weight", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->down[l], &wd->down_fp4[l], c->dim, c->hidden_dim);
+#else
         sprintf(name, "blk.%d.ffn_gate.weight", l);      wd->gate[l]     = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.ffn_up.weight", l);        wd->up[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.ffn_down.weight", l);      wd->down[l]     = upload_fp16_dequant(m, name, f32, f16, NULL);
+#endif
         if (!wd->norm_att[l] || !wd->wq[l] || !wd->wk[l] || !wd->wv[l] ||
             !wd->wo[l] || !wd->q_norm[l] || !wd->k_norm[l] || !wd->norm_ffn[l] ||
             !wd->gate[l] || !wd->up[l] || !wd->down[l]) {
@@ -1197,7 +1300,22 @@ static void upload_weights_gpu(Model *m) {
     }
 
     wd->norm_out = (float *)upload_f32(m, "output_norm.weight");
+#ifdef BONSAI_FP4
+    {
+        TensorInfo *ti = ti_find(m, "output.weight");
+        if (!ti) { fprintf(stderr, "missing output.weight\n"); exit(1); }
+        materialize_host_f16(m, ti, f32, f16);
+        wd->out = upload_host_f16(f16, ti_nelements(ti));
+        wd->out_t = DT_F16;
+        wd->out_fp4 = fp4_qwen3_weight_from_f16_host(f16, c->vocab_size, c->dim);
+        if (!wd->out_fp4) {
+            fprintf(stderr, "NVFP4 quantize failed for output.weight\n");
+            exit(1);
+        }
+    }
+#else
     wd->out      = upload_fp16_dequant(m, "output.weight", f32, f16, &wd->out_t);
+#endif
     if (!wd->out) wd->out = wd->embd;
     if (!wd->norm_out) { fprintf(stderr, "missing output_norm.weight\n"); exit(1); }
 
@@ -1212,6 +1330,10 @@ static void free_dev_weights(WeightsDev *wd, int L) {
     free(wd->norm_att); free(wd->q_norm); free(wd->k_norm);
     free(wd->wq); free(wd->wk); free(wd->wv); free(wd->wo);
     free(wd->norm_ffn); free(wd->gate); free(wd->up); free(wd->down);
+#ifdef BONSAI_FP4
+    free(wd->wq_fp4); free(wd->wk_fp4); free(wd->wv_fp4); free(wd->wo_fp4);
+    free(wd->gate_fp4); free(wd->up_fp4); free(wd->down_fp4);
+#endif
     memset(wd, 0, sizeof(*wd));
 }
 
@@ -1246,6 +1368,17 @@ static GpuWeightsHost gpu_weights_from(const WeightsDev *wd) {
     gh.down = (void **)wd->down;
     gh.norm_out = wd->norm_out;
     gh.out = wd->out; gh.out_t = wd->out_t;
+#ifdef BONSAI_FP4
+    gh.wq_fp4 = wd->wq_fp4; gh.wk_fp4 = wd->wk_fp4;
+    gh.wv_fp4 = wd->wv_fp4; gh.wo_fp4 = wd->wo_fp4;
+    gh.gate_fp4 = wd->gate_fp4; gh.up_fp4 = wd->up_fp4;
+    gh.down_fp4 = wd->down_fp4;
+    gh.out_fp4 = wd->out_fp4;
+#else
+    gh.wq_fp4 = NULL; gh.wk_fp4 = NULL; gh.wv_fp4 = NULL; gh.wo_fp4 = NULL;
+    gh.gate_fp4 = NULL; gh.up_fp4 = NULL; gh.down_fp4 = NULL;
+    gh.out_fp4 = NULL;
+#endif
     return gh;
 }
 

@@ -28,20 +28,6 @@ static size_t g_act_cap = 0, g_out_cap = 0;
 
 static int align128(int x) { return (x + 127) & ~127; }
 
-static __global__ void f16_to_bf16_pad_kernel(
-    const uint16_t *src, __nv_bfloat16 *dst, int N, int K, int K_pad)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * K_pad;
-    if (idx >= total) return;
-    int row = idx / K_pad;
-    int k = idx % K_pad;
-    float v = 0.f;
-    if (k < K)
-        v = __half2float(*reinterpret_cast<const __half *>(&src[(size_t)row * K + k]));
-    dst[idx] = __float2bfloat16_rn(v);
-}
-
 static __global__ void f32_to_bf16_pad_kernel(
     const float *src, __nv_bfloat16 *dst, int M, int n, int K_pad, int M_act)
 {
@@ -104,26 +90,11 @@ void fp4_qwen3_shutdown(void)
     g_max_M = g_max_N = g_max_K = 0;
 }
 
-void *fp4_qwen3_weight_from_f16_device(const void *dev_f16, int N, int K)
+void *fp4_qwen3_weight_from_f16_host(const uint16_t *host_f16, int N, int K)
 {
-    int N_pad = align128(N);
-    int K_pad = align128(K);
-
-    __nv_bfloat16 *dev_bf16 = NULL;
-    CUDA_CHECK(cudaMalloc(&dev_bf16, (size_t)N_pad * K_pad * sizeof(__nv_bfloat16)));
-    CUDA_CHECK(cudaMemset(dev_bf16, 0, (size_t)N_pad * K_pad * sizeof(__nv_bfloat16)));
-
-    int total = N * K_pad;
-    f16_to_bf16_pad_kernel<<<(total + 255) / 256, 256>>>(
-        (const uint16_t *)dev_f16, dev_bf16, N, K, K_pad);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    void *cache = fp4_quantize_weights(dev_bf16, N_pad, K_pad);
-    cudaFree(dev_bf16);
-
+    void *cache = fp4_quantize_weights_host_f16(host_f16, N, K);
     if (!cache)
-        fprintf(stderr, "fp4_qwen3_weight_from_f16_device: quantize failed N=%d K=%d\n",
-                N_pad, K_pad);
+        fprintf(stderr, "fp4_qwen3_weight_from_f16_host: quantize failed N=%d K=%d\n", N, K);
     return cache;
 }
 

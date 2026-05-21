@@ -12,6 +12,7 @@ qwen3-8b/cpu/qwen3-cpu
 qwen3-8b/cpu-multicore/qwen3-cpu-omp
 qwen3-8b/gpu-rocm/qwen3-rocm
 qwen3-8b/gpu-cuda/qwen3-gpu-cuda
+qwen3-8b/gpu-cuda/fp4_verify
 qwen3-8b/gpu-cuda/*.o
 qwen3-8b/gpu-cuda/third_party/
 qwen3-8b/xdna2/qwen3-xdna2

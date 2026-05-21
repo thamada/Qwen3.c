@@ -1,6 +1,8 @@
 #ifndef BONSAI_FP4_GEMM_H
 #define BONSAI_FP4_GEMM_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -15,6 +17,8 @@ void fp4_gemm_cleanup(void);
 void fp4_gemm_sync(void);
 
 void *fp4_quantize_weights(const void *weight_bf16, int N, int K);
+/* Host row-major FP16 [N,K] -> device NVFP4 cache (128-padded). */
+void *fp4_quantize_weights_host_f16(const uint16_t *host_f16, int N, int K);
 const void *fp4_weight_cache_fp4_ptr(const void *cache);
 const void *fp4_weight_cache_sf_ptr(const void *cache);
 int   fp4_weight_cache_N(const void *cache);

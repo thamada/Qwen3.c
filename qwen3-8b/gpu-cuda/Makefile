@@ -64,7 +64,11 @@ endif
 # BONSAI_FP4 / FA_BR が変わったら kernels を必ず再コンパイル（古い .o 再利用防止）
 KERNELS_OBJ := kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR_VAL).o
 
-.PHONY: build build.fp4 run run.no-fp4 clean blackwell cutlass
+.PHONY: build build.fp4 run run.no-fp4 clean blackwell cutlass fp4-test
+
+fp4-test: fp4_gemm.o | cutlass
+	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu fp4_gemm.o $(LDFLAGS)
+	./fp4_verify
 
 .DEFAULT_GOAL := run
 
@@ -77,8 +81,8 @@ build.fp4: cutlass
 build.no-fp4:
 	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_FP4=0
 
-main.o: main.c gpu.h
-	$(CC) $(CFLAGS) -c main.c -o main.o
+main.o: main.c gpu.h fp4_qwen3.h
+	$(CC) $(CFLAGS) $(FP4_FLAG) -c main.c -o main.o
 
 $(KERNELS_OBJ): kernels.cu gpu.h fp4_qwen3.h
 	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) -c kernels.cu -o $@
@@ -101,7 +105,7 @@ run.no-fp4: build.no-fp4
 	./qwen3-gpu-cuda "$(MODEL)" -p "$(PROMPT)"
 
 clean:
-	rm -f qwen3-gpu-cuda main.o kernels.*.o fp4_gemm.o fp4_qwen3.o
+	rm -f qwen3-gpu-cuda fp4_verify main.o kernels.*.o fp4_gemm.o fp4_qwen3.o
 
 # apt CUDA 11 を削除 → NVIDIA 公式 CUDA 13 をインストール → Blackwell FP4 ビルド
 blackwell:

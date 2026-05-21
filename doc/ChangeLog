@@ -4,6 +4,16 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 20:18:22
+
+**`qwen3-8b/gpu-cuda/`**: **`fp4_bonsai`** を **`fp4_qwen3`**（CUTLASS NVFP4 ブリッジ）に置換。**`Makefile`** に **`build.fp4`**・**`build.no-fp4`**・**`run.no-fp4`** を追加。既定 **`run` → `build.fp4`**（Blackwell）。**`KERNELS_OBJ`** で **`BONSAI_FP4`/`FA_BR` 別オブジェクト**。**`fp4_verify.cu`** と **`fp4-test`** ターゲット。
+
+**`README.md`**・**`README.en.md`**: FP16 汎用ビルドと Blackwell NVFP4 の手順を分離。既定 **`make run` が `build.fp4` である**注意を追記。
+
+**`doc/design.md`**: 上記に追随（バリアント表・ディレクトリ表・Make ターゲット・CUDA 節・実行時挙動・制約・トラブルシュート）。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-21 17:44:31
 
 **`README.md`**・**`README.en.md`**: **`gpu-cuda/`**（CUDA ビルド・実行・要件）を追記。実行経路表・ディレクトリツリー・モデル取得（**`make model`**）を更新。集約 Makefile のターゲット名に追随（**`build.cpu`**・**`build.cpu-multicore`**・**`build.xdna2-bfp16`** 等）。CUDA のトラブルシュート・**`make clean`** 注記を追加。

@@ -38,7 +38,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
-| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。集約 `Makefile` 外（`gpu-cuda/` で単体ビルド） |
+| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。任意で Blackwell **NVFP4**（`fp4_qwen3` + CUTLASS）。集約 `Makefile` 外 |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
@@ -71,7 +71,9 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     │   ├── Makefile
     │   ├── main.c
     │   ├── kernels.cu
-    │   └── gpu.h
+    │   ├── gpu.h
+    │   ├── fp4_gemm.cu / fp4_qwen3.cu  （Blackwell FP4 時）
+    │   └── third_party/cutlass/  （make cutlass で取得）
     ├── xdna2/
     │   ├── Makefile
     │   ├── main.c
@@ -158,7 +160,15 @@ nvcc --version
 nvidia-smi
 ```
 
-`nvcc` / `nvlink` は **CUDA の `bin` ディレクトリ**を `PATH` に通してください（`/usr/local/bin/nvcc` のみだとリンクに失敗することがあります）。既定ビルドは PTX（`compute_86`）です。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。Blackwell（RTX 50 系等）向けの FP4 経路は **`cd gpu-cuda && make blackwell`**（CUDA 13 導入・CUTLASS 取得を含む）を参照してください。
+`nvcc` / `nvlink` は **CUDA の `bin` ディレクトリ**を `PATH` に通してください（`/usr/local/bin/nvcc` のみだとリンクに失敗することがあります）。
+
+| 用途 | コマンド（`cd qwen3-8b/gpu-cuda`） |
+|------|-----------------------------------|
+| **FP16 のみ**（Ampere/Ada 等・PTX 可） | `make build.no-fp4` または `make run.no-fp4` |
+| **Blackwell NVFP4**（RTX 50 系等） | `make build.fp4` / 既定の `make run`（内部で `build.fp4`） |
+| CUDA 13 の導入から一式 | `make blackwell`（apt CUDA 11 除去 → CUDA 13 → CUTLASS → `build.fp4`） |
+
+FP16 ビルドの既定は PTX（`compute_86`）。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。**`gpu-cuda/Makefile` の既定ターゲット `run` は `build.fp4` を呼ぶ**ため、Blackwell 以外では **`make run.no-fp4`** を使ってください。
 
 ## モデルファイルを置く
 
@@ -326,22 +336,43 @@ make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="日本語で短く説明してくだ�
 
 ## CUDA GPU 版（NVIDIA）
 
-NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` には `build.gpu-cuda` は無い**ため、`gpu-cuda/` でビルドします。方針は ROCm 版と同様（ロード時に CPU で逆量子化 → FP16 → VRAM、プロンプトは Prefill バッチ、生成は 1 トークンずつ）です。
+NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` には `build.gpu-cuda` は無い**ため、`gpu-cuda/` で単体ビルドします。方針は ROCm 版と同様（ロード時に CPU で逆量子化 → FP16 → VRAM、プロンプトは Prefill バッチ、生成は 1 トークンずつ）です。
 
-### ビルド
+**Blackwell（sm_120 系）** では任意で **NVFP4 Tensor Core** 経路（CUTLASS + **`fp4_qwen3`** ブリッジ）を有効化できます。それ以外の GPU では **FP16 カーネルのみ**（`make build.no-fp4` / `make run.no-fp4`）を使います。
+
+### ビルド（FP16 のみ・汎用 GPU）
 
 ```bash
 cd qwen3-8b/gpu-cuda
-make build
+make build.no-fp4
 ```
 
 成功すると **`qwen3-gpu-cuda`** ができます。実 GPU アーキテクチャを直接指定する例:
 
 ```bash
-make build CUDA_GENCODE=arch=compute_89,code=sm_89
+make build.no-fp4 CUDA_GENCODE=arch=compute_89,code=sm_89
 ```
 
-### 実行
+### ビルド・実行（Blackwell + NVFP4）
+
+CUDA 13 と CUTLASS が未導入なら、まず環境構築（要 root 相当）:
+
+```bash
+cd qwen3-8b/gpu-cuda
+make blackwell
+```
+
+既に CUDA 13 がある場合:
+
+```bash
+make cutlass          # third_party/cutlass を clone（初回のみ）
+make build.fp4        # sm_120a + BONSAI_FP4=1 + FA_BR=32
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+```
+
+**注意**: `gpu-cuda/Makefile` の **既定ターゲットは `run` → `build.fp4`** です。Blackwell 以外の GPU では **`make run.no-fp4`** を使ってください。
+
+### 実行（バイナリを直接）
 
 ```bash
 ./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
@@ -349,13 +380,13 @@ make build CUDA_GENCODE=arch=compute_89,code=sm_89
   -n 64
 ```
 
-`Makefile` の `run` を使う場合（`MODEL` は gpu-cuda からの相対パス）:
+FP16 のみでビルド済みのとき:
 
 ```bash
-make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="日本語で短く説明してください。"
+make run.no-fp4 MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="日本語で短く説明してください。"
 ```
 
-Blackwell（RTX 50 系等）で NVFP4 経路を試す場合は **`make blackwell`**（CUDA 11 系 apt パッケージの除去と CUDA 13 導入を含む）のあと、必要に応じて **`make run.no-fp4`** で FP4 無し実行もできます。詳細は `doc/design.md` の CUDA 節を参照してください。
+CUTLASS GEMM の単体確認（任意）: `make fp4-test`。詳細は `doc/design.md` の CUDA 節を参照してください。
 
 ## AMD Ryzen AI XDNA2 NPU 版
 
@@ -591,8 +622,8 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 5. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
-6. `qwen3-8b/gpu-cuda/main.c` / `qwen3-8b/gpu-cuda/kernels.cu`  
-   CUDA 版の Prefill／Decode、FP16 GEMV、Flash Attention。
+6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu`  
+   CUDA 版の Prefill／Decode、FP16 GEMV、Flash Attention、Blackwell 向け NVFP4 ブリッジ。
 
 7. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。

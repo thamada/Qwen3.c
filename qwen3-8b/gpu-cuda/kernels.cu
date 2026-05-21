@@ -19,7 +19,7 @@
  * validated against CUTLASS column-major B layout; keep disabled until verified. */
 /* CUTLASS NVFP4 prefill: row-major weights vs ColumnMajor B layout mismatch
  * still under investigation. Decode uses fast FP16 GEMV (M=1). */
-#define FP4_MM_MIN_M 999999
+#define FP4_MM_MIN_M 128
 #endif
 
 #ifndef M_PI
@@ -621,17 +621,16 @@ static void dev_free_fp4_layers(DevLayerBuf *lb)
     lb->n_layers = 0;
 }
 
-static DevLayerBuf dev_convert_layers_fp4(void **f16_layers, int n_layers,
-    int n_out, int n_in)
+static DevLayerBuf dev_adopt_layers_fp4(void **fp4_layers, void **f16_layers, int n_layers)
 {
     DevLayerBuf lb = { NULL, NULL, n_layers };
     lb.layer = (void **)calloc((size_t)n_layers, sizeof(void *));
     lb.f16   = (void **)calloc((size_t)n_layers, sizeof(void *));
     for (int l = 0; l < n_layers; l++) {
-        lb.f16[l] = f16_layers[l];
-        lb.layer[l] = fp4_qwen3_weight_from_f16_device(f16_layers[l], n_out, n_in);
+        lb.layer[l] = fp4_layers[l];
+        lb.f16[l]   = f16_layers[l];
         if (!lb.layer[l]) {
-            fprintf(stderr, "FP4 weight convert failed layer %d (%dx%d)\n", l, n_out, n_in);
+            fprintf(stderr, "FP4 weight missing at layer %d\n", l);
             exit(1);
         }
     }
@@ -732,22 +731,22 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
                     max_M, max_N, max_K);
             exit(1);
         }
-        printf("GPU: converting linear weights FP16 -> NVFP4 (CUTLASS sm_120)...\n");
 
-        gm->wq   = dev_convert_layers_fp4(host->wq,   L, dim,    dim);
-        gm->wk   = dev_convert_layers_fp4(host->wk,   L, kv_dim, dim);
-        gm->wv   = dev_convert_layers_fp4(host->wv,   L, kv_dim, dim);
-        gm->wo   = dev_convert_layers_fp4(host->wo,   L, dim,    dim);
-        gm->gate = dev_convert_layers_fp4(host->gate, L, hidden, dim);
-        gm->up   = dev_convert_layers_fp4(host->up,   L, hidden, dim);
-        gm->down = dev_convert_layers_fp4(host->down, L, dim,    hidden);
+        gm->wq   = dev_adopt_layers_fp4(host->wq_fp4,   host->wq,   L);
+        gm->wk   = dev_adopt_layers_fp4(host->wk_fp4,   host->wk,   L);
+        gm->wv   = dev_adopt_layers_fp4(host->wv_fp4,   host->wv,   L);
+        gm->wo   = dev_adopt_layers_fp4(host->wo_fp4,   host->wo,   L);
+        gm->gate = dev_adopt_layers_fp4(host->gate_fp4, host->gate, L);
+        gm->up   = dev_adopt_layers_fp4(host->up_fp4,   host->up,   L);
+        gm->down = dev_adopt_layers_fp4(host->down_fp4, host->down, L);
 
-        gm->out.ptr = fp4_qwen3_weight_from_f16_device(host->out, vocab, dim);
+        gm->out.ptr = host->out_fp4;
         if (!gm->out.ptr) exit(1);
         gm->out_f16 = host->out;
         gm->out_t = host->out_t;
         gm->use_fp4 = 1;
-        printf("GPU: FP4 weights cached (prefill Tensor Core pending; decode uses FP16 GEMV)\n");
+        printf("GPU: FP4 Tensor Core path enabled (prefill M>=%d, decode FP16 GEMV)\n",
+               FP4_MM_MIN_M);
     }
 #else
     gm->wq       = dev_adopt_layers(L, host->wq);

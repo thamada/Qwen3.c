@@ -22,6 +22,10 @@ typedef struct {
     void **gate, **up, **down;
     void  *norm_out;
     void  *out;     int out_t;
+    /* NVFP4 caches (BONSAI_FP4): prefill Tensor Core path; wq etc. stay FP16 for decode. */
+    void **wq_fp4, **wk_fp4, **wv_fp4, **wo_fp4;
+    void **gate_fp4, **up_fp4, **down_fp4;
+    void  *out_fp4;
 } GpuWeightsHost;
 
 typedef struct GpuModel GpuModel;

@@ -38,7 +38,7 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
-| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention; build under `gpu-cuda/` (not in aggregate `Makefile`) |
+| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention; optional Blackwell **NVFP4** (`fp4_qwen3` + CUTLASS); not in aggregate `Makefile` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
@@ -71,7 +71,9 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     │   ├── Makefile
     │   ├── main.c
     │   ├── kernels.cu
-    │   └── gpu.h
+    │   ├── gpu.h
+    │   ├── fp4_gemm.cu / fp4_qwen3.cu  (Blackwell FP4)
+    │   └── third_party/cutlass/  (fetched via make cutlass)
     ├── xdna2/
     │   ├── Makefile
     │   ├── main.c
@@ -158,7 +160,15 @@ nvcc --version
 nvidia-smi
 ```
 
-Put CUDA’s **`bin`** directory on **`PATH`** (linking can fail if only `/usr/local/bin/nvcc` is visible). The default build emits PTX (`compute_86`). For a native SASS build, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. For Blackwell (e.g. RTX 50 series) FP4, see **`cd gpu-cuda && make blackwell`** in that directory’s `Makefile`.
+Put CUDA’s **`bin`** directory on **`PATH`** (linking can fail if only `/usr/local/bin/nvcc` is visible).
+
+| Use case | Command (`cd qwen3-8b/gpu-cuda`) |
+|----------|----------------------------------|
+| **FP16 only** (Ampere/Ada, PTX OK) | `make build.no-fp4` or `make run.no-fp4` |
+| **Blackwell NVFP4** (e.g. RTX 50) | `make build.fp4` / default `make run` (calls `build.fp4`) |
+| Install CUDA 13 + full FP4 build | `make blackwell` (removes apt CUDA 11 → CUDA 13 → CUTLASS → `build.fp4`) |
+
+FP16 builds default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. The **`gpu-cuda/Makefile` default target `run` invokes `build.fp4`**—on non-Blackwell GPUs use **`make run.no-fp4`** instead.
 
 ## Obtain the model file
 
@@ -328,22 +338,43 @@ make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
 
 ## CUDA GPU (NVIDIA)
 
-For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build in **`gpu-cuda/`**. Same broad strategy as ROCm: dequantize to FP16 on the CPU at load, prefill the prompt in batch, then decode one token at a time.
+For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build under **`gpu-cuda/`**. Same broad strategy as ROCm: dequantize to FP16 on the CPU at load, prefill the prompt in batch, then decode one token at a time.
 
-### Build
+On **Blackwell (sm_120)** you can optionally enable **NVFP4 Tensor Core** paths (CUTLASS + the **`fp4_qwen3`** bridge). On other GPUs use **FP16 kernels only** (`make build.no-fp4` / `make run.no-fp4`).
+
+### Build (FP16 only, general GPUs)
 
 ```bash
 cd qwen3-8b/gpu-cuda
-make build
+make build.no-fp4
 ```
 
 Produces **`qwen3-gpu-cuda`**. Example with a specific architecture:
 
 ```bash
-make build CUDA_GENCODE=arch=compute_89,code=sm_89
+make build.no-fp4 CUDA_GENCODE=arch=compute_89,code=sm_89
 ```
 
-### Run
+### Build and run (Blackwell + NVFP4)
+
+If CUDA 13 and CUTLASS are not set up yet (needs root-like privileges):
+
+```bash
+cd qwen3-8b/gpu-cuda
+make blackwell
+```
+
+If CUDA 13 is already installed:
+
+```bash
+make cutlass          # clone third_party/cutlass (first time)
+make build.fp4        # sm_120a + BONSAI_FP4=1 + FA_BR=32
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+```
+
+**Note:** the **`gpu-cuda/Makefile` default target is `run` → `build.fp4`**. On non-Blackwell GPUs use **`make run.no-fp4`**.
+
+### Run (binary directly)
 
 ```bash
 ./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
@@ -351,13 +382,13 @@ make build CUDA_GENCODE=arch=compute_89,code=sm_89
   -n 64
 ```
 
-Using the local `Makefile` `run` target (`MODEL` is relative to `gpu-cuda/`):
+After an FP16-only build:
 
 ```bash
-make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Short explanation in English."
+make run.no-fp4 MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Short explanation in English."
 ```
 
-For Blackwell FP4, **`make blackwell`** installs CUDA 13 and pulls CUTLASS; you can run without FP4 via **`make run.no-fp4`**. See `doc/design.md` (CUDA section).
+Optional CUTLASS GEMM smoke test: `make fp4-test`. See `doc/design.md` (CUDA section).
 
 ## AMD Ryzen AI XDNA2 NPU
 
@@ -583,7 +614,7 @@ Suggested order:
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
 5. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
-6. `qwen3-8b/gpu-cuda/main.c` / `qwen3-8b/gpu-cuda/kernels.cu` — CUDA prefill/decode, FP16 GEMV, Flash Attention.
+6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu` — CUDA prefill/decode, FP16 GEMV, Flash Attention, Blackwell NVFP4 bridge.
 7. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope
