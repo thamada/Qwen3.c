@@ -19,7 +19,6 @@
  * validated against CUTLASS column-major B layout; keep disabled until verified. */
 /* CUTLASS NVFP4 prefill: row-major weights vs ColumnMajor B layout mismatch
  * still under investigation. Decode uses fast FP16 GEMV (M=1). */
-#define FP4_MM_MIN_M 128
 #endif
 
 #ifndef M_PI
@@ -540,9 +539,6 @@ typedef struct {
 
 typedef struct {
     void  **layer;
-#ifdef BONSAI_FP4
-    void  **f16;
-#endif
     int    n_layers;
 } DevLayerBuf;
 
@@ -570,17 +566,12 @@ struct GpuModel {
     int batch_cap;
 #ifdef BONSAI_FP4
     int use_fp4;
-    void *out_f16;
 #endif
 };
 
 static DevLayerBuf dev_adopt_layers(int n_layers, void **ptrs)
 {
-    DevLayerBuf lb = { NULL,
-#ifdef BONSAI_FP4
-        NULL,
-#endif
-        n_layers };
+    DevLayerBuf lb = { NULL, n_layers };
     lb.layer = (void **)malloc((size_t)n_layers * sizeof(void *));
     if (ptrs)
         memcpy(lb.layer, ptrs, (size_t)n_layers * sizeof(void *));
@@ -612,23 +603,15 @@ static void dev_free_fp4_layers(DevLayerBuf *lb)
             fp4_qwen3_free_weight(lb->layer[l]);
     free(lb->layer);
     lb->layer = NULL;
-    if (lb->f16) {
-        for (int l = 0; l < lb->n_layers; l++)
-            if (lb->f16[l]) cudaFree(lb->f16[l]);
-        free(lb->f16);
-        lb->f16 = NULL;
-    }
     lb->n_layers = 0;
 }
 
-static DevLayerBuf dev_adopt_layers_fp4(void **fp4_layers, void **f16_layers, int n_layers)
+static DevLayerBuf dev_adopt_layers_fp4(void **fp4_layers, int n_layers)
 {
-    DevLayerBuf lb = { NULL, NULL, n_layers };
+    DevLayerBuf lb = { NULL, n_layers };
     lb.layer = (void **)calloc((size_t)n_layers, sizeof(void *));
-    lb.f16   = (void **)calloc((size_t)n_layers, sizeof(void *));
     for (int l = 0; l < n_layers; l++) {
         lb.layer[l] = fp4_layers[l];
-        lb.f16[l]   = f16_layers[l];
         if (!lb.layer[l]) {
             fprintf(stderr, "FP4 weight missing at layer %d\n", l);
             exit(1);
@@ -653,11 +636,8 @@ static void gpu_mm(float *o, const float *x, const DevLayerBuf *W, int wl,
     int n, int d, int type, int M)
 {
 #ifdef BONSAI_FP4
-    if (type == DT_F16 && W && W->f16) {
-        if (M >= FP4_MM_MIN_M)
-            fp4_qwen3_mm(W->layer[wl], x, o, M, n, d);
-        else
-            launch_mm_f16(o, x, (const uint16_t *)W->f16[wl], n, d);
+    if (type == DT_F16) {
+        fp4_qwen3_mm(W->layer[wl], x, o, M, n, d);
         return;
     }
 #endif
@@ -675,12 +655,8 @@ static void gpu_mm_batch(float *o, const float *x, const DevLayerBuf *W, int wl,
     int n, int d, int type, int n_tokens)
 {
 #ifdef BONSAI_FP4
-    if (type == DT_F16 && W && W->f16) {
-        if (n_tokens >= FP4_MM_MIN_M)
-            fp4_qwen3_mm(W->layer[wl], x, o, n_tokens, n, d);
-        else
-            mm_f16_gemv_batch_kernel<<<(n_tokens * d + 255) / 256, 256>>>(
-                o, x, (const uint16_t *)W->f16[wl], n, d, n_tokens);
+    if (type == DT_F16) {
+        fp4_qwen3_mm(W->layer[wl], x, o, n_tokens, n, d);
         return;
     }
 #endif
@@ -732,21 +708,20 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
             exit(1);
         }
 
-        gm->wq   = dev_adopt_layers_fp4(host->wq_fp4,   host->wq,   L);
-        gm->wk   = dev_adopt_layers_fp4(host->wk_fp4,   host->wk,   L);
-        gm->wv   = dev_adopt_layers_fp4(host->wv_fp4,   host->wv,   L);
-        gm->wo   = dev_adopt_layers_fp4(host->wo_fp4,   host->wo,   L);
-        gm->gate = dev_adopt_layers_fp4(host->gate_fp4, host->gate, L);
-        gm->up   = dev_adopt_layers_fp4(host->up_fp4,   host->up,   L);
-        gm->down = dev_adopt_layers_fp4(host->down_fp4, host->down, L);
+        gm->wq   = dev_adopt_layers_fp4(host->wq_fp4,   L);
+        gm->wk   = dev_adopt_layers_fp4(host->wk_fp4,   L);
+        gm->wv   = dev_adopt_layers_fp4(host->wv_fp4,   L);
+        gm->wo   = dev_adopt_layers_fp4(host->wo_fp4,   L);
+        gm->gate = dev_adopt_layers_fp4(host->gate_fp4, L);
+        gm->up   = dev_adopt_layers_fp4(host->up_fp4,   L);
+        gm->down = dev_adopt_layers_fp4(host->down_fp4, L);
 
         gm->out.ptr = host->out_fp4;
         if (!gm->out.ptr) exit(1);
-        gm->out_f16 = host->out;
         gm->out_t = host->out_t;
         gm->use_fp4 = 1;
-        printf("GPU: FP4 Tensor Core path enabled (prefill M>=%d, decode FP16 GEMV)\n",
-               FP4_MM_MIN_M);
+        printf("GPU: FP4 Tensor Core path enabled (GEMM M>=%d, GEMV decode)\n",
+               128);
     }
 #else
     gm->wq       = dev_adopt_layers(L, host->wq);
@@ -815,7 +790,6 @@ void gpu_model_destroy(GpuModel *gm)
         dev_free_fp4_layers(&gm->up);
         dev_free_fp4_layers(&gm->down);
         if (gm->out.ptr) fp4_qwen3_free_weight(gm->out.ptr);
-        if (gm->out_f16) cudaFree(gm->out_f16);
         fp4_qwen3_shutdown();
     } else
 #endif
@@ -860,11 +834,8 @@ static void gpu_emb_lookup(GpuModel *gm, int token)
 static void gpu_mm_out(float *o, const float *x, GpuModel *gm, int n, int d, int M)
 {
 #ifdef BONSAI_FP4
-    if (gm->use_fp4 && gm->out_f16) {
-        if (M >= FP4_MM_MIN_M)
-            fp4_qwen3_mm(gm->out.ptr, x, o, M, n, d);
-        else
-            launch_mm_f16(o, x, (const uint16_t *)gm->out_f16, n, d);
+    if (gm->use_fp4) {
+        fp4_qwen3_mm(gm->out.ptr, x, o, M, n, d);
         return;
     }
 #endif

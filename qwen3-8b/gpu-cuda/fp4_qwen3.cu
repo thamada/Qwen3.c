@@ -1,13 +1,13 @@
 /*
- * Qwen3 FP4 bridge: FP16 GPU weights -> NVFP4 cache, F32 activations in/out.
- * Uses CUTLASS block-scaled NVFP4 GEMM (fp4_gemm.cu) on Blackwell SM120+.
+ * Qwen3 FP4 bridge: NVFP4 weight cache, F32 activations in/out.
+ * Prefill (M>=128): CUTLASS block-scaled NVFP4 GEMM.
+ * Decode  (M<128):  dedicated FP4 GEMV (no M=128 padding).
  */
 
 #include "fp4_qwen3.h"
 #include "fp4_gemm.h"
 
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,6 +20,8 @@
         exit(1); \
     } \
 } while (0)
+
+#define FP4_GEMM_MIN_M 128
 
 static int g_max_M = 0, g_max_N = 0, g_max_K = 0;
 static __nv_bfloat16 *g_act_bf16 = NULL;
@@ -112,6 +114,14 @@ void fp4_qwen3_mm(const void *weight_cache,
         exit(1);
     }
 
+    if (M < FP4_GEMM_MIN_M) {
+        if (M == 1)
+            fp4_gemv_cached(weight_cache, x, y, n, d);
+        else
+            fp4_gemv_batch_cached(weight_cache, x, y, M, n, d);
+        return;
+    }
+
     int K_pad = fp4_weight_cache_K(weight_cache);
     int N_pad = fp4_weight_cache_N(weight_cache);
     int M_pad = align128(M);
@@ -137,5 +147,4 @@ void fp4_qwen3_mm(const void *weight_cache,
 
     bf16_to_f32_trunc_kernel<<<(M * d + 255) / 256, 256>>>(
         g_out_bf16, y, M, d, N_pad);
-    CUDA_CHECK(cudaDeviceSynchronize());
 }

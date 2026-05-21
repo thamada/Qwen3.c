@@ -38,7 +38,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
-| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。任意で Blackwell **NVFP4**（`fp4_qwen3` + CUTLASS）。集約 `Makefile` 外 |
+| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。**`build.no-fp4`**: 全線形層 FP16。**`build.fp4`**（Blackwell）: 線形層をロード時 **NVFP4** 化（`fp4_qwen3` + CUTLASS）、埋め込みは FP16。集約 `Makefile` 外 |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
@@ -72,7 +72,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     │   ├── main.c
     │   ├── kernels.cu
     │   ├── gpu.h
-    │   ├── fp4_gemm.cu / fp4_qwen3.cu  （Blackwell FP4 時）
+    │   ├── fp4_gemm.cu / fp4_qwen3.cu / fp4_verify.cu  （Blackwell FP4 時）
     │   └── third_party/cutlass/  （make cutlass で取得）
     ├── xdna2/
     │   ├── Makefile
@@ -336,9 +336,14 @@ make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="日本語で短く説明してくだ�
 
 ## CUDA GPU 版（NVIDIA）
 
-NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` には `build.gpu-cuda` は無い**ため、`gpu-cuda/` で単体ビルドします。方針は ROCm 版と同様（ロード時に CPU で逆量子化 → FP16 → VRAM、プロンプトは Prefill バッチ、生成は 1 トークンずつ）です。
+NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` には `build.gpu-cuda` は無い**ため、`gpu-cuda/` で単体ビルドします。プロンプトは **Prefill バッチ**、生成は **1 トークン Decode**、Attention は **Flash Attention**（GQA）です。
 
-**Blackwell（sm_120 系）** では任意で **NVFP4 Tensor Core** 経路（CUTLASS + **`fp4_qwen3`** ブリッジ）を有効化できます。それ以外の GPU では **FP16 カーネルのみ**（`make build.no-fp4` / `make run.no-fp4`）を使います。
+| ビルド | ロード時の重み | 線形層の実行 |
+|--------|----------------|--------------|
+| **`build.no-fp4`** | CPU 逆量子化 → **FP16** → VRAM（ROCm 版と同趣旨） | FP16 GEMV カーネル |
+| **`build.fp4`**（Blackwell） | 線形層（Q/K/V/O、gate/up/down、LM head）を **NVFP4 キャッシュ**へ変換（**`fp4_qwen3_weight_from_f16_host`**）。**`token_embd`** は FP16 のまま VRAM | **`fp4_qwen3_mm`**（M=1 は FP4 GEMV、長い Prefill バッチは M≥128 で Tensor Core GEMM） |
+
+**Blackwell（sm_120 系）** 向け **`build.fp4`** は CUTLASS **NVFP4** を使います。Ampere/Ada 等では **`build.no-fp4` / `make run.no-fp4`** のみを想定してください。
 
 ### ビルド（FP16 のみ・汎用 GPU）
 
@@ -370,6 +375,8 @@ make build.fp4        # sm_120a + BONSAI_FP4=1 + FA_BR=32
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
+起動ログに **`Uploading weights to device (dequant -> NVFP4 linear layers)...`** と **`GPU: FP4 Tensor Core path enabled`** が出れば FP4 経路が有効です。
+
 **注意**: `gpu-cuda/Makefile` の **既定ターゲットは `run` → `build.fp4`** です。Blackwell 以外の GPU では **`make run.no-fp4`** を使ってください。
 
 ### 実行（バイナリを直接）
@@ -386,7 +393,7 @@ FP16 のみでビルド済みのとき:
 make run.no-fp4 MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="日本語で短く説明してください。"
 ```
 
-CUTLASS GEMM の単体確認（任意）: `make fp4-test`。詳細は `doc/design.md` の CUDA 節を参照してください。
+CUTLASS NVFP4 GEMM の単体確認（任意）: `make fp4-test`（**`fp4_verify.cu`** をビルドして実行）。詳細は `doc/design.md` の CUDA 節を参照してください。
 
 ## AMD Ryzen AI XDNA2 NPU 版
 
@@ -561,6 +568,10 @@ nvcc --version
 
 PTX のみのビルドで極端に遅い場合は、実機の `sm_XX` を `CUDA_GENCODE` で指定して再ビルドしてください。
 
+### `build.fp4` が失敗する／`NVFP4 quantize failed`
+
+**`sm_120a`** 向けビルドか、CUDA 13 + **`make cutlass`** 済みかを確認してください。汎用 GPU では **`make build.no-fp4`** を使います。
+
 ### `hipcc` が見つからない
 
 ROCm の場所を確認してください。
@@ -622,8 +633,8 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 5. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
-6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu`  
-   CUDA 版の Prefill／Decode、FP16 GEMV、Flash Attention、Blackwell 向け NVFP4 ブリッジ。
+6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu` / `fp4_gemm.cu`  
+   CUDA 版の Prefill／Decode、FP16 GEMV、Flash Attention、ロード時 NVFP4 量化と **`fp4_qwen3_mm`**。
 
 7. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。

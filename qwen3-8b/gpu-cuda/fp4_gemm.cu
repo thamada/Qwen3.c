@@ -1019,4 +1019,123 @@ int fp4_gemm_run_cached(
     return 0;
 }
 
+#define FP4_GEMV_WARP 32
+#define FP4_GEMV_ROWS 8
+#define FP4_GEMV_THREADS (FP4_GEMV_WARP * FP4_GEMV_ROWS)
+
+__device__ __forceinline__ int sfb_sf_index(int r, int k_block, int nsb)
+{
+    int r0 = r % 32;
+    int r1 = (r / 32) % 4;
+    int r2 = r / 128;
+    int k1 = k_block % 4;
+    int k2 = k_block / 4;
+    int k_tiles = nsb / 4;
+    return r0 * 16 + r1 * 4 + r2 * (512 * k_tiles) + k1 + k2 * 512;
+}
+
+__device__ __forceinline__ float d_fp4_nibble_to_float(uint8_t nibble)
+{
+    int sign = (nibble & 0x8) ? -1 : 1;
+    return sign * c_fp4_values[nibble & 0x7];
+}
+
+__device__ __forceinline__ float fp4_dot_row(
+    const float *x, const uint8_t *row_fp4, const uint8_t *w_sf,
+    int row, int n, int K, int nsb)
+{
+    float val = 0.f;
+    for (int sb = 0; sb < nsb; sb++) {
+        int k0 = sb * SF_VEC_SIZE;
+        if (k0 >= n) break;
+        float scale = d_ue4m3_to_float(w_sf[sfb_sf_index(row, sb, nsb)]);
+        #pragma unroll
+        for (int i = 0; i < SF_VEC_SIZE; i += 2) {
+            int k = k0 + i;
+            if (k >= n) break;
+            uint8_t pk = row_fp4[(k0 + i) >> 1];
+            val += x[k] * d_fp4_nibble_to_float(pk & 0xF) * scale;
+            if (k + 1 < n)
+                val += x[k + 1] * d_fp4_nibble_to_float(pk >> 4) * scale;
+        }
+    }
+    return val;
+}
+
+__launch_bounds__(FP4_GEMV_THREADS)
+__global__ void fp4_gemv_kernel(float *__restrict__ o,
+    const float *__restrict__ x,
+    const uint8_t *__restrict__ w_fp4,
+    const uint8_t *__restrict__ w_sf,
+    int n, int d, int K, int nsb)
+{
+    int local_row = threadIdx.x / FP4_GEMV_WARP;
+    int lane      = threadIdx.x % FP4_GEMV_WARP;
+    int row       = blockIdx.x * FP4_GEMV_ROWS + local_row;
+    if (row >= d) return;
+
+    const uint8_t *row_fp4 = w_fp4 + (size_t)row * (K / 2);
+    float val = 0.f;
+
+    for (int sb = lane; sb < nsb; sb += FP4_GEMV_WARP) {
+        int k0 = sb * SF_VEC_SIZE;
+        if (k0 >= n) continue;
+        float scale = d_ue4m3_to_float(w_sf[sfb_sf_index(row, sb, nsb)]);
+        #pragma unroll
+        for (int i = 0; i < SF_VEC_SIZE; i += 2) {
+            int k = k0 + i;
+            if (k >= n) break;
+            uint8_t pk = row_fp4[(k0 + i) >> 1];
+            val += x[k] * d_fp4_nibble_to_float(pk & 0xF) * scale;
+            if (k + 1 < n)
+                val += x[k + 1] * d_fp4_nibble_to_float(pk >> 4) * scale;
+        }
+    }
+    for (int off = FP4_GEMV_WARP / 2; off > 0; off >>= 1)
+        val += __shfl_down_sync(0xffffffffu, val, off, FP4_GEMV_WARP);
+    if (lane == 0)
+        o[row] = val;
+}
+
+__global__ void fp4_gemv_batch_kernel(float *__restrict__ o,
+    const float *__restrict__ x,
+    const uint8_t *__restrict__ w_fp4,
+    const uint8_t *__restrict__ w_sf,
+    int n, int d, int K, int nsb, int M)
+{
+    int flat = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = flat / d;
+    int row = flat % d;
+    if (t >= M || row >= d) return;
+
+    const float *xt = x + (size_t)t * n;
+    float *ot = o + (size_t)t * d;
+    const uint8_t *row_fp4 = w_fp4 + (size_t)row * (K / 2);
+    ot[row] = fp4_dot_row(xt, row_fp4, w_sf, row, n, K, nsb);
+}
+
+void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
+                     int n, int d)
+{
+    if (!cache_handle) return;
+    const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
+    int K = cache->K;
+    int nsb = K / SF_VEC_SIZE;
+    int blocks = (d + FP4_GEMV_ROWS - 1) / FP4_GEMV_ROWS;
+    fp4_gemv_kernel<<<blocks, FP4_GEMV_THREADS>>>(
+        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb);
+}
+
+void fp4_gemv_batch_cached(const void *cache_handle, const float *x, float *y,
+                           int M, int n, int d)
+{
+    if (!cache_handle || M <= 0) return;
+    const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
+    int K = cache->K;
+    int nsb = K / SF_VEC_SIZE;
+    int total = M * d;
+    fp4_gemv_batch_kernel<<<(total + 255) / 256, 256>>>(
+        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb, M);
+}
+
 }  // extern "C"

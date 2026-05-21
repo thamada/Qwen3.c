@@ -25,6 +25,11 @@ int   fp4_weight_cache_N(const void *cache);
 int   fp4_weight_cache_K(const void *cache);
 void  fp4_weight_cache_free(void *cache);
 
+void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
+                     int n, int d);
+void fp4_gemv_batch_cached(const void *cache_handle, const float *x, float *y,
+                           int M, int n, int d);
+
 int  fp4_gemm_run_cached(const void *A_bf16, const void *cache_handle,
                           const void *C_bf16, void *D_bf16,
                           int M, float alpha, float beta);
