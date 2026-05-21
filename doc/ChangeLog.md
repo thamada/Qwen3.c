@@ -4,6 +4,22 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 22:30:51
+
+**`qwen3-8b/gpu-cuda/`**:
+
+- **PolarQuant-R** KV キャッシュ圧縮を実装（**`polarquant.cu`** / **`polarquant_kernels.cuh`** / **`polarquant.h`**）。**`BONSAI_POLARQUANT=1`** 時は **`kc_pq`/`vc_pq`**（**`PQBlock`** 64 B/head）と **`flash_attn_*_pq_kernel`**。
+- **`build.polarquant`** / **`pq-test`** / **`polarquant_verify.cu`** を追加。
+- **`build.fp4.polarquant`** / **`run.fp4.polarquant`** — NVFP4 線形 + PolarQuant-R KV の組み合わせビルド。
+- **`fp4-test` 修正**: **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** を **`BLACKWELL_NVCCFLAGS`**（**`BLACKWELL_GENCODE`** 固定）でコンパイル。旧 **`compute_86` PTX** ビルドでは sm_120 MMA が **`Arch conditional MMA instruction... Aborting`** で失敗していた問題を解消。
+- **`MAIN_OBJ`**（**`main.bfp4*.pq*.o`**）を **`KERNELS_OBJ`** と同様にフラグ別名化。
+
+**`README.md`**: **`build.fp4.polarquant`** / **`run.fp4.polarquant`**、PolarQuant 専用節、**`fp4-test`** の Blackwell 必須注記、トラブルシュート（OOM / MMA abort）を追記。
+
+**`doc/design.md`**: 上記に追随（バリアント表・Make ターゲット表・CUDA 変数表・実行時挙動・PolarQuant / NVFP4 実装メモ・トラブルシュート）。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-21 21:19:33
 
 - **doc**: PolarQuant-R（KV キャッシュ圧縮）の実装説明を追加 — `doc/design.md` にアルゴリズム・VRAM 削減・Flash Attention 統合・ビルド手順、`README.md` / `README.en.md` に `build.polarquant` / `pq-test`、ファイル表に `polarquant.*` を追記。
