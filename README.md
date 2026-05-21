@@ -171,7 +171,7 @@ nvidia-smi
 | **NVFP4 + PolarQuant 同時**（Blackwell・最大 VRAM 節約） | `make build.fp4.polarquant` / `make run.fp4.polarquant` |
 | CUDA 13 の導入から一式 | `make blackwell`（apt CUDA 11 除去 → CUDA 13 → CUTLASS → `build.fp4`） |
 | PolarQuant ラウンドトリップ検証 | `make pq-test` |
-| CUTLASS NVFP4 GEMM 単体検証 | `make fp4-test` |
+| CUTLASS NVFP4 GEMM 単体検証 | `make fp4-test`（**Blackwell / sm_120a 必須**） |
 
 FP16 ビルドの既定は PTX（`compute_86`）。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。**`gpu-cuda/Makefile` の既定ターゲット `run` は `build.fp4` を呼ぶ**ため、Blackwell 以外では **`make run.no-fp4`** を使ってください。
 
@@ -436,7 +436,7 @@ FP16 のみでビルド済みのとき:
 make run.no-fp4 MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="日本語で短く説明してください。"
 ```
 
-CUTLASS NVFP4 GEMM の単体確認（任意）: `make fp4-test`（**`fp4_verify.cu`** をビルドして実行）。詳細は `doc/design.md` の CUDA 節を参照してください。
+CUTLASS NVFP4 GEMM の単体確認（任意）: `make fp4-test`（**`fp4_verify.cu`**。**Blackwell / sm_120a 向け**。RTX 50 系等）。詳細は `doc/design.md` の CUDA 節を参照してください。
 
 ## AMD Ryzen AI XDNA2 NPU 版
 

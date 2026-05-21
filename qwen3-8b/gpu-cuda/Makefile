@@ -49,13 +49,20 @@ FP4_CXXFLAGS = -std=c++17 --expt-relaxed-constexpr \
                -I$(CUTLASS_DIR)/tools/util/include \
                -DCUTLASS_ARCH_MMA_SM120_SUPPORTED
 
+# NVFP4 (CUTLASS sm_120 MMA) は Blackwell 向け gencode 必須。compute_86 PTX では fp4-test / GEMM が abort する。
+BLACKWELL_NVCCFLAGS = -O3 -std=c++14 -Xcompiler -Wall,-Wextra,-Wno-unused-parameter \
+                      -use_fast_math --expt-relaxed-constexpr \
+                      -gencode $(BLACKWELL_GENCODE)
+FP4_GEMM_OBJ = fp4_gemm.sm120a.o
+FP4_QWEN3_OBJ = fp4_qwen3.sm120a.o
+
 FP4_FLAG :=
 FP4_OBJS :=
 PQ_FLAG :=
 PQ_OBJS :=
 ifneq ($(BONSAI_FP4),0)
 FP4_FLAG  := -DBONSAI_FP4=1
-FP4_OBJS  := fp4_gemm.o fp4_qwen3.o
+FP4_OBJS  := $(FP4_GEMM_OBJ) $(FP4_QWEN3_OBJ)
 endif
 ifneq ($(BONSAI_POLARQUANT),0)
 PQ_FLAG   := -DBONSAI_POLARQUANT=1
@@ -76,8 +83,8 @@ MAIN_OBJ    := main.bfp4$(BONSAI_FP4).pq$(BONSAI_POLARQUANT).o
 .PHONY: build build.fp4 build.polarquant build.fp4.polarquant \
         run run.no-fp4 run.fp4.polarquant clean blackwell cutlass fp4-test pq-test
 
-fp4-test: fp4_gemm.o | cutlass
-	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu fp4_gemm.o $(LDFLAGS)
+fp4-test: cutlass $(FP4_GEMM_OBJ)
+	$(NVCC) $(BLACKWELL_NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu $(FP4_GEMM_OBJ) $(LDFLAGS)
 	./fp4_verify
 
 .DEFAULT_GOAL := run
@@ -105,11 +112,11 @@ $(MAIN_OBJ): main.c gpu.h fp4_qwen3.h polarquant.h
 $(KERNELS_OBJ): kernels.cu gpu.h fp4_qwen3.h polarquant.h
 	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) $(PQ_FLAG) -c kernels.cu -o $@
 
-fp4_gemm.o: fp4_gemm.cu fp4_gemm.h | cutlass
-	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_gemm.cu -o fp4_gemm.o
+$(FP4_GEMM_OBJ): fp4_gemm.cu fp4_gemm.h | cutlass
+	$(NVCC) $(BLACKWELL_NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_gemm.cu -o $@
 
-fp4_qwen3.o: fp4_qwen3.cu fp4_qwen3.h fp4_gemm.h | cutlass
-	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_qwen3.cu -o fp4_qwen3.o
+$(FP4_QWEN3_OBJ): fp4_qwen3.cu fp4_qwen3.h fp4_gemm.h | cutlass
+	$(NVCC) $(BLACKWELL_NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_qwen3.cu -o $@
 
 polarquant.o: polarquant.cu polarquant.h polarquant_kernels.cuh
 	$(NVCC) $(NVCCFLAGS) -c polarquant.cu -o polarquant.o
@@ -134,7 +141,8 @@ run.fp4.polarquant: build.fp4.polarquant
 
 clean:
 	rm -f qwen3-gpu-cuda fp4_verify polarquant_verify \
-	      main.o main.bfp4*.o kernels.*.o fp4_gemm.o fp4_qwen3.o polarquant.o
+	      main.o main.bfp4*.o kernels.*.o fp4_gemm.o fp4_gemm.sm120a.o \
+	      fp4_qwen3.o fp4_qwen3.sm120a.o polarquant.o
 
 # apt CUDA 11 を削除 → NVIDIA 公式 CUDA 13 をインストール → Blackwell FP4 ビルド
 blackwell:
