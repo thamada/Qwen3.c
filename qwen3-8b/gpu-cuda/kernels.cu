@@ -14,7 +14,12 @@
 #include <string.h>
 
 #ifdef BONSAI_FP4
-#include "fp4_bonsai.h"
+#include "fp4_qwen3.h"
+/* CUTLASS NVFP4 GEMM requires M>=128. Prefill FP4 output is still being
+ * validated against CUTLASS column-major B layout; keep disabled until verified. */
+/* CUTLASS NVFP4 prefill: row-major weights vs ColumnMajor B layout mismatch
+ * still under investigation. Decode uses fast FP16 GEMV (M=1). */
+#define FP4_MM_MIN_M 999999
 #endif
 
 #ifndef M_PI
@@ -535,6 +540,9 @@ typedef struct {
 
 typedef struct {
     void  **layer;
+#ifdef BONSAI_FP4
+    void  **f16;
+#endif
     int    n_layers;
 } DevLayerBuf;
 
@@ -560,11 +568,19 @@ struct GpuModel {
     float *hb_batch, *hb2_batch;
     int *tokens_dev;
     int batch_cap;
+#ifdef BONSAI_FP4
+    int use_fp4;
+    void *out_f16;
+#endif
 };
 
 static DevLayerBuf dev_adopt_layers(int n_layers, void **ptrs)
 {
-    DevLayerBuf lb = { NULL, n_layers };
+    DevLayerBuf lb = { NULL,
+#ifdef BONSAI_FP4
+        NULL,
+#endif
+        n_layers };
     lb.layer = (void **)malloc((size_t)n_layers * sizeof(void *));
     if (ptrs)
         memcpy(lb.layer, ptrs, (size_t)n_layers * sizeof(void *));
@@ -587,6 +603,42 @@ static void dev_free_layers(DevLayerBuf *lb)
     lb->n_layers = 0;
 }
 
+#ifdef BONSAI_FP4
+static void dev_free_fp4_layers(DevLayerBuf *lb)
+{
+    if (!lb) return;
+    for (int l = 0; l < lb->n_layers; l++)
+        if (lb->layer && lb->layer[l])
+            fp4_qwen3_free_weight(lb->layer[l]);
+    free(lb->layer);
+    lb->layer = NULL;
+    if (lb->f16) {
+        for (int l = 0; l < lb->n_layers; l++)
+            if (lb->f16[l]) cudaFree(lb->f16[l]);
+        free(lb->f16);
+        lb->f16 = NULL;
+    }
+    lb->n_layers = 0;
+}
+
+static DevLayerBuf dev_convert_layers_fp4(void **f16_layers, int n_layers,
+    int n_out, int n_in)
+{
+    DevLayerBuf lb = { NULL, NULL, n_layers };
+    lb.layer = (void **)calloc((size_t)n_layers, sizeof(void *));
+    lb.f16   = (void **)calloc((size_t)n_layers, sizeof(void *));
+    for (int l = 0; l < n_layers; l++) {
+        lb.f16[l] = f16_layers[l];
+        lb.layer[l] = fp4_qwen3_weight_from_f16_device(f16_layers[l], n_out, n_in);
+        if (!lb.layer[l]) {
+            fprintf(stderr, "FP4 weight convert failed layer %d (%dx%d)\n", l, n_out, n_in);
+            exit(1);
+        }
+    }
+    return lb;
+}
+#endif
+
 static void launch_mm_f16(float *o, const float *x, const uint16_t *w, int n, int d)
 {
     int blocks = (d + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
@@ -598,28 +650,48 @@ static void launch_mm_f32(float *o, const float *x, const float *w, int n, int d
     mm_f32_gemv_kernel<<<(d + 255) / 256, 256>>>(o, x, w, n, d);
 }
 
-static void gpu_mm(float *o, const float *x, const void *W, int n, int d, int type)
+static void gpu_mm(float *o, const float *x, const DevLayerBuf *W, int wl,
+    int n, int d, int type, int M)
 {
+#ifdef BONSAI_FP4
+    if (type == DT_F16 && W && W->f16) {
+        if (M >= FP4_MM_MIN_M)
+            fp4_qwen3_mm(W->layer[wl], x, o, M, n, d);
+        else
+            launch_mm_f16(o, x, (const uint16_t *)W->f16[wl], n, d);
+        return;
+    }
+#endif
     if (type == DT_F16)
-        launch_mm_f16(o, x, (const uint16_t *)W, n, d);
+        launch_mm_f16(o, x, (const uint16_t *)W->layer[wl], n, d);
     else if (type == DT_F32)
-        launch_mm_f32(o, x, (const float *)W, n, d);
+        launch_mm_f32(o, x, (const float *)W->layer[wl], n, d);
     else {
         fprintf(stderr, "gpu_mm: unsupported weight type %d\n", type);
         exit(1);
     }
 }
 
-static void gpu_mm_batch(float *o, const float *x, const void *W,
+static void gpu_mm_batch(float *o, const float *x, const DevLayerBuf *W, int wl,
     int n, int d, int type, int n_tokens)
 {
+#ifdef BONSAI_FP4
+    if (type == DT_F16 && W && W->f16) {
+        if (n_tokens >= FP4_MM_MIN_M)
+            fp4_qwen3_mm(W->layer[wl], x, o, n_tokens, n, d);
+        else
+            mm_f16_gemv_batch_kernel<<<(n_tokens * d + 255) / 256, 256>>>(
+                o, x, (const uint16_t *)W->f16[wl], n, d, n_tokens);
+        return;
+    }
+#endif
     if (type == DT_F16)
         mm_f16_gemv_batch_kernel<<<(n_tokens * d + 255) / 256, 256>>>(
-            o, x, (const uint16_t *)W, n, d, n_tokens);
+            o, x, (const uint16_t *)W->layer[wl], n, d, n_tokens);
     else if (type == DT_F32) {
         for (int t = 0; t < n_tokens; t++)
             launch_mm_f32(o + (size_t)t * d, x + (size_t)t * n,
-                (const float *)W, n, d);
+                (const float *)W->layer[wl], n, d);
     } else {
         fprintf(stderr, "gpu_mm_batch: unsupported weight type %d\n", type);
         exit(1);
@@ -641,16 +713,43 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
     const int max_seq = cfg->max_seq;
     const int qdim = cfg->n_heads * cfg->head_dim;
 
-    gm->embd.ptr = host->embd;
-    gm->embd_t = host->embd_t;
-    gm->out.ptr = host->out;
-    gm->out_t = host->out_t;
-    gm->norm_out.ptr = host->norm_out;
-
     gm->norm_att = dev_adopt_layers(L, host->norm_att);
     gm->q_norm   = dev_adopt_layers(L, host->q_norm);
     gm->k_norm   = dev_adopt_layers(L, host->k_norm);
     gm->norm_ffn = dev_adopt_layers(L, host->norm_ffn);
+
+#ifdef BONSAI_FP4
+    {
+        int max_M = ((max_seq + 127) / 128) * 128;
+        if (max_M < 128) max_M = 128;
+        int max_K = ((dim + 127) / 128) * 128;
+        if (hidden > max_K) max_K = ((hidden + 127) / 128) * 128;
+        int max_N = ((vocab + 127) / 128) * 128;
+        if (hidden > max_N) max_N = ((hidden + 127) / 128) * 128;
+
+        if (fp4_qwen3_init(max_M, max_N, max_K) != 0) {
+            fprintf(stderr, "FP4 init failed (max_M=%d max_N=%d max_K=%d)\n",
+                    max_M, max_N, max_K);
+            exit(1);
+        }
+        printf("GPU: converting linear weights FP16 -> NVFP4 (CUTLASS sm_120)...\n");
+
+        gm->wq   = dev_convert_layers_fp4(host->wq,   L, dim,    dim);
+        gm->wk   = dev_convert_layers_fp4(host->wk,   L, kv_dim, dim);
+        gm->wv   = dev_convert_layers_fp4(host->wv,   L, kv_dim, dim);
+        gm->wo   = dev_convert_layers_fp4(host->wo,   L, dim,    dim);
+        gm->gate = dev_convert_layers_fp4(host->gate, L, hidden, dim);
+        gm->up   = dev_convert_layers_fp4(host->up,   L, hidden, dim);
+        gm->down = dev_convert_layers_fp4(host->down, L, dim,    hidden);
+
+        gm->out.ptr = fp4_qwen3_weight_from_f16_device(host->out, vocab, dim);
+        if (!gm->out.ptr) exit(1);
+        gm->out_f16 = host->out;
+        gm->out_t = host->out_t;
+        gm->use_fp4 = 1;
+        printf("GPU: FP4 weights cached (prefill Tensor Core pending; decode uses FP16 GEMV)\n");
+    }
+#else
     gm->wq       = dev_adopt_layers(L, host->wq);
     gm->wk       = dev_adopt_layers(L, host->wk);
     gm->wv       = dev_adopt_layers(L, host->wv);
@@ -658,6 +757,15 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
     gm->gate     = dev_adopt_layers(L, host->gate);
     gm->up       = dev_adopt_layers(L, host->up);
     gm->down     = dev_adopt_layers(L, host->down);
+#endif
+
+    gm->embd.ptr = host->embd;
+    gm->embd_t = host->embd_t;
+#ifndef BONSAI_FP4
+    gm->out.ptr = host->out;
+    gm->out_t = host->out_t;
+#endif
+    gm->norm_out.ptr = host->norm_out;
 
     CUDA_CHECK(cudaMalloc(&gm->x,      (size_t)dim * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&gm->xb,     (size_t)dim * sizeof(float)));
@@ -698,15 +806,31 @@ void gpu_model_destroy(GpuModel *gm)
     dev_free_layers(&gm->q_norm);
     dev_free_layers(&gm->k_norm);
     dev_free_layers(&gm->norm_ffn);
-    dev_free_layers(&gm->wq);
-    dev_free_layers(&gm->wk);
-    dev_free_layers(&gm->wv);
-    dev_free_layers(&gm->wo);
-    dev_free_layers(&gm->gate);
-    dev_free_layers(&gm->up);
-    dev_free_layers(&gm->down);
-    if (gm->out.ptr && gm->out.ptr != gm->embd.ptr)
-        dev_free(&gm->out);
+#ifdef BONSAI_FP4
+    if (gm->use_fp4) {
+        dev_free_fp4_layers(&gm->wq);
+        dev_free_fp4_layers(&gm->wk);
+        dev_free_fp4_layers(&gm->wv);
+        dev_free_fp4_layers(&gm->wo);
+        dev_free_fp4_layers(&gm->gate);
+        dev_free_fp4_layers(&gm->up);
+        dev_free_fp4_layers(&gm->down);
+        if (gm->out.ptr) fp4_qwen3_free_weight(gm->out.ptr);
+        if (gm->out_f16) cudaFree(gm->out_f16);
+        fp4_qwen3_shutdown();
+    } else
+#endif
+    {
+        dev_free_layers(&gm->wq);
+        dev_free_layers(&gm->wk);
+        dev_free_layers(&gm->wv);
+        dev_free_layers(&gm->wo);
+        dev_free_layers(&gm->gate);
+        dev_free_layers(&gm->up);
+        dev_free_layers(&gm->down);
+        if (gm->out.ptr && gm->out.ptr != gm->embd.ptr)
+            dev_free(&gm->out);
+    }
     dev_free(&gm->norm_out);
     cudaFree(gm->x); cudaFree(gm->xb); cudaFree(gm->xb2);
     cudaFree(gm->hb); cudaFree(gm->hb2);
@@ -734,6 +858,27 @@ static void gpu_emb_lookup(GpuModel *gm, int token)
         emb_f16_kernel<<<(dim + 255) / 256, 256>>>(gm->x, (const uint16_t *)gm->embd.ptr, token, dim);
 }
 
+static void gpu_mm_out(float *o, const float *x, GpuModel *gm, int n, int d, int M)
+{
+#ifdef BONSAI_FP4
+    if (gm->use_fp4 && gm->out_f16) {
+        if (M >= FP4_MM_MIN_M)
+            fp4_qwen3_mm(gm->out.ptr, x, o, M, n, d);
+        else
+            launch_mm_f16(o, x, (const uint16_t *)gm->out_f16, n, d);
+        return;
+    }
+#endif
+    if (gm->out_t == DT_F16)
+        launch_mm_f16(o, x, (const uint16_t *)gm->out.ptr, n, d);
+    else if (gm->out_t == DT_F32)
+        launch_mm_f32(o, x, (const float *)gm->out.ptr, n, d);
+    else {
+        fprintf(stderr, "gpu_mm_out: unsupported weight type %d\n", gm->out_t);
+        exit(1);
+    }
+}
+
 void gpu_forward(GpuModel *gm, int token, int pos)
 {
     GpuConfig *c = &gm->cfg;
@@ -749,9 +894,9 @@ void gpu_forward(GpuModel *gm, int token, int pos)
     for (int l = 0; l < c->n_layers; l++) {
         rmsnorm_kernel<<<1, 256>>>(gm->xb, gm->x, (float *)gm->norm_att.layer[l], dim, c->norm_eps);
 
-        gpu_mm(gm->q, gm->xb, gm->wq.layer[l], dim, dim, wt);
-        gpu_mm(gm->k, gm->xb, gm->wk.layer[l], dim, kv_dim, wt);
-        gpu_mm(gm->v, gm->xb, gm->wv.layer[l], dim, kv_dim, wt);
+        gpu_mm(gm->q, gm->xb, &gm->wq, l, dim, dim, wt, 1);
+        gpu_mm(gm->k, gm->xb, &gm->wk, l, dim, kv_dim, wt, 1);
+        gpu_mm(gm->v, gm->xb, &gm->wv, l, dim, kv_dim, wt, 1);
 
         rmsnorm_head_kernel<<<n_heads, 256>>>(gm->q, (float *)gm->q_norm.layer[l], n_heads, hd, c->norm_eps);
         rmsnorm_head_kernel<<<n_kv, 256>>>(gm->k, (float *)gm->k_norm.layer[l], n_kv, hd, c->norm_eps);
@@ -773,22 +918,22 @@ void gpu_forward(GpuModel *gm, int token, int pos)
             gm->xb, gm->q, gm->kc + loff, gm->vc + loff,
             npos, n_heads, hd, kv_dim, kv_mul, scale);
 
-        gpu_mm(gm->xb2, gm->xb, gm->wo.layer[l], dim, dim, wt);
+        gpu_mm(gm->xb2, gm->xb, &gm->wo, l, dim, dim, wt, 1);
         add_kernel<<<(dim + 255) / 256, 256>>>(gm->x, gm->xb2, dim);
 
         rmsnorm_kernel<<<1, 256>>>(gm->xb, gm->x, (float *)gm->norm_ffn.layer[l], dim, c->norm_eps);
 
-        gpu_mm(gm->hb,  gm->xb, gm->gate.layer[l], dim, hidden, wt);
-        gpu_mm(gm->hb2, gm->xb, gm->up.layer[l],   dim, hidden, wt);
+        gpu_mm(gm->hb,  gm->xb, &gm->gate, l, dim, hidden, wt, 1);
+        gpu_mm(gm->hb2, gm->xb, &gm->up,   l, dim, hidden, wt, 1);
 
         swiglu_kernel<<<(hidden + 255) / 256, 256>>>(gm->hb, gm->hb2, hidden);
 
-        gpu_mm(gm->xb, gm->hb, gm->down.layer[l], hidden, dim, wt);
+        gpu_mm(gm->xb, gm->hb, &gm->down, l, hidden, dim, wt, 1);
         add_kernel<<<(dim + 255) / 256, 256>>>(gm->x, gm->xb, dim);
     }
 
     rmsnorm_kernel<<<1, 256>>>(gm->x, gm->x, (float *)gm->norm_out.ptr, dim, c->norm_eps);
-    gpu_mm(gm->logits, gm->x, gm->out.ptr, dim, c->vocab_size, gm->out_t);
+    gpu_mm_out(gm->logits, gm->x, gm, dim, c->vocab_size, 1);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -822,9 +967,9 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
         rmsnorm_batch_kernel<<<n_tokens, 256>>>(
             gm->xb_batch, gm->x_batch, (float *)gm->norm_att.layer[l], dim, n_tokens, c->norm_eps);
 
-        gpu_mm_batch(gm->q_batch, gm->xb_batch, gm->wq.layer[l], dim, dim, wt, n_tokens);
-        gpu_mm_batch(gm->k_batch, gm->xb_batch, gm->wk.layer[l], dim, kv_dim, wt, n_tokens);
-        gpu_mm_batch(gm->v_batch, gm->xb_batch, gm->wv.layer[l], dim, kv_dim, wt, n_tokens);
+        gpu_mm_batch(gm->q_batch, gm->xb_batch, &gm->wq, l, dim, dim, wt, n_tokens);
+        gpu_mm_batch(gm->k_batch, gm->xb_batch, &gm->wk, l, dim, kv_dim, wt, n_tokens);
+        gpu_mm_batch(gm->v_batch, gm->xb_batch, &gm->wv, l, dim, kv_dim, wt, n_tokens);
 
         rmsnorm_head_batch_kernel<<<n_tokens * n_heads, 256>>>(
             gm->q_batch, (float *)gm->q_norm.layer[l], n_heads, hd, n_tokens, c->norm_eps);
@@ -850,27 +995,27 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
             gm->xb_batch, gm->q_batch, gm->kc + loff, gm->vc + loff,
             n_tokens, n_heads, hd, kv_dim, kv_mul, scale);
 
-        gpu_mm_batch(gm->xb2_batch, gm->xb_batch, gm->wo.layer[l], dim, dim, wt, n_tokens);
+        gpu_mm_batch(gm->xb2_batch, gm->xb_batch, &gm->wo, l, dim, dim, wt, n_tokens);
         add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
             gm->x_batch, gm->xb2_batch, dim, n_tokens);
 
         rmsnorm_batch_kernel<<<n_tokens, 256>>>(
             gm->xb_batch, gm->x_batch, (float *)gm->norm_ffn.layer[l], dim, n_tokens, c->norm_eps);
 
-        gpu_mm_batch(gm->hb_batch,  gm->xb_batch, gm->gate.layer[l], dim, hidden, wt, n_tokens);
-        gpu_mm_batch(gm->hb2_batch, gm->xb_batch, gm->up.layer[l],   dim, hidden, wt, n_tokens);
+        gpu_mm_batch(gm->hb_batch,  gm->xb_batch, &gm->gate, l, dim, hidden, wt, n_tokens);
+        gpu_mm_batch(gm->hb2_batch, gm->xb_batch, &gm->up,   l, dim, hidden, wt, n_tokens);
 
         swiglu_batch_kernel<<<(n_tokens * hidden + 255) / 256, 256>>>(
             gm->hb_batch, gm->hb2_batch, hidden, n_tokens);
 
-        gpu_mm_batch(gm->xb_batch, gm->hb_batch, gm->down.layer[l], hidden, dim, wt, n_tokens);
+        gpu_mm_batch(gm->xb_batch, gm->hb_batch, &gm->down, l, hidden, dim, wt, n_tokens);
         add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
             gm->x_batch, gm->xb_batch, dim, n_tokens);
     }
 
     const float *x_last = gm->x_batch + (size_t)(n_tokens - 1) * dim;
     rmsnorm_kernel<<<1, 256>>>(gm->x, x_last, (float *)gm->norm_out.ptr, dim, c->norm_eps);
-    gpu_mm(gm->logits, gm->x, gm->out.ptr, dim, c->vocab_size, gm->out_t);
+    gpu_mm_out(gm->logits, gm->x, gm, dim, c->vocab_size, 1);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 

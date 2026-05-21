@@ -1,16 +1,17 @@
 /*
- * Bonsai 向け FP4 ブリッジ: Q1_0 重み変換、128 アライン、F32 入出力。
+ * Qwen3 FP4 bridge: FP16 GPU weights -> NVFP4 cache, F32 activations in/out.
+ * Uses CUTLASS block-scaled NVFP4 GEMM (fp4_gemm.cu) on Blackwell SM120+.
  */
 
-#include "fp4_bonsai.h"
+#include "fp4_qwen3.h"
 #include "fp4_gemm.h"
-#include "gpu.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = (call); \
@@ -27,44 +28,31 @@ static size_t g_act_cap = 0, g_out_cap = 0;
 
 static int align128(int x) { return (x + 127) & ~127; }
 
-static __device__ float dev_f16f32(uint16_t h)
+static __global__ void f16_to_bf16_pad_kernel(
+    const uint16_t *src, __nv_bfloat16 *dst, int N, int K, int K_pad)
 {
-    return __half2float(*reinterpret_cast<const __half *>(&h));
-}
-
-static __global__ void dequant_q1_0_to_bf16_kernel(
-    const GpuBlockQ1_0 *W, __nv_bfloat16 *out,
-    int N, int K, int K_pad, size_t row_stride)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= N) return;
-
-    const GpuBlockQ1_0 *wrow =
-        (const GpuBlockQ1_0 *)((const char *)W + row * row_stride);
-    int nb = K / GPU_QK1_0;
-    __nv_bfloat16 *orow = out + (size_t)row * K_pad;
-
-    for (int ib = 0; ib < nb; ib++) {
-        float d = dev_f16f32(wrow[ib].d);
-        for (int k = 0; k < GPU_QK1_0; k++) {
-            int bit = (wrow[ib].qs[k / 8] >> (k % 8)) & 1;
-            float val = bit ? d : -d;
-            orow[ib * GPU_QK1_0 + k] = __float2bfloat16_rn(val);
-        }
-    }
-    for (int k = K; k < K_pad; k++)
-        orow[k] = __float2bfloat16_rn(0.0f);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K_pad;
+    if (idx >= total) return;
+    int row = idx / K_pad;
+    int k = idx % K_pad;
+    float v = 0.f;
+    if (k < K)
+        v = __half2float(*reinterpret_cast<const __half *>(&src[(size_t)row * K + k]));
+    dst[idx] = __float2bfloat16_rn(v);
 }
 
 static __global__ void f32_to_bf16_pad_kernel(
-    const float *src, __nv_bfloat16 *dst, int M, int n, int K_pad)
+    const float *src, __nv_bfloat16 *dst, int M, int n, int K_pad, int M_act)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = M * K_pad;
     if (idx >= total) return;
     int m = idx / K_pad;
-    int k = idx - m * K_pad;
-    float v = (k < n) ? src[(size_t)m * n + k] : 0.0f;
+    int k = idx % K_pad;
+    float v = 0.f;
+    if (m < M_act && k < n)
+        v = src[(size_t)m * n + k];
     dst[idx] = __float2bfloat16_rn(v);
 }
 
@@ -79,7 +67,7 @@ static __global__ void bf16_to_f32_trunc_kernel(
     dst[idx] = __bfloat162float(src[(size_t)m * N_pad + n]);
 }
 
-int fp4_bonsai_init(int max_M, int max_N, int max_K)
+int fp4_qwen3_init(int max_M, int max_N, int max_K)
 {
     int M = align128(max_M);
     int N = align128(max_N);
@@ -105,7 +93,7 @@ int fp4_bonsai_init(int max_M, int max_N, int max_K)
     return 0;
 }
 
-void fp4_bonsai_shutdown(void)
+void fp4_qwen3_shutdown(void)
 {
     fp4_gemm_cleanup();
     if (g_act_bf16) cudaFree(g_act_bf16);
@@ -116,47 +104,40 @@ void fp4_bonsai_shutdown(void)
     g_max_M = g_max_N = g_max_K = 0;
 }
 
-void *fp4_bonsai_weight_from_q1_host(const void *host_q1, int N, int K,
-                                      size_t row_stride)
+void *fp4_qwen3_weight_from_f16_device(const void *dev_f16, int N, int K)
 {
     int N_pad = align128(N);
     int K_pad = align128(K);
 
-    GpuBlockQ1_0 *dev_q1 = NULL;
     __nv_bfloat16 *dev_bf16 = NULL;
-    size_t q1_bytes = (size_t)N * row_stride;
-    CUDA_CHECK(cudaMalloc(&dev_q1, q1_bytes));
-    CUDA_CHECK(cudaMemcpy(dev_q1, host_q1, q1_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&dev_bf16, (size_t)N_pad * K_pad * sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaMemset(dev_bf16, 0, (size_t)N_pad * K_pad * sizeof(__nv_bfloat16)));
 
-    dequant_q1_0_to_bf16_kernel<<<(N + 255) / 256, 256>>>(
-        dev_q1, dev_bf16, N, K, K_pad, row_stride);
+    int total = N * K_pad;
+    f16_to_bf16_pad_kernel<<<(total + 255) / 256, 256>>>(
+        (const uint16_t *)dev_f16, dev_bf16, N, K, K_pad);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     void *cache = fp4_quantize_weights(dev_bf16, N_pad, K_pad);
-
-    cudaFree(dev_q1);
     cudaFree(dev_bf16);
 
-    if (!cache) {
-        fprintf(stderr, "fp4_bonsai_weight_from_q1_host: quantize failed N=%d K=%d\n",
+    if (!cache)
+        fprintf(stderr, "fp4_qwen3_weight_from_f16_device: quantize failed N=%d K=%d\n",
                 N_pad, K_pad);
-    }
     return cache;
 }
 
-void fp4_bonsai_free_weight(void *cache)
+void fp4_qwen3_free_weight(void *cache)
 {
     fp4_weight_cache_free(cache);
 }
 
-void fp4_bonsai_mm(const void *weight_cache,
-                   const float *x, float *y,
-                   int M, int n, int d)
+void fp4_qwen3_mm(const void *weight_cache,
+                  const float *x, float *y,
+                  int M, int n, int d)
 {
     if (!weight_cache) {
-        fprintf(stderr, "fp4_bonsai_mm: null weight cache\n");
+        fprintf(stderr, "fp4_qwen3_mm: null weight cache\n");
         exit(1);
     }
 
@@ -165,22 +146,20 @@ void fp4_bonsai_mm(const void *weight_cache,
     int M_pad = align128(M);
 
     if (M_pad > g_max_M || N_pad > g_max_N || K_pad > g_max_K) {
-        if (fp4_bonsai_init(M_pad > g_max_M ? M_pad : g_max_M,
-                            N_pad > g_max_N ? N_pad : g_max_N,
-                            K_pad > g_max_K ? K_pad : g_max_K) != 0) {
-            fprintf(stderr, "fp4_bonsai_mm: init failed\n");
+        if (fp4_qwen3_init(M_pad > g_max_M ? M_pad : g_max_M,
+                           N_pad > g_max_N ? N_pad : g_max_N,
+                           K_pad > g_max_K ? K_pad : g_max_K) != 0) {
+            fprintf(stderr, "fp4_qwen3_mm: init failed\n");
             exit(1);
         }
     }
 
-    int act_elems = M_pad * K_pad;
-    int out_elems = M_pad * N_pad;
-    f32_to_bf16_pad_kernel<<<(act_elems + 255) / 256, 256>>>(
-        x, g_act_bf16, M_pad, n, K_pad);
+    f32_to_bf16_pad_kernel<<<(M_pad * K_pad + 255) / 256, 256>>>(
+        x, g_act_bf16, M_pad, n, K_pad, M);
 
     if (fp4_gemm_run_cached(g_act_bf16, weight_cache, NULL, g_out_bf16,
                             M_pad, 1.0f, 0.0f) != 0) {
-        fprintf(stderr, "fp4_bonsai_mm: gemm failed M=%d n=%d d=%d\n", M, n, d);
+        fprintf(stderr, "fp4_qwen3_mm: gemm failed M=%d n=%d d=%d\n", M, n, d);
         exit(1);
     }
     fp4_gemm_sync();

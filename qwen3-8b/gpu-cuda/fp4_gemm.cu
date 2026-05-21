@@ -223,6 +223,49 @@ __device__ __forceinline__ int compute_sf_index(int r, int k_block, int rows, in
     return r0 * 16 + r1 * 4 + r2 * row_tile_stride + k1 * 1 + k2 * k_tile_stride;
 }
 
+// Quantize BF16 matrix (column-major N×K) to packed FP4 + UE4M3 scales
+__global__ void quantize_bf16_colmajor_to_fp4_kernel(
+    const __nv_bfloat16* __restrict__ src,
+    uint8_t* __restrict__ dst_fp4,
+    uint8_t* __restrict__ dst_sf,
+    int rows, int K, int nsb, int N_stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_blocks = rows * nsb;
+    if (idx >= total_blocks) return;
+
+    int r = idx / nsb;
+    int sb = idx % nsb;
+    int k_start = sb * 16;
+
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int k = k_start + i;
+        float val = __bfloat162float(src[r + (size_t)k * N_stride]);
+        max_abs = fmaxf(max_abs, fabsf(val));
+    }
+
+    float scale_val = max_abs / 6.0f;
+    if (scale_val < 1.953125e-3f) scale_val = 1.953125e-3f;
+    uint8_t scale_raw = d_float_to_ue4m3(scale_val);
+    float actual_scale = d_ue4m3_to_float(scale_raw);
+    float scale_inv = 1.0f / actual_scale;
+
+    int sf_idx = compute_sf_index(r, sb, rows, nsb);
+    dst_sf[sf_idx] = scale_raw;
+
+    #pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+        int k0 = k_start + i;
+        float v0 = __bfloat162float(src[r + (size_t)k0 * N_stride]) * scale_inv;
+        float v1 = __bfloat162float(src[r + (size_t)(k0 + 1) * N_stride]) * scale_inv;
+        uint8_t fp4_0 = d_float_to_fp4(v0);
+        uint8_t fp4_1 = d_float_to_fp4(v1);
+        dst_fp4[r + (size_t)(k0 / 2) * N_stride] = (fp4_1 << 4) | fp4_0;
+    }
+}
+
 // Quantize BF16 matrix to packed FP4 + UE4M3 scales
 // One thread per scale block (i.e., per 16 BF16 elements)
 __global__ void quantize_bf16_to_fp4_kernel(
@@ -291,6 +334,40 @@ static inline uint8_t float_to_fp4(float val) {
         }
     }
     return sign | code;
+}
+
+template <typename LayoutSF>
+static void quantize_matrix_colmajor_host(
+    const cutlass::bfloat16_t* src, uint8_t* dst_fp4,
+    ScaleFactorType* dst_sf, int rows, int K, int N_stride, LayoutSF layout_sf)
+{
+    int nsb = K / SF_VEC_SIZE;
+    for (int r = 0; r < rows; r++) {
+        for (int sb = 0; sb < nsb; sb++) {
+            int k_start = sb * SF_VEC_SIZE;
+            float max_abs = 0.0f;
+            for (int i = 0; i < SF_VEC_SIZE; i++) {
+                int k = k_start + i;
+                float val = float(src[r + (size_t)k * N_stride]);
+                max_abs = fmaxf(max_abs, fabsf(val));
+            }
+            float scale_val = max_abs / 6.0f;
+            if (scale_val < 1e-10f) scale_val = 1e-10f;
+            ScaleFactorType scale_ue4m3 = ScaleFactorType(scale_val);
+            float actual_scale = float(scale_ue4m3);
+            float scale_inv = 1.0f / actual_scale;
+            int sf_idx = layout_sf(r, k_start, 0);
+            dst_sf[sf_idx] = scale_ue4m3;
+            for (int i = 0; i < SF_VEC_SIZE; i += 2) {
+                int k0 = k_start + i;
+                float v0 = float(src[r + (size_t)k0 * N_stride]) * scale_inv;
+                float v1 = float(src[r + (size_t)(k0 + 1) * N_stride]) * scale_inv;
+                uint8_t fp4_0 = float_to_fp4(v0);
+                uint8_t fp4_1 = float_to_fp4(v1);
+                dst_fp4[r + (size_t)(k0 / 2) * N_stride] = (fp4_1 << 4) | fp4_0;
+            }
+        }
+    }
 }
 
 template <typename LayoutSF>
@@ -662,14 +739,11 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
         return nullptr;
     }
 
-    // Compute scale factor layout size (B matrix uses SFB layout)
-    // We need a dummy M to compute the layout, but SFB only depends on N and K
     int dummy_M = 128;
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
         cute::make_shape(dummy_M, N, K, 1));
     int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
 
-    // Allocate device buffers
     FP4WeightCache* cache = new FP4WeightCache();
     cache->N = N;
     cache->K = K;
@@ -682,7 +756,6 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
         delete cache;
         return nullptr;
     }
-
     err = cudaMalloc(&cache->d_sf, sf_elems);
     if (err != cudaSuccess) {
         fprintf(stderr, "fp4_quantize_weights: cudaMalloc sf failed: %s\n", cudaGetErrorString(err));
@@ -691,7 +764,6 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
         return nullptr;
     }
 
-    // Quantize on GPU
     int nsb = K / SF_VEC_SIZE;
     int total_blocks = N * nsb;
     int threads = 256;

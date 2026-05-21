@@ -39,7 +39,7 @@ CUDA13_NVCC         ?= /usr/local/cuda/bin/nvcc
 CUTLASS_DIR ?= third_party/cutlass
 CUTLASS_TAG ?= v3.9.0
 
-# Blackwell FP4 ビルド: BONSAI_FP4=1（make blackwell が自動設定）
+# Blackwell FP4 ビルド: BONSAI_FP4=1（make run / make build.fp4 が設定）
 BONSAI_FP4 ?= 0
 
 FP4_CXXFLAGS = -std=c++17 --expt-relaxed-constexpr \
@@ -51,33 +51,43 @@ FP4_FLAG :=
 FP4_OBJS :=
 ifneq ($(BONSAI_FP4),0)
 FP4_FLAG  := -DBONSAI_FP4=1
-FP4_OBJS  := fp4_gemm.o fp4_bonsai.o
+FP4_OBJS  := fp4_gemm.o fp4_qwen3.o
 endif
 
 # Blackwell (sm_120) は静的 shared 上限 48 KB。FA_BR=32 で Flash Attention が収まる。
 FA_BR_FLAG :=
+FA_BR_VAL  := $(if $(FA_BR),$(FA_BR),64)
 ifneq ($(FA_BR),)
 FA_BR_FLAG := -DFA_BR=$(FA_BR)
 endif
 
-.PHONY: build run run.no-fp4 clean blackwell cutlass
+# BONSAI_FP4 / FA_BR が変わったら kernels を必ず再コンパイル（古い .o 再利用防止）
+KERNELS_OBJ := kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR_VAL).o
+
+.PHONY: build build.fp4 run run.no-fp4 clean blackwell cutlass
 
 .DEFAULT_GOAL := run
 
-build: main.o kernels.o $(FP4_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o qwen3-gpu-cuda main.o kernels.o $(FP4_OBJS) $(LDFLAGS)
+build: main.o $(KERNELS_OBJ) $(FP4_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o qwen3-gpu-cuda main.o $(KERNELS_OBJ) $(FP4_OBJS) $(LDFLAGS)
+
+build.fp4: cutlass
+	$(MAKE) build CUDA_GENCODE="$(BLACKWELL_GENCODE)" FA_BR="$(BLACKWELL_FA_BR)" BONSAI_FP4=1
+
+build.no-fp4:
+	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_FP4=0
 
 main.o: main.c gpu.h
 	$(CC) $(CFLAGS) -c main.c -o main.o
 
-kernels.o: kernels.cu gpu.h fp4_bonsai.h
-	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) -c kernels.cu -o kernels.o
+$(KERNELS_OBJ): kernels.cu gpu.h fp4_qwen3.h
+	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) -c kernels.cu -o $@
 
 fp4_gemm.o: fp4_gemm.cu fp4_gemm.h | cutlass
 	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_gemm.cu -o fp4_gemm.o
 
-fp4_bonsai.o: fp4_bonsai.cu fp4_bonsai.h fp4_gemm.h gpu.h | cutlass
-	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_bonsai.cu -o fp4_bonsai.o
+fp4_qwen3.o: fp4_qwen3.cu fp4_qwen3.h fp4_gemm.h | cutlass
+	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_qwen3.cu -o fp4_qwen3.o
 
 cutlass:
 	@if [ ! -f "$(CUTLASS_DIR)/include/cutlass/cutlass.h" ]; then \
@@ -87,11 +97,11 @@ cutlass:
 			https://github.com/NVIDIA/cutlass.git $(CUTLASS_DIR); \
 	fi
 
-run.no-fp4: build
+run.no-fp4: build.no-fp4
 	./qwen3-gpu-cuda "$(MODEL)" -p "$(PROMPT)"
 
 clean:
-	rm -f qwen3-gpu-cuda main.o kernels.o fp4_gemm.o fp4_bonsai.o
+	rm -f qwen3-gpu-cuda main.o kernels.*.o fp4_gemm.o fp4_qwen3.o
 
 # apt CUDA 11 を削除 → NVIDIA 公式 CUDA 13 をインストール → Blackwell FP4 ビルド
 blackwell:
@@ -153,8 +163,7 @@ blackwell:
 	echo "nvcc: $$(command -v nvcc)"; \
 	$(MAKE) cutlass; \
 	echo "=== Building Blackwell FP4 ($(BLACKWELL_GENCODE), FA_BR=$(BLACKWELL_FA_BR)) ==="; \
-	$(MAKE) build CUDA_GENCODE="$(BLACKWELL_GENCODE)" NVCC="$(CUDA13_NVCC)" \
-		FA_BR="$(BLACKWELL_FA_BR)" BONSAI_FP4=1
+	$(MAKE) build.fp4
 
-run: build
+run: build.fp4
 	./qwen3-gpu-cuda "$(MODEL)" -p "$(PROMPT)"
