@@ -37,7 +37,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 |---|---|---|---|
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
-| ROCm/HIP GPU | `qwen3-8b/gpu/main.c` | `gpu/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
@@ -63,7 +63,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     ├── cpu-multicore/
     │   ├── Makefile
     │   └── main.c
-    ├── gpu/
+    ├── gpu-rocm/
     │   ├── Makefile
     │   └── main.c
     ├── xdna2/
@@ -164,7 +164,7 @@ qwen3-8b/
 ├── Makefile
 ├── cpu/ … （`main.c` → `cpu/qwen3-cpu`）
 ├── cpu-multicore/ …
-├── gpu/ …
+├── gpu-rocm/ …
 ├── xdna2/ …
 ├── xdna2-bfp16/ …
 └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
@@ -270,29 +270,29 @@ rocminfo | grep -m 1 gfx
 
 ```bash
 cd qwen3-8b
-make build.rocm GPU_ARCH=gfx1201
+make build.gpu-rocm GPU_ARCH=gfx1201
 ```
 
 ROCm が `/opt/rocm` 以外にある場合:
 
 ```bash
-make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
-成功すると **`gpu/qwen3-rocm`** ができます。
+成功すると **`gpu-rocm/qwen3-rocm`** ができます。
 
 ### 実行
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "日本語で、ROCmとは何かを初心者向けに説明してください。" \
   -n 64
 ```
 
-`Makefile` の `run.rocm` を使う場合:
+`Makefile` の `run.gpu-rocm` を使う場合:
 
 ```bash
-make run.rocm GPU_ARCH=gfx1201 PROMPT="日本語で短く説明してください。"
+make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="日本語で短く説明してください。"
 ```
 
 ## AMD Ryzen AI XDNA2 NPU 版
@@ -389,7 +389,7 @@ make run.xdna2.bfpx PROMPT="日本語で短く説明してください。"
 慣れてきたら `-n` を増やします。
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で詩を書いてください。" -n 128
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で詩を書いてください。" -n 128
 ```
 
 ## 生成を安定させたいとき
@@ -397,7 +397,7 @@ make run.xdna2.bfpx PROMPT="日本語で短く説明してください。"
 同じ入力で結果を比較したい場合は、温度を下げたり seed を固定します。
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "1文で説明してください: GGUFとは？" \
   -n 32 \
   -t 0.2 \
@@ -419,7 +419,7 @@ make clean
 
 - `cpu/qwen3-cpu`
 - `cpu-multicore/qwen3-cpu-omp`
-- `gpu/qwen3-rocm`
+- `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
 
@@ -449,7 +449,7 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-速度が必要なら `./gpu/qwen3-rocm` を使ってください。
+速度が必要なら `./gpu-rocm/qwen3-rocm` を使ってください。
 
 ### `hipcc` が見つからない
 
@@ -462,7 +462,7 @@ ls /opt/rocm/bin/hipcc
 別の場所にある場合:
 
 ```bash
-make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
 ### GPU_ARCH が合わない
@@ -476,7 +476,7 @@ rocminfo | grep -m 1 gfx
 表示された値を使います。
 
 ```bash
-make build.rocm GPU_ARCH=gfx1100
+make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 
 ### `/dev/accel/accel0` は開けるが `CREATE_HWCTX` が EINVAL
@@ -509,7 +509,7 @@ make build.rocm GPU_ARCH=gfx1100
 4. `qwen3-8b/cpu-multicore/main.c`  
    OpenMP による並列化箇所を見る。
 
-5. `qwen3-8b/gpu/main.c`  
+5. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
 6. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  

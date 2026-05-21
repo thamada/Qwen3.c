@@ -8,7 +8,7 @@ PROMPT  ?= Hello, how are you?
 	all \
 	build.cpu run.cpu \
 	build.cpu-multicore run.cpu-multicore \
-	build.gpu run.gpu \
+	build.gpu-rocm run.gpu-rocm \
 	build.xdna2 run.xdna2 \
 	build.xdna2-bfp16 run.xdna2-bfp16 \
 	gen-xdna-kernels \
@@ -68,21 +68,21 @@ run.cpu-multicore: build.cpu-multicore
 	./cpu-multicore/qwen3-cpu-omp "$(MODEL)" -p "$(PROMPT)"
 
 # -----------------------------------------------------------------------------
-# AMD Radeon GPU（gpu/main.c）
-# HIPCC が無い環境ではビルドを省略（gpu/Makefile の既定パスと一致させること）
+# AMD Radeon GPU（gpu-rocm/main.c）
+# HIPCC が無い環境ではビルドを省略（gpu-rocm/Makefile の既定パスと一致させること）
 ROCM     ?= /opt/rocm
 HIPCC    ?= $(ROCM)/bin/hipcc
 GPU_ARCH ?= gfx1201
 
-build.gpu:
+build.gpu-rocm:
 	@if [ -x "$(HIPCC)" ]; then \
-		cd gpu && make build ROCM="$(ROCM)" HIPCC="$(HIPCC)" GPU_ARCH="$(GPU_ARCH)"; \
+		cd gpu-rocm && make build ROCM="$(ROCM)" HIPCC="$(HIPCC)" GPU_ARCH="$(GPU_ARCH)"; \
 	else \
-		echo "Skipping build.gpu: HIPCC ($(HIPCC)) not found"; \
+		echo "Skipping build.gpu-rocm: HIPCC ($(HIPCC)) not found"; \
 	fi
 
-run.gpu: build.gpu
-	./gpu/qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
+run.gpu-rocm: build.gpu-rocm
+	./gpu-rocm/qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
 
 # -----------------------------------------------------------------------------
 # AMD Ryzen AI XDNA2 NPU（xdna2/main.c）
@@ -106,10 +106,10 @@ run.xdna2-bfp16: build.xdna2-bfp16
 
 # -----------------------------------------------------------------------------
 # 全バリアントをビルド
-all: build.cpu build.cpu-multicore build.gpu build.xdna2 build.xdna2-bfp16
+all: build.cpu build.cpu-multicore build.gpu-rocm build.xdna2 build.xdna2-bfp16
 
 # -----------------------------------------------------------------------------
 clean:
-	for d in cpu cpu-multicore gpu xdna2 xdna2-bfp16; do \
+	for d in cpu cpu-multicore gpu-rocm xdna2 xdna2-bfp16; do \
 		(cd $$d && make clean); \
 	done

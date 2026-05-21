@@ -37,7 +37,7 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 |---|---|---|---|
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
-| ROCm/HIP GPU | `qwen3-8b/gpu/main.c` | `gpu/qwen3-rocm` | Practical speed on AMD GPUs |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
@@ -63,7 +63,7 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     ├── cpu-multicore/
     │   ├── Makefile
     │   └── main.c
-    ├── gpu/
+    ├── gpu-rocm/
     │   ├── Makefile
     │   └── main.c
     ├── xdna2/
@@ -164,7 +164,7 @@ qwen3-8b/
 ├── Makefile
 ├── cpu/ … (`main.c` → `cpu/qwen3-cpu`)
 ├── cpu-multicore/ …
-├── gpu/ …
+├── gpu-rocm/ …
 ├── xdna2/ …
 ├── xdna2-bfp16/ …
 └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
@@ -272,29 +272,29 @@ If you see e.g. `gfx1201`, build with `GPU_ARCH=gfx1201`.
 
 ```bash
 cd qwen3-8b
-make build.rocm GPU_ARCH=gfx1201
+make build.gpu-rocm GPU_ARCH=gfx1201
 ```
 
 If ROCm is not under `/opt/rocm`:
 
 ```bash
-make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
-Produces **`gpu/qwen3-rocm`**.
+Produces **`gpu-rocm/qwen3-rocm`**.
 
 ### Run
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Explain what ROCm is for beginners." \
   -n 64
 ```
 
-Using `run.rocm`:
+Using `run.gpu-rocm`:
 
 ```bash
-make run.rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
+make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
 ```
 
 ## AMD Ryzen AI XDNA2 NPU
@@ -391,7 +391,7 @@ Start small:
 Then increase `-n`:
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Write a short poem." \
   -n 128
 ```
@@ -401,7 +401,7 @@ Then increase `-n`:
 Lower temperature and fix the seed when comparing runs:
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "One sentence: what is GGUF?" \
   -n 32 \
   -t 0.2 \
@@ -423,7 +423,7 @@ Typical files removed:
 
 - `cpu/qwen3-cpu`
 - `cpu-multicore/qwen3-cpu-omp`
-- `gpu/qwen3-rocm`
+- `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
 
@@ -453,7 +453,7 @@ Expected for 8B on CPU alone. Try `-n 1` or `-n 4`:
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-For speed, use `./gpu/qwen3-rocm`.
+For speed, use `./gpu-rocm/qwen3-rocm`.
 
 ### `hipcc` not found
 
@@ -466,7 +466,7 @@ ls /opt/rocm/bin/hipcc
 If elsewhere:
 
 ```bash
-make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
 ### Wrong `GPU_ARCH`
@@ -478,7 +478,7 @@ rocminfo | grep -m 1 gfx
 ```
 
 ```bash
-make build.rocm GPU_ARCH=gfx1100
+make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 
 ### `/dev/accel/accel0` opens but `CREATE_HWCTX` returns `EINVAL`
@@ -503,7 +503,7 @@ Suggested order:
 2. `doc/design.md` — design, quantization, Qwen3 specifics.
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
-5. `qwen3-8b/gpu/main.c` — GPU memory, HIP kernels, GPU sampling.
+5. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
 6. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope

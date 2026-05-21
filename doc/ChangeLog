@@ -4,6 +4,16 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 16:50:16
+
+**`qwen3-8b/gpu/`** を **`qwen3-8b/gpu-rocm/`** にリネーム（**`main.c`**・**`Makefile`** を移動）。集約 **`qwen3-8b/Makefile`** の **`build.gpu` / `run.gpu`** を **`build.gpu-rocm` / `run.gpu-rocm`** に変更し、実行パスを **`gpu-rocm/qwen3-rocm`** に更新。**`clean`** の対象ディレクトリも **`gpu-rocm`** に追随。
+
+**`.gitignore`**・**`README.md`**・**`README.en.md`**・**`qwen3-8b/cpu-multicore/main.c`**・**`qwen3-8b/gpu-rocm/main.c`**（ビルド注記）のパス・Make ターゲット表記を上記に追随。
+
+**`doc/design.md`**: 概要・実装バリアント表・ディレクトリ表・Make ターゲット表・ビルド例の **`gpu/`** / **`build.gpu`** 表記を **`gpu-rocm/`** / **`build.gpu-rocm`** に更新。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-21 16:46:11
 
 **`qwen3-8b/hf-model.py`**: 削除。**`make model`**（**`wget`** + **`.sha256sum`**）に GGUF 取得を一本化。
