@@ -1,17 +1,21 @@
 #define _POSIX_C_SOURCE 200809L
 
 /*
- * qwen3-8b/cpu-multicore/main.c — Qwen3-VL-8B GGUF、CPU + OpenMP（単一ソース）。
+ * Qwen3-VL GGUF Inference Engine (NVIDIA CUDA) — Text-only decoder.
  *
- * qwen3-8b/gpu-rocm/main.c（ROCm/HIP）のカーネル粒度に沿った並列化:
- *   - GEMV: 出力行（row）方向 — hip の mm_*_gemv が 1 行ずつ独立と同じ
- *   - attn: ヘッドごと — flash / MHA カーネルが blockIdx.x = head と同様
- *   - RoPE: ヘッド並列 — rope_kernel のヘッド次元と同様
- *   - RMSNorm(全体): 2 パス（reduction + 素平行ループ）／ヘッド RMSNorm はヘッド並列
- *   - SiLU+mul・残差加算: hidden / dim を並列
+ * 対象: Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf（IQ2_S / IQ3_S / Q4_K / Q5_K 混合量子化）。
+ * テキスト処理のみ。Vision deepstack は無視。
  *
- * Build: `make build` → `qwen3-cpu-omp`。
- * スレッド数: 環境変数 OMP_NUM_THREADS（未設定時は実装依存）
+ * GPU 方針:
+ *   - 起動時に CPU で逆量子化 → NVFP4（線形層）/ FP16（embedding）→ VRAM アップロード。
+ *   - Prefill: 全プロンプトトークンをバッチ並列（gpu_forward_prefill）。
+ *   - Decode: 1 トークンずつ gpu_forward。
+ *   - 線形層: FP16 GEMV カーネル（mm_f16_gemv_kernel）。
+ *   - Attention: Flash Attention（online softmax、GQA 対応）。
+ *   - RoPE: 標準 RoPE（隣接ペア回転、rope_theta のみ）。
+ *   - サンプリングのみ CPU（logits を D2H コピー）。
+ *
+ * チャット: ChatML — system + user + assistant 開始（Qwen3-VL テンプレート）。
  */
 
 #include <stdio.h>
@@ -24,8 +28,23 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <omp.h>
+#include "gpu.h"
+#include <cuda_runtime.h>
+#ifdef BONSAI_FP4
+#include "fp4_qwen3.h"
+#endif
 
+#define CUDACHECK(x) do { \
+    cudaError_t _cuda_err = (x); \
+    if (_cuda_err != cudaSuccess) { \
+        fprintf(stderr, "%s:%d CUDA error: %s\n", __FILE__, __LINE__, cudaGetErrorString(_cuda_err)); \
+        exit(1); \
+    } \
+} while (0)
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #define GGUF_MAGIC      0x46554747u
 #define QK_K            256
 #define K_SCALE_SIZE    12
@@ -599,8 +618,9 @@ static void dequant_iq3_s(const BlockIQ3_S *x, float *y, int64_t nb) {
         }
     }
 }
+
 /* ================================================================
- * Model layout (host pointers into mmap)
+ * Model layout
  * ================================================================ */
 
 typedef struct {
@@ -629,34 +649,32 @@ typedef struct {
     int byte_tok[256];
 } Tok;
 
+/* Device-resident weights (FP16 matmul weights + F32 norms). */
 typedef struct {
-    void *embd;    int embd_t;
+    void  *embd;    int embd_t;
     float **norm_att;
-    void **wq;     int *wq_t;
-    void **wk;     int *wk_t;
-    void **wv;     int *wv_t;
-    void **wo;     int *wo_t;
-    float **q_norm;
-    float **k_norm;
-    float **norm_ffn;
-    void **gate;   int *gate_t;
-    void **up;     int *up_t;
-    void **down;   int *down_t;
+    void **wq, **wk, **wv, **wo;
+    float **q_norm, **k_norm, **norm_ffn;
+    void **gate, **up, **down;
     float *norm_out;
     void *out;     int out_t;
-} Weights;
+#ifdef BONSAI_FP4
+    void **wq_fp4, **wk_fp4, **wv_fp4, **wo_fp4;
+    void **gate_fp4, **up_fp4, **down_fp4;
+    void *out_fp4;
+#endif
+} WeightsDev;
 
 typedef struct {
-    float *x, *xb, *xb2, *hb, *hb2;
-    float *q, *k, *v, *att, *logits;
-    float *kc, *vc;
+    float *logits; /* host: サンプリング用（GPU から D2H コピー先） */
 } State;
 
 typedef struct {
     Config cfg;
-    Weights w;
+    WeightsDev wd;
     State s;
     Tok tok;
+    GpuModel *gpu;
     int fd;
     uint8_t *fdata;
     size_t fsz;
@@ -665,35 +683,30 @@ typedef struct {
     uint64_t doff;
 } Model;
 
-static size_t row_bytes_quant(int type, int n_in) {
-    int nb = n_in / QK_K;
-    switch (type) {
-    case DT_Q4_K:  return (size_t)nb * sizeof(BlockQ4_K);
-    case DT_Q5_K:  return (size_t)nb * sizeof(BlockQ5_K);
-    case DT_IQ2_S: return (size_t)nb * sizeof(BlockIQ2_S);
-    case DT_IQ3_S: return (size_t)nb * sizeof(BlockIQ3_S);
-    default: return 0;
-    }
+static TensorInfo *ti_find(Model *m, const char *name) {
+    for (int i = 0; i < m->nti; i++)
+        if (strcmp(m->ti[i].name, name) == 0)
+            return &m->ti[i];
+    return NULL;
 }
 
-static size_t block_size_quant(int type) {
-    switch (type) {
-    case DT_Q4_K:  return sizeof(BlockQ4_K);
-    case DT_Q5_K:  return sizeof(BlockQ5_K);
-    case DT_IQ2_S: return sizeof(BlockIQ2_S);
-    case DT_IQ3_S: return sizeof(BlockIQ3_S);
-    default: return 0;
-    }
+static size_t ti_nelements(const TensorInfo *ti) {
+    uint64_t el = 1;
+    for (int i = 0; i < ti->n_dims; i++) el *= ti->ne[i];
+    return (size_t)el;
 }
 
-static void dequant_one_block_to(const void *blk, int type, float *dst) {
-    switch (type) {
-    case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)blk,  dst, 1); break;
-    case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)blk,  dst, 1); break;
-    case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)blk, dst, 1); break;
-    case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)blk, dst, 1); break;
+static size_t ti_nbytes(const TensorInfo *ti) {
+    size_t el = ti_nelements(ti);
+    switch (ti->type) {
+    case DT_F32:   return el * sizeof(float);
+    case DT_F16:   return el * sizeof(uint16_t);
+    case DT_Q4_K:  return (el / QK_K) * sizeof(BlockQ4_K);
+    case DT_Q5_K:  return (el / QK_K) * sizeof(BlockQ5_K);
+    case DT_IQ2_S: return (el / QK_K) * sizeof(BlockIQ2_S);
+    case DT_IQ3_S: return (el / QK_K) * sizeof(BlockIQ3_S);
     default:
-        fprintf(stderr, "dequant_one_block_to: bad type %d\n", type);
+        fprintf(stderr, "Error: unsupported tensor dtype %d\n", ti->type);
         exit(1);
     }
 }
@@ -1037,6 +1050,12 @@ static void append_bpe(Tok *tk, int *out, int *n, const char *text) {
     free(t);
 }
 
+/*
+ * ChatML Encoder (Qwen3-VL text-only)
+ *   <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
+ *   <|im_start|>user\n{prompt}<|im_end|>\n
+ *   <|im_start|>assistant\n
+ */
 static int *chat_encode(Tok *tk, const char *prompt, int *out_n) {
     int *toks = (int *)malloc(MAX_PROMPT_TOKS * sizeof(int));
     int n = 0;
@@ -1059,133 +1078,318 @@ static int *chat_encode(Tok *tk, const char *prompt, int *out_n) {
     return toks;
 }
 
-static void *find_tensor(Model *m, const char *name, int *out_type) {
-    for (int i = 0; i < m->nti; i++) {
-        if (strcmp(m->ti[i].name, name) == 0) {
-            if (out_type) *out_type = m->ti[i].type;
-            return m->fdata + m->doff + m->ti[i].offset;
-        }
-    }
-    return NULL;
+static const void *raw_tensor_ptr(Model *m, const TensorInfo *ti) {
+    return m->fdata + m->doff + ti->offset;
 }
 
-static void load_weights(Model *m) {
+static void materialize_host_f16(Model *m, const TensorInfo *ti,
+                                 float *f32_buf, uint16_t *f16_buf) {
+    size_t nel = ti_nelements(ti);
+    const void *raw = raw_tensor_ptr(m, ti);
+
+    if (ti->type == DT_F32) {
+        const float *src = (const float *)raw;
+        for (size_t i = 0; i < nel; i++)
+            f16_buf[i] = host_f32f16(src[i]);
+        return;
+    }
+    if (ti->type == DT_F16) {
+        memcpy(f16_buf, raw, nel * sizeof(uint16_t));
+        return;
+    }
+
+    if (nel % QK_K) {
+        fprintf(stderr, "Error: tensor %s nelements %zu not a multiple of QK_K\n",
+                ti->name, nel);
+        exit(1);
+    }
+    size_t nb = nel / QK_K;
+    switch (ti->type) {
+    case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)raw,  f32_buf, nb); break;
+    case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)raw,  f32_buf, nb); break;
+    case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)raw, f32_buf, nb); break;
+    case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)raw, f32_buf, nb); break;
+    default:
+        fprintf(stderr, "Error: unsupported dtype %d for tensor %s\n", ti->type, ti->name);
+        exit(1);
+    }
+    for (size_t i = 0; i < nel; i++)
+        f16_buf[i] = host_f32f16(f32_buf[i]);
+}
+
+static void *upload_fp16_dequant(Model *m, const char *name,
+                                 float *f32_buf, uint16_t *f16_buf, int *out_type) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) return NULL;
+    size_t nel = ti_nelements(ti);
+    const void *raw = raw_tensor_ptr(m, ti);
+    void *dptr = NULL;
+
+    if (ti->type == DT_F32) {
+        if (out_type) *out_type = DT_F32;
+        CUDACHECK(cudaMalloc(&dptr, nel * sizeof(float)));
+        CUDACHECK(cudaMemcpy(dptr, raw, nel * sizeof(float), cudaMemcpyHostToDevice));
+        return dptr;
+    }
+    if (ti->type == DT_F16) {
+        if (out_type) *out_type = DT_F16;
+        CUDACHECK(cudaMalloc(&dptr, nel * sizeof(uint16_t)));
+        CUDACHECK(cudaMemcpy(dptr, raw, nel * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        return dptr;
+    }
+
+    if (nel % QK_K) {
+        fprintf(stderr, "Error: tensor %s nelements %zu not a multiple of QK_K\n", name, nel);
+        exit(1);
+    }
+    size_t nb = nel / QK_K;
+    switch (ti->type) {
+    case DT_Q4_K:  dequant_q4_k ((const BlockQ4_K *)raw,  f32_buf, nb); break;
+    case DT_Q5_K:  dequant_q5_k ((const BlockQ5_K *)raw,  f32_buf, nb); break;
+    case DT_IQ2_S: dequant_iq2_s((const BlockIQ2_S *)raw, f32_buf, nb); break;
+    case DT_IQ3_S: dequant_iq3_s((const BlockIQ3_S *)raw, f32_buf, nb); break;
+    default:
+        fprintf(stderr, "Error: unsupported dtype %d for tensor %s\n", ti->type, name);
+        exit(1);
+    }
+
+    for (size_t i = 0; i < nel; i++) f16_buf[i] = host_f32f16(f32_buf[i]);
+    if (out_type) *out_type = DT_F16;
+    CUDACHECK(cudaMalloc(&dptr, nel * sizeof(uint16_t)));
+    CUDACHECK(cudaMemcpy(dptr, f16_buf, nel * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    return dptr;
+}
+
+#ifdef BONSAI_FP4
+static void upload_linear_fp4(Model *m, const char *name,
+                              float *f32_buf, uint16_t *f16_buf,
+                              void **out_fp4, int n_out, int n_in) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) {
+        fprintf(stderr, "missing tensor %s\n", name);
+        exit(1);
+    }
+    materialize_host_f16(m, ti, f32_buf, f16_buf);
+    *out_fp4 = fp4_qwen3_weight_from_f16_host(f16_buf, n_out, n_in);
+    if (!*out_fp4) {
+        fprintf(stderr, "NVFP4 quantize failed for %s (%dx%d)\n", name, n_out, n_in);
+        exit(1);
+    }
+}
+#endif
+
+static void *upload_f32(Model *m, const char *name) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) return NULL;
+    if (ti->type != DT_F32) {
+        fprintf(stderr, "Error: tensor %s expected F32, got type=%d\n", name, ti->type);
+        exit(1);
+    }
+    size_t nb = ti_nbytes(ti);
+    void *dptr;
+    CUDACHECK(cudaMalloc(&dptr, nb));
+    CUDACHECK(cudaMemcpy(dptr, raw_tensor_ptr(m, ti), nb, cudaMemcpyHostToDevice));
+    return dptr;
+}
+
+static size_t max_tensor_nelements(Model *m) {
+    size_t mx = 0;
+    for (int i = 0; i < m->nti; i++) {
+        size_t n = ti_nelements(&m->ti[i]);
+        if (n > mx) mx = n;
+    }
+    return mx;
+}
+
+static void upload_weights_gpu(Model *m) {
     Config *c = &m->cfg;
-    Weights *w = &m->w;
     int L = c->n_layers;
+    WeightsDev *wd = &m->wd;
 
-    w->embd = find_tensor(m, "token_embd.weight", &w->embd_t);
+    size_t max_nel = max_tensor_nelements(m);
+    printf("Allocating dequant staging: max tensor = %zu elements (%.1f MiB F32 + %.1f MiB F16)\n",
+           max_nel, (max_nel * 4.0) / (1024.0 * 1024.0), (max_nel * 2.0) / (1024.0 * 1024.0));
 
-    w->norm_att = (float **)calloc(L, sizeof(float *));
-    w->q_norm   = (float **)calloc(L, sizeof(float *));
-    w->k_norm   = (float **)calloc(L, sizeof(float *));
-    w->wq       = (void **)calloc(L, sizeof(void *));  w->wq_t   = (int *)calloc(L, sizeof(int));
-    w->wk       = (void **)calloc(L, sizeof(void *));  w->wk_t   = (int *)calloc(L, sizeof(int));
-    w->wv       = (void **)calloc(L, sizeof(void *));  w->wv_t   = (int *)calloc(L, sizeof(int));
-    w->wo       = (void **)calloc(L, sizeof(void *));  w->wo_t   = (int *)calloc(L, sizeof(int));
-    w->norm_ffn = (float **)calloc(L, sizeof(float *));
-    w->gate     = (void **)calloc(L, sizeof(void *));  w->gate_t  = (int *)calloc(L, sizeof(int));
-    w->up       = (void **)calloc(L, sizeof(void *));  w->up_t    = (int *)calloc(L, sizeof(int));
-    w->down     = (void **)calloc(L, sizeof(void *));  w->down_t  = (int *)calloc(L, sizeof(int));
+    float    *f32 = (float    *)malloc(max_nel * sizeof(float));
+    uint16_t *f16 = (uint16_t *)malloc(max_nel * sizeof(uint16_t));
+    if (!f32 || !f16) {
+        fprintf(stderr, "Error: failed to allocate dequant staging buffers\n");
+        exit(1);
+    }
+
+    wd->norm_att = (float **)calloc(L, sizeof(float *));
+    wd->wq       = (void  **)calloc(L, sizeof(void *));
+    wd->wk       = (void  **)calloc(L, sizeof(void *));
+    wd->wv       = (void  **)calloc(L, sizeof(void *));
+    wd->wo       = (void  **)calloc(L, sizeof(void *));
+    wd->q_norm   = (float **)calloc(L, sizeof(float *));
+    wd->k_norm   = (float **)calloc(L, sizeof(float *));
+    wd->norm_ffn = (float **)calloc(L, sizeof(float *));
+    wd->gate     = (void  **)calloc(L, sizeof(void *));
+    wd->up       = (void  **)calloc(L, sizeof(void *));
+    wd->down     = (void  **)calloc(L, sizeof(void *));
+#ifdef BONSAI_FP4
+    wd->wq_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->wk_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->wv_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->wo_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->gate_fp4 = (void  **)calloc(L, sizeof(void *));
+    wd->up_fp4   = (void  **)calloc(L, sizeof(void *));
+    wd->down_fp4 = (void  **)calloc(L, sizeof(void *));
+#endif
+
+#ifdef BONSAI_FP4
+    printf("Uploading weights to device (dequant -> NVFP4 linear layers)...\n");
+#else
+    printf("Uploading weights to device (dequantizing IQ2_S / IQ3_S / Q4_K / Q5_K -> FP16)...\n");
+#endif
+
+    wd->embd = upload_fp16_dequant(m, "token_embd.weight", f32, f16, &wd->embd_t);
+    if (!wd->embd) { fprintf(stderr, "missing token_embd.weight\n"); exit(1); }
 
     char name[128];
     for (int l = 0; l < L; l++) {
-        sprintf(name, "blk.%d.attn_norm.weight", l);
-        w->norm_att[l] = (float *)find_tensor(m, name, NULL);
-        sprintf(name, "blk.%d.attn_q_norm.weight", l);
-        w->q_norm[l] = (float *)find_tensor(m, name, NULL);
-        sprintf(name, "blk.%d.attn_k_norm.weight", l);
-        w->k_norm[l] = (float *)find_tensor(m, name, NULL);
+        sprintf(name, "blk.%d.attn_norm.weight", l);     wd->norm_att[l] = (float *)upload_f32(m, name);
+#ifdef BONSAI_FP4
         sprintf(name, "blk.%d.attn_q.weight", l);
-        w->wq[l] = find_tensor(m, name, &w->wq_t[l]);
+        upload_linear_fp4(m, name, f32, f16, &wd->wq_fp4[l], c->dim, c->dim);
         sprintf(name, "blk.%d.attn_k.weight", l);
-        w->wk[l] = find_tensor(m, name, &w->wk_t[l]);
+        upload_linear_fp4(m, name, f32, f16, &wd->wk_fp4[l], c->kv_dim, c->dim);
         sprintf(name, "blk.%d.attn_v.weight", l);
-        w->wv[l] = find_tensor(m, name, &w->wv_t[l]);
+        upload_linear_fp4(m, name, f32, f16, &wd->wv_fp4[l], c->kv_dim, c->dim);
         sprintf(name, "blk.%d.attn_output.weight", l);
-        w->wo[l] = find_tensor(m, name, &w->wo_t[l]);
-        sprintf(name, "blk.%d.ffn_norm.weight", l);
-        w->norm_ffn[l] = (float *)find_tensor(m, name, NULL);
+        upload_linear_fp4(m, name, f32, f16, &wd->wo_fp4[l], c->dim, c->dim);
+#else
+        sprintf(name, "blk.%d.attn_q.weight", l);        wd->wq[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
+        sprintf(name, "blk.%d.attn_k.weight", l);        wd->wk[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
+        sprintf(name, "blk.%d.attn_v.weight", l);        wd->wv[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
+        sprintf(name, "blk.%d.attn_output.weight", l);   wd->wo[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
+#endif
+        sprintf(name, "blk.%d.attn_q_norm.weight", l);   wd->q_norm[l]   = (float *)upload_f32(m, name);
+        sprintf(name, "blk.%d.attn_k_norm.weight", l);   wd->k_norm[l]   = (float *)upload_f32(m, name);
+        sprintf(name, "blk.%d.ffn_norm.weight", l);      wd->norm_ffn[l] = (float *)upload_f32(m, name);
+#ifdef BONSAI_FP4
         sprintf(name, "blk.%d.ffn_gate.weight", l);
-        w->gate[l] = find_tensor(m, name, &w->gate_t[l]);
+        upload_linear_fp4(m, name, f32, f16, &wd->gate_fp4[l], c->hidden_dim, c->dim);
         sprintf(name, "blk.%d.ffn_up.weight", l);
-        w->up[l] = find_tensor(m, name, &w->up_t[l]);
+        upload_linear_fp4(m, name, f32, f16, &wd->up_fp4[l], c->hidden_dim, c->dim);
         sprintf(name, "blk.%d.ffn_down.weight", l);
-        w->down[l] = find_tensor(m, name, &w->down_t[l]);
-    }
-
-    w->norm_out = (float *)find_tensor(m, "output_norm.weight", NULL);
-    w->out = find_tensor(m, "output.weight", &w->out_t);
-    if (!w->out) {
-        fprintf(stderr, "Error: output.weight missing (Qwen3-VL uses untied LM head)\n");
-        exit(1);
-    }
-
-    if (!w->embd || !w->norm_out) {
-        fprintf(stderr, "Error: missing critical tensors\n");
-        exit(1);
-    }
-    for (int l = 0; l < L; l++) {
-        if (!w->norm_att[l] || !w->q_norm[l] || !w->k_norm[l] || !w->wq[l] || !w->wk[l] || !w->wv[l] ||
-            !w->wo[l] || !w->norm_ffn[l] || !w->gate[l] || !w->up[l] || !w->down[l]) {
-            fprintf(stderr, "Error: missing tensor(s) in layer %d\n", l);
+        upload_linear_fp4(m, name, f32, f16, &wd->down_fp4[l], c->dim, c->hidden_dim);
+#else
+        sprintf(name, "blk.%d.ffn_gate.weight", l);      wd->gate[l]     = upload_fp16_dequant(m, name, f32, f16, NULL);
+        sprintf(name, "blk.%d.ffn_up.weight", l);        wd->up[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
+        sprintf(name, "blk.%d.ffn_down.weight", l);      wd->down[l]     = upload_fp16_dequant(m, name, f32, f16, NULL);
+#endif
+#ifdef BONSAI_FP4
+        if (!wd->norm_att[l] || !wd->wq_fp4[l] || !wd->wk_fp4[l] || !wd->wv_fp4[l] ||
+            !wd->wo_fp4[l] || !wd->q_norm[l] || !wd->k_norm[l] || !wd->norm_ffn[l] ||
+            !wd->gate_fp4[l] || !wd->up_fp4[l] || !wd->down_fp4[l]) {
+#else
+        if (!wd->norm_att[l] || !wd->wq[l] || !wd->wk[l] || !wd->wv[l] ||
+            !wd->wo[l] || !wd->q_norm[l] || !wd->k_norm[l] || !wd->norm_ffn[l] ||
+            !wd->gate[l] || !wd->up[l] || !wd->down[l]) {
+#endif
+            fprintf(stderr, "Error: layer %d missing weight tensor\n", l);
             exit(1);
         }
+        if ((l + 1) % 8 == 0)
+            printf("  layer %d/%d uploaded\n", l + 1, L);
     }
+
+    wd->norm_out = (float *)upload_f32(m, "output_norm.weight");
+#ifdef BONSAI_FP4
+    {
+        TensorInfo *ti = ti_find(m, "output.weight");
+        if (!ti) ti = ti_find(m, "token_embd.weight");
+        if (!ti) { fprintf(stderr, "missing output.weight\n"); exit(1); }
+        materialize_host_f16(m, ti, f32, f16);
+        wd->out_fp4 = fp4_qwen3_weight_from_f16_host(f16, c->vocab_size, c->dim);
+        if (!wd->out_fp4) {
+            fprintf(stderr, "NVFP4 quantize failed for output.weight\n");
+            exit(1);
+        }
+        wd->out = NULL;
+        wd->out_t = DT_F16;
+    }
+#else
+    wd->out      = upload_fp16_dequant(m, "output.weight", f32, f16, &wd->out_t);
+    if (!wd->out) wd->out = wd->embd;
+#endif
+    if (!wd->norm_out) { fprintf(stderr, "missing output_norm.weight\n"); exit(1); }
+
+    free(f32);
+    free(f16);
+    printf("Upload complete.\n");
+}
+
+static void free_dev_weights(WeightsDev *wd, int L) {
+    (void)L;
+    /* weights freed by gpu_model_destroy */
+    free(wd->norm_att); free(wd->q_norm); free(wd->k_norm);
+    free(wd->wq); free(wd->wk); free(wd->wv); free(wd->wo);
+    free(wd->norm_ffn); free(wd->gate); free(wd->up); free(wd->down);
+#ifdef BONSAI_FP4
+    free(wd->wq_fp4); free(wd->wk_fp4); free(wd->wv_fp4); free(wd->wo_fp4);
+    free(wd->gate_fp4); free(wd->up_fp4); free(wd->down_fp4);
+#endif
+    memset(wd, 0, sizeof(*wd));
 }
 
 static void alloc_state(State *s, Config *c) {
-    int kv_cache_len = c->n_layers * c->max_seq * c->kv_dim;
-    s->x      = (float *)calloc(c->dim, sizeof(float));
-    s->xb     = (float *)calloc(c->dim, sizeof(float));
-    s->xb2    = (float *)calloc(c->dim, sizeof(float));
-    s->hb     = (float *)calloc(c->hidden_dim, sizeof(float));
-    s->hb2    = (float *)calloc(c->hidden_dim, sizeof(float));
-    s->q      = (float *)calloc(c->dim, sizeof(float));
-    s->k      = (float *)calloc(c->kv_dim, sizeof(float));
-    s->v      = (float *)calloc(c->kv_dim, sizeof(float));
-    s->att    = (float *)calloc(c->n_heads * c->max_seq, sizeof(float));
-    s->logits = (float *)calloc(c->vocab_size, sizeof(float));
-    s->kc     = (float *)calloc(kv_cache_len, sizeof(float));
-    s->vc     = (float *)calloc(kv_cache_len, sizeof(float));
+    s->logits = (float *)calloc((size_t)c->vocab_size, sizeof(float));
 }
 
 static void free_state(State *s) {
-    free(s->x); free(s->xb); free(s->xb2);
-    free(s->hb); free(s->hb2);
-    free(s->q); free(s->k); free(s->v);
-    free(s->att); free(s->logits);
-    free(s->kc); free(s->vc);
+    free(s->logits);
 }
 
-static void free_weight_ptrs(Weights *w, int L) {
-    free(w->norm_att); free(w->q_norm); free(w->k_norm);
-    free(w->wq); free(w->wq_t); free(w->wk); free(w->wk_t);
-    free(w->wv); free(w->wv_t); free(w->wo); free(w->wo_t);
-    free(w->norm_ffn);
-    free(w->gate); free(w->gate_t); free(w->up); free(w->up_t); free(w->down); free(w->down_t);
-    memset(w, 0, sizeof(*w));
-    (void)L;
+static GpuConfig gpu_config_from(const Config *c) {
+    GpuConfig g;
+    g.dim = c->dim; g.hidden_dim = c->hidden_dim;
+    g.n_layers = c->n_layers; g.n_heads = c->n_heads;
+    g.n_kv_heads = c->n_kv_heads; g.vocab_size = c->vocab_size;
+    g.max_seq = c->max_seq; g.head_dim = c->head_dim;
+    g.kv_dim = c->kv_dim; g.kv_mul = c->kv_mul;
+    g.norm_eps = c->norm_eps; g.rope_theta = c->rope_theta;
+    return g;
 }
 
-static void rmsnorm(float *o, const float *x, const float *weight, int n, float eps) {
-    float ss = 0.0f;
-    #pragma omp parallel for reduction(+:ss) schedule(static)
-    for (int i = 0; i < n; i++) ss += x[i] * x[i];
-    ss = 1.0f / sqrtf(ss / n + eps);
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++) o[i] = x[i] * ss * weight[i];
+static GpuWeightsHost gpu_weights_from(const WeightsDev *wd) {
+    GpuWeightsHost gh;
+    gh.embd = wd->embd; gh.embd_t = wd->embd_t;
+    gh.norm_att = (void **)wd->norm_att;
+#ifdef BONSAI_FP4
+    gh.wq = NULL; gh.wk = NULL; gh.wv = NULL; gh.wo = NULL;
+    gh.gate = NULL; gh.up = NULL; gh.down = NULL;
+    gh.out = NULL;
+#else
+    gh.wq = (void **)wd->wq; gh.wk = (void **)wd->wk;
+    gh.wv = (void **)wd->wv; gh.wo = (void **)wd->wo;
+    gh.gate = (void **)wd->gate; gh.up = (void **)wd->up;
+    gh.down = (void **)wd->down;
+    gh.out = wd->out;
+#endif
+    gh.q_norm = (void **)wd->q_norm; gh.k_norm = (void **)wd->k_norm;
+    gh.norm_ffn = (void **)wd->norm_ffn;
+    gh.norm_out = wd->norm_out;
+    gh.out_t = wd->out_t;
+#ifdef BONSAI_FP4
+    gh.wq_fp4 = wd->wq_fp4; gh.wk_fp4 = wd->wk_fp4;
+    gh.wv_fp4 = wd->wv_fp4; gh.wo_fp4 = wd->wo_fp4;
+    gh.gate_fp4 = wd->gate_fp4; gh.up_fp4 = wd->up_fp4;
+    gh.down_fp4 = wd->down_fp4;
+    gh.out_fp4 = wd->out_fp4;
+#else
+    gh.wq_fp4 = NULL; gh.wk_fp4 = NULL; gh.wv_fp4 = NULL; gh.wo_fp4 = NULL;
+    gh.gate_fp4 = NULL; gh.up_fp4 = NULL; gh.down_fp4 = NULL;
+    gh.out_fp4 = NULL;
+#endif
+    return gh;
 }
 
-static void rmsnorm_head_inplace(float *vec, const float *w, int n_heads, int hd, float eps) {
-    #pragma omp parallel for schedule(static)
-    for (int h = 0; h < n_heads; h++) {
-        float *seg = vec + h * hd;
-        float ss = 0.0f;
-        for (int i = 0; i < hd; i++) ss += seg[i] * seg[i];
-        ss = 1.0f / sqrtf(ss / hd + eps);
-        for (int i = 0; i < hd; i++) seg[i] *= ss * w[i];
-    }
+static void forward(Model *m, int token, int pos) {
+    gpu_forward(m->gpu, token, pos);
+    gpu_copy_logits(m->gpu, m->s.logits);
 }
 
 static void softmax(float *x, int n) {
@@ -1197,200 +1401,8 @@ static void softmax(float *x, int n) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
     }
-    for (int i = 0; i < n; i++) x[i] /= sum;
-}
-
-static void mm_f32(float *o, const float *x, const float *w, int n, int d) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; i++) {
-        const float *row = w + (size_t)i * n;
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) val += x[j] * row[j];
-        o[i] = val;
-    }
-}
-
-static void mm_f16(float *o, const float *x, const uint16_t *w, int n, int d) {
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; i++) {
-        const uint16_t *row = w + (size_t)i * n;
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) val += x[j] * host_f16f32(row[j]);
-        o[i] = val;
-    }
-}
-
-static void mm_quant_rows(float *o, const float *x, const void *w, int n, int d, int type) {
-    if (n % QK_K) {
-        fprintf(stderr, "mm_quant_rows: n=%d not multiple of QK_K\n", n);
-        exit(1);
-    }
-    int nb = n / QK_K;
-    size_t row_sz = row_bytes_quant(type, n);
-    size_t bs = block_size_quant(type);
-    const uint8_t *wb = (const uint8_t *)w;
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < d; i++) {
-        float blk[QK_K];
-        const uint8_t *row = wb + (size_t)i * row_sz;
-        float val = 0.0f;
-        for (int b = 0; b < nb; b++) {
-            dequant_one_block_to(row + (size_t)b * bs, type, blk);
-            const float *xp = x + b * QK_K;
-            for (int j = 0; j < QK_K; j++) val += xp[j] * blk[j];
-        }
-        o[i] = val;
-    }
-}
-
-static void mm(float *o, const float *x, const void *w, int n, int d, int type) {
-    switch (type) {
-    case DT_F32: mm_f32(o, x, (const float *)w, n, d); break;
-    case DT_F16: mm_f16(o, x, (const uint16_t *)w, n, d); break;
-    case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S:
-        mm_quant_rows(o, x, w, n, d, type);
-        break;
-    default:
-        fprintf(stderr, "Unsupported tensor type %d in matmul\n", type);
-        exit(1);
-    }
-}
-
-static void emb_lookup(float *o, const void *w, int type, int id, int dim) {
-    if (dim % QK_K && (type == DT_Q4_K || type == DT_Q5_K || type == DT_IQ2_S || type == DT_IQ3_S)) {
-        fprintf(stderr, "emb_lookup: dim %% QK_K != 0 for quant\n");
-        exit(1);
-    }
-    switch (type) {
-    case DT_F32:
-        memcpy(o, (const float *)w + (size_t)id * dim, dim * sizeof(float));
-        break;
-    case DT_F16: {
-        const uint16_t *row = (const uint16_t *)w + (size_t)id * dim;
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < dim; i++) o[i] = host_f16f32(row[i]);
-        break;
-    }
-    case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S: {
-        int nb = dim / QK_K;
-        size_t row_sz = row_bytes_quant(type, dim);
-        size_t bs = block_size_quant(type);
-        const uint8_t *row = (const uint8_t *)w + (size_t)id * row_sz;
-        #pragma omp parallel for schedule(static)
-        for (int b = 0; b < nb; b++) {
-            float blk[QK_K];
-            dequant_one_block_to(row + (size_t)b * bs, type, blk);
-            memcpy(o + b * QK_K, blk, QK_K * sizeof(float));
-        }
-        break;
-    }
-    default:
-        fprintf(stderr, "Unsupported emb type %d\n", type);
-        exit(1);
-    }
-}
-
-static void apply_rope(float *vec, int n_heads, int head_dim, int pos, float theta) {
-    #pragma omp parallel for schedule(static)
-    for (int h = 0; h < n_heads; h++) {
-        for (int i = 0; i < head_dim; i += 2) {
-            float freq = 1.0f / powf(theta, (float)i / head_dim);
-            float val  = pos * freq;
-            float cr   = cosf(val);
-            float ci   = sinf(val);
-            int idx = h * head_dim + i;
-            float v0 = vec[idx], v1 = vec[idx + 1];
-            vec[idx]     = v0 * cr - v1 * ci;
-            vec[idx + 1] = v0 * ci + v1 * cr;
-        }
-    }
-}
-
-static void forward(Model *m, int token, int pos) {
-    Config *c = &m->cfg;
-    Weights *w = &m->w;
-    State *s = &m->s;
-    int dim      = c->dim;
-    int hd       = c->head_dim;
-    int kv_dim   = c->kv_dim;
-    int kv_mul   = c->kv_mul;
-    int n_heads  = c->n_heads;
-    int n_kv     = c->n_kv_heads;
-    int max_seq  = c->max_seq;
-    int hidden   = c->hidden_dim;
-
-    emb_lookup(s->x, w->embd, w->embd_t, token, dim);
-
-    for (int l = 0; l < c->n_layers; l++) {
-        rmsnorm(s->xb, s->x, w->norm_att[l], dim, c->norm_eps);
-
-        mm(s->q, s->xb, w->wq[l], dim, dim,    w->wq_t[l]);
-        mm(s->k, s->xb, w->wk[l], dim, kv_dim, w->wk_t[l]);
-        mm(s->v, s->xb, w->wv[l], dim, kv_dim, w->wv_t[l]);
-
-        rmsnorm_head_inplace(s->q, w->q_norm[l], n_heads, hd, c->norm_eps);
-        rmsnorm_head_inplace(s->k, w->k_norm[l], n_kv, hd, c->norm_eps);
-
-        apply_rope(s->q, n_heads, hd, pos, c->rope_theta);
-        apply_rope(s->k, n_kv,   hd, pos, c->rope_theta);
-
-        size_t loff = (size_t)l * max_seq * kv_dim;
-        float *kc_pos = s->kc + loff + (size_t)pos * kv_dim;
-        float *vc_pos = s->vc + loff + (size_t)pos * kv_dim;
-        #pragma omp parallel for schedule(static)
-        for (int j = 0; j < kv_dim; j++) {
-            kc_pos[j] = s->k[j];
-            vc_pos[j] = s->v[j];
-        }
-
-        #pragma omp parallel for schedule(static)
-        for (int h = 0; h < n_heads; h++) {
-            float *qh = s->q + h * hd;
-            int kvh = h / kv_mul;
-            float *att_h = s->att + (size_t)h * max_seq;
-            float scale = 1.0f / sqrtf((float)hd);
-
-            for (int t = 0; t <= pos; t++) {
-                float *kt = s->kc + loff + (size_t)t * kv_dim + kvh * hd;
-                float score = 0.0f;
-                for (int i = 0; i < hd; i++) score += qh[i] * kt[i];
-                att_h[t] = score * scale;
-            }
-
-            softmax(att_h, pos + 1);
-
-            float *oh = s->xb + h * hd;
-            memset(oh, 0, hd * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                float a = att_h[t];
-                float *vt = s->vc + loff + (size_t)t * kv_dim + kvh * hd;
-                for (int i = 0; i < hd; i++) oh[i] += a * vt[i];
-            }
-        }
-
-        mm(s->xb2, s->xb, w->wo[l], dim, dim, w->wo_t[l]);
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
-
-        rmsnorm(s->xb, s->x, w->norm_ffn[l], dim, c->norm_eps);
-
-        mm(s->hb,  s->xb, w->gate[l], dim, hidden, w->gate_t[l]);
-        mm(s->hb2, s->xb, w->up[l],   dim, hidden, w->up_t[l]);
-
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < hidden; i++) {
-            float val = s->hb[i];
-            val = val / (1.0f + expf(-val));
-            s->hb[i] = val * s->hb2[i];
-        }
-
-        mm(s->xb, s->hb, w->down[l], hidden, dim, w->down_t[l]);
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
-    }
-
-    rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
-    mm(s->logits, s->x, w->out, dim, c->vocab_size, w->out_t);
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv_sum;
 }
 
 static float rng_f32(uint64_t *state) {
@@ -1488,41 +1500,112 @@ static void print_tok(Tok *tk, int id) {
     fflush(stdout);
 }
 
+#define PREFILL_BAR_WIDTH 40
+
+static void prefill_progress_update(int done, int total) {
+    if (total <= 0) return;
+    if (done > total) done = total;
+    int filled = (done * PREFILL_BAR_WIDTH) / total;
+    int pct = (done * 100) / total;
+    fprintf(stderr, "\rPrefill [");
+    for (int i = 0; i < PREFILL_BAR_WIDTH; i++)
+        fputc(i < filled ? '=' : ' ', stderr);
+    fprintf(stderr, "] %3d%% (%d/%d)", pct, done, total);
+    fflush(stderr);
+}
+
+static void prefill_progress_done(int n_tokens, double elapsed_sec) {
+    double tps = (elapsed_sec > 0.0) ? (double)n_tokens / elapsed_sec : 0.0;
+    fprintf(stderr, "\rPrefill [");
+    for (int i = 0; i < PREFILL_BAR_WIDTH; i++)
+        fputc('=', stderr);
+    fprintf(stderr, "] 100%% (%d/%d)\n", n_tokens, n_tokens);
+    fprintf(stderr, "Prefill complete: %d tokens in %.2fs (%.2f tok/s)\n",
+            n_tokens, elapsed_sec, tps);
+}
+
+static void decode_progress_done(int n_tokens, double elapsed_sec) {
+    double tps = (elapsed_sec > 0.0) ? (double)n_tokens / elapsed_sec : 0.0;
+    fflush(stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+    fprintf(stderr, "\nDecode complete: %d tokens in %.2fs (%.2f tok/s)\n",
+            n_tokens, elapsed_sec, tps);
+}
+
+static void throughput_summary(int n_prefill, double prefill_sec,
+                             int n_decode, double decode_sec,
+                             double total_sec) {
+    double prefill_tps = (prefill_sec > 0.0) ? (double)n_prefill / prefill_sec : 0.0;
+    double decode_tps  = (decode_sec > 0.0)  ? (double)n_decode / decode_sec  : 0.0;
+    int n_total = n_prefill + n_decode;
+    double total_tps = (total_sec > 0.0) ? (double)n_total / total_sec : 0.0;
+    fprintf(stderr, "--- throughput ---\n");
+    fprintf(stderr, "  prefill: %.2f tok/s\n", prefill_tps);
+    fprintf(stderr, "  decode:  %.2f tok/s\n", decode_tps);
+    fprintf(stderr, "  total:   %.2f tok/s\n", total_tps);
+}
+
 static void generate(Model *m, int *prompt, int n_prompt,
                      int max_new, float temp, float topp, uint64_t seed) {
     uint64_t rng = seed ? seed : 1;
-    int token = prompt[0];
     int gen = 0;
+    double prefill_sec = 0.0;
 
-    struct timespec t0, t1;
+    struct timespec t0, t1, t_prefill, t_decode;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    for (int pos = 0; pos < n_prompt + max_new - 1; pos++) {
+    if (n_prompt > 0) {
+        if (n_prompt > m->cfg.max_seq) {
+            fprintf(stderr, "\n[prompt length %d exceeds max_seq %d]\n",
+                n_prompt, m->cfg.max_seq);
+            return;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_prefill);
+        prefill_progress_update(0, n_prompt);
+        if (n_prompt > 1) {
+            gpu_forward_prefill(m->gpu, prompt, n_prompt);
+        } else {
+            forward(m, prompt[0], 0);
+        }
+        gpu_copy_logits(m->gpu, m->s.logits);
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        prefill_sec = (t_now.tv_sec - t_prefill.tv_sec)
+            + (t_now.tv_nsec - t_prefill.tv_nsec) / 1e9;
+        prefill_progress_done(n_prompt, prefill_sec);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_decode);
+
+    for (int gen_i = 0; gen_i < max_new; gen_i++) {
+        int pos = n_prompt - 1 + gen_i;
         if (pos >= m->cfg.max_seq) {
             fprintf(stderr, "\n[max sequence length %d reached]\n", m->cfg.max_seq);
             break;
         }
 
-        forward(m, token, pos);
+        int next = sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, &rng);
+        if (next == m->tok.eos || next == m->tok.eot) break;
+        gen++;
+        print_tok(&m->tok, next);
 
-        int next;
-        if (pos < n_prompt - 1) {
-            next = prompt[pos + 1];
-        } else {
-            next = sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, &rng);
-            if (next == m->tok.eos || next == m->tok.eot) break;
-            gen++;
-            print_tok(&m->tok, next);
-        }
-        token = next;
+        pos = n_prompt + gen_i;
+        if (pos >= m->cfg.max_seq) break;
+        forward(m, next, pos);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double decode_sec = (t1.tv_sec - t_decode.tv_sec)
+        + (t1.tv_nsec - t_decode.tv_nsec) / 1e9;
+    if (gen > 0)
+        decode_progress_done(gen, decode_sec);
 
     printf("\n\n--- %d prompt tokens + %d generated tokens ---\n", n_prompt, gen);
-    printf("--- %.1fs total (%.2f tok/s) ---\n", elapsed,
-           (gen > 0) ? gen / elapsed : 0.0);
+    printf("--- %.1fs total ---\n", elapsed);
+    if (n_prompt > 0 || gen > 0)
+        throughput_summary(n_prompt, prefill_sec, gen, decode_sec, elapsed);
 }
 
 int main(int argc, char *argv[]) {
@@ -1556,6 +1639,11 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "-l")) max_seq    = atoi(argv[i + 1]);
     }
 
+    /*
+     * NVIDIA GPU + cuBLAS。重みは起動時に VRAM へアップロード。
+     */
+    gpu_print_device_info();
+
     printf("Loading %s ...\n", model_path);
 
     Model model;
@@ -1584,13 +1672,16 @@ int main(int argc, char *argv[]) {
     Config *c = &model.cfg;
     printf("Model: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d\n",
            c->dim, c->hidden_dim, c->n_layers, c->n_heads, c->n_kv_heads, c->vocab_size);
-    printf("       head_dim=%d kv_dim=%d kv_mul=%d rope_theta=%.0f max_seq=%d\n",
-           c->head_dim, c->kv_dim, c->kv_mul, c->rope_theta, c->max_seq);
-    printf("OpenMP max threads = %d\n", omp_get_max_threads());
+    printf("       head_dim=%d kv_dim=%d kv_mul=%d rope_theta=%g max_seq=%d\n",
+           c->head_dim, c->kv_dim, c->kv_mul, (double)c->rope_theta, c->max_seq);
 
-    load_weights(&model);
+    upload_weights_gpu(&model);
     init_tokenizer(&model.tok, merges, n_merges);
     alloc_state(&model.s, c);
+
+    GpuConfig gc = gpu_config_from(c);
+    GpuWeightsHost gw = gpu_weights_from(&model.wd);
+    model.gpu = gpu_model_create(&gc, &gw);
 
     int n_prompt_tokens;
     int *prompt_tokens = chat_encode(&model.tok, prompt, &n_prompt_tokens);
@@ -1599,8 +1690,9 @@ int main(int argc, char *argv[]) {
     generate(&model, prompt_tokens, n_prompt_tokens, max_tokens, temp, topp, seed);
 
     free(prompt_tokens);
+    gpu_model_destroy(model.gpu);
     free_state(&model.s);
-    free_weight_ptrs(&model.w, c->n_layers);
+    free_dev_weights(&model.wd, c->n_layers);
     free(model.ti);
     free(model.tok.vocab);
     free(model.tok.vlen);

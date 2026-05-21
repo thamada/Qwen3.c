@@ -4,6 +4,68 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 20:53:55
+
+**`qwen3-8b/gpu-cuda/`**（**`db8ce6f`**）: **`BONSAI_FP4`** 時に線形層の **FP16 VRAM 複製を廃止**し **NVFP4 キャッシュのみ**（**`upload_linear_fp4`** → **`fp4_qwen3_weight_from_f16_host`**）。**`fp4_gemm`** に **FP4 GEMV**（**`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`**）を追加し、**`fp4_qwen3_mm`** が M=1 デコードと Prefill バッチを経路分岐。
+
+**`fdd860d`**（同ブランチ・前コミット）: **`main.c` / `kernels.cu`** で Blackwell **NVFP4** ロードと **`gpu_model_create`** の FP4 採用、**`fp4_gemm`** 拡張。
+
+**`README.md`**・**`README.en.md`**: **`build.no-fp4` / `build.fp4`** のロード・実行対照表、起動ログ、**`NVFP4 quantize failed`** のトラブルシュート。
+
+**`doc/design.md`**: 上記に追随。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 20:18:22
+
+**`qwen3-8b/gpu-cuda/`**: **`fp4_bonsai`** を **`fp4_qwen3`**（CUTLASS NVFP4 ブリッジ）に置換。**`Makefile`** に **`build.fp4`**・**`build.no-fp4`**・**`run.no-fp4`** を追加。既定 **`run` → `build.fp4`**（Blackwell）。**`KERNELS_OBJ`** で **`BONSAI_FP4`/`FA_BR` 別オブジェクト**。**`fp4_verify.cu`** と **`fp4-test`** ターゲット。
+
+**`README.md`**・**`README.en.md`**: FP16 汎用ビルドと Blackwell NVFP4 の手順を分離。既定 **`make run` が `build.fp4` である**注意を追記。
+
+**`doc/design.md`**: 上記に追随（バリアント表・ディレクトリ表・Make ターゲット・CUDA 節・実行時挙動・制約・トラブルシュート）。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 17:44:31
+
+**`README.md`**・**`README.en.md`**: **`gpu-cuda/`**（CUDA ビルド・実行・要件）を追記。実行経路表・ディレクトリツリー・モデル取得（**`make model`**）を更新。集約 Makefile のターゲット名に追随（**`build.cpu`**・**`build.cpu-multicore`**・**`build.xdna2-bfp16`** 等）。CUDA のトラブルシュート・**`make clean`** 注記を追加。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 17:42:28
+
+**`qwen3-8b/gpu-cuda/`**: NVIDIA **CUDA** 向けテキストデコーダ推論を追加（**`main.c`**・**`kernels.cu`**・**`gpu.h`**）。ロード時に CPU で逆量子化 → **FP16** → VRAM、**Prefill** は **`gpu_forward_prefill`**（プロンプト全トークン並列）、**Decode** は 1 トークン **`gpu_forward`**。線形層は **FP16 GEMV**、Attention は **Flash Attention**（GQA・`head_dim=128`）。サンプリングは logits の **D2H** 後に CPU。出力バイナリは **`qwen3-gpu-cuda`**（当ディレクトリの **`Makefile`** で **`make build` / `make run`**）。既定 **`CUDA_GENCODE`** は PTX **`compute_86`**（JIT 対応）。**Blackwell**（RTX 50 系等）向けに **`make blackwell`**（apt CUDA 11 除去 → CUDA 13 導入 → **CUTLASS** `third_party/cutlass` 取得 → **`BONSAI_FP4=1`**・**`sm_120a`**・**`FA_BR=32`**）を用意。集約 **`qwen3-8b/Makefile`** には未統合（**`build.gpu-cuda`** なし）。
+
+**`doc/design.md`**: 概要・実装バリアント表・ディレクトリ表・ビルド／実行（CUDA 節）・実行時挙動・トラブルシューティングに **`gpu-cuda/`** を追記。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 16:50:16
+
+**`qwen3-8b/gpu/`** を **`qwen3-8b/gpu-rocm/`** にリネーム（**`main.c`**・**`Makefile`** を移動）。集約 **`qwen3-8b/Makefile`** の **`build.gpu` / `run.gpu`** を **`build.gpu-rocm` / `run.gpu-rocm`** に変更し、実行パスを **`gpu-rocm/qwen3-rocm`** に更新。**`clean`** の対象ディレクトリも **`gpu-rocm`** に追随。
+
+**`.gitignore`**・**`README.md`**・**`README.en.md`**・**`qwen3-8b/cpu-multicore/main.c`**・**`qwen3-8b/gpu-rocm/main.c`**（ビルド注記）のパス・Make ターゲット表記を上記に追随。
+
+**`doc/design.md`**: 概要・実装バリアント表・ディレクトリ表・Make ターゲット表・ビルド例の **`gpu/`** / **`build.gpu`** 表記を **`gpu-rocm/`** / **`build.gpu-rocm`** に更新。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 16:46:11
+
+**`qwen3-8b/hf-model.py`**: 削除。**`make model`**（**`wget`** + **`.sha256sum`**）に GGUF 取得を一本化。
+
+**`doc/design.md`**: **`hf-model.py`** 関連の記述を削除し、**「モデル参照」** を **`make model`** と手動取得の 2 通りに整理。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 16:45:20
+
+**`qwen3-8b/Makefile`**: **`model`** ターゲットを追加。**`gguf.txt`** の URL（`blob/main` → `resolve/main`）から **`wget`** で **`$(MODEL)`** を取得し、**`$(MODEL).sha256sum`** が存在するとき **`sha256sum --check`** で検証。チェックサムファイル欠如・検証失敗時はエラー終了し、破損ファイルは削除。
+
+**`doc/design.md`**: ディレクトリ表の **`qwen3-8b/Makefile`** 一行、Make ターゲット表に **`model`**、ビルド例、**「モデル参照」**（**`make model`**・手動 **`wget`**）を反映。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-18 20:38:59
 
 **`qwen3-8b/hf-model.py`**: **`qwen3-8b/gguf.txt`** の Hugging Face **`blob` / `resolve` URL** を解釈し、**`hf download`** で既定配置先（スクリプトと同じディレクトリ、**`--local-dir`** で変更可）に取得。開始時に **`hf auth login`** を実行（**`HF_TOKEN`** または **`--token`** で非対話可）。Hub の tree API から当該ファイルの **LFS `oid`（SHA256）** を取得し、ダウンロード後のファイルと照合する。旧ファイル名 **`download_gguf_hf.py`** は **`hf-model.py`** に変更。

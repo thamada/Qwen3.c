@@ -26,7 +26,7 @@
  * area while keeping the run-time on the GPU end-to-end.
  *
  * Build:
- *   make build.rocm -> qwen3-rocm（本ファイル）
+ *   make build.gpu-rocm -> qwen3-rocm（本ファイル）
  */
 
 #include <stdio.h>

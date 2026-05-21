@@ -2,9 +2,9 @@
 
 This repository is an **inference implementation** that runs **Qwen3-family models** directly from **a single C source**, **without relying on external libraries**.
 
-**This project does not link userland ML libraries or runtimes such as PyTorch, TensorFlow, JAX, or ONNX Runtime.** Inference is built around **standard C and `libm`**, with one or a few sources under `qwen3-8b/`. The GPU build uses **ROCm/HIP** (`hipcc`), CPU parallelism uses **OpenMP**, and the XDNA2 NPU build talks to the **Linux kernel `amdxdna` DRM ioctl (UAPI)** directly—there is no dependency on a Python runtime or `torch`.
+**This project does not link userland ML libraries or runtimes such as PyTorch, TensorFlow, JAX, or ONNX Runtime.** Inference is built around **standard C and `libm`**, with one or a few sources under `qwen3-8b/`. The AMD GPU build uses **ROCm/HIP** (`hipcc`), the NVIDIA GPU build uses the **CUDA Toolkit** (`nvcc`), CPU parallelism uses **OpenMP**, and the XDNA2 NPU build talks to the **Linux kernel `amdxdna` DRM ioctl (UAPI)** directly—there is no dependency on a Python runtime or `torch`.
 
-Among the above, ROCm/HIP is AMD’s GPU compiler and runtime; it is **not a high-level neural network framework** (this repo builds the Transformer from custom HIP kernels and host code).
+ROCm/HIP and CUDA are **GPU compilers and runtimes**, not high-level neural network frameworks (this repo builds the Transformer from custom HIP / CUDA kernels and host code).
 
 ### Why avoid ML libraries?
 
@@ -23,7 +23,7 @@ So this is **not** aimed at maximum performance or full feature parity. The focu
 
 ---
 
-A small inference implementation that runs Qwen3-family GGUF models from **straightforward C sources** under `qwen3-8b/`. Paths include **CPU**, **OpenMP**, **ROCm/HIP on AMD GPUs**, and **AMD Ryzen AI XDNA2 NPU** (direct **`amdxdna` DRM ioctl** usage).
+A small inference implementation that runs Qwen3-family GGUF models from **straightforward C sources** under `qwen3-8b/`. Paths include **CPU**, **OpenMP**, **ROCm/HIP on AMD GPUs**, **CUDA on NVIDIA GPUs**, and **AMD Ryzen AI XDNA2 NPU** (direct **`amdxdna` DRM ioctl** usage).
 
 The scope is the **text decoder of Qwen3-VL-8B-Instruct**. Image input and the vision encoder are **out of scope**; use cases are prompt-in, text-out generation.
 
@@ -37,13 +37,14 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 |---|---|---|---|
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
-| ROCm/HIP GPU | `qwen3-8b/gpu/main.c` | `gpu/qwen3-rocm` | Practical speed on AMD GPUs |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
+| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. **`build.no-fp4`**: all-linear FP16. **`build.fp4`** (Blackwell): linear weights **NVFP4** at load (`fp4_qwen3` + CUTLASS), embedding stays FP16. Not in aggregate `Makefile` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
 For an **overview of AMD XDNA** (design goals, tile-level architecture, generational changes, dtypes and accuracy, software stack, comparison with other NPUs, etc.), see the companion write-up: [thamada/xdna-overview](https://github.com/thamada/xdna-overview) (`main.md` plus a PDF).
 
-An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable token throughput, use ROCm/HIP or the XDNA2 NPU builds. **`xdna2/qwen3-xdna2`** avoids **persistent BF16 copies of every layer**—it keeps quantized weights **mmap'd** (**CPU OpenMP** build–style residency) and decodes **one GEMV matrix at a time** into a BF16 scratch for the NPU, so latency per matmul rises. For tighter residency or another host layout, **`xdna2-bfp16/qwen3-xdna2-bfpx`** converts to **BFPX** and drops the GGUF mmap after conversion (**large load-time peak possible**); output is **not** bit-aligned with **`xdna2/qwen3-xdna2`**.
+An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable token throughput, use **ROCm/HIP** (AMD GPU), **CUDA** (NVIDIA GPU), or the XDNA2 NPU builds. **`xdna2/qwen3-xdna2`** avoids **persistent BF16 copies of every layer**—it keeps quantized weights **mmap'd** (**CPU OpenMP** build–style residency) and decodes **one GEMV matrix at a time** into a BF16 scratch for the NPU, so latency per matmul rises. For tighter residency or another host layout, **`xdna2-bfp16/qwen3-xdna2-bfpx`** converts to **BFPX** and drops the GGUF mmap after conversion (**large load-time peak possible**); output is **not** bit-aligned with **`xdna2/qwen3-xdna2`**.
 
 ## Repository layout
 
@@ -63,9 +64,16 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     ├── cpu-multicore/
     │   ├── Makefile
     │   └── main.c
-    ├── gpu/
+    ├── gpu-rocm/
     │   ├── Makefile
     │   └── main.c
+    ├── gpu-cuda/
+    │   ├── Makefile
+    │   ├── main.c
+    │   ├── kernels.cu
+    │   ├── gpu.h
+    │   ├── fp4_gemm.cu / fp4_qwen3.cu / fp4_verify.cu  (Blackwell FP4)
+    │   └── third_party/cutlass/  (fetched via make cutlass)
     ├── xdna2/
     │   ├── Makefile
     │   ├── main.c
@@ -141,6 +149,27 @@ rocminfo | grep -m 1 gfx
 
 Pass the `gfx…` value from `rocminfo` as `GPU_ARCH` at build time.
 
+### CUDA build
+
+You need an NVIDIA GPU and the **CUDA Toolkit** (`nvcc`, `libcudart`). There is **no** CUDA target in the aggregate `qwen3-8b/Makefile`; build under **`qwen3-8b/gpu-cuda/`**.
+
+Check:
+
+```bash
+nvcc --version
+nvidia-smi
+```
+
+Put CUDA’s **`bin`** directory on **`PATH`** (linking can fail if only `/usr/local/bin/nvcc` is visible).
+
+| Use case | Command (`cd qwen3-8b/gpu-cuda`) |
+|----------|----------------------------------|
+| **FP16 only** (Ampere/Ada, PTX OK) | `make build.no-fp4` or `make run.no-fp4` |
+| **Blackwell NVFP4** (e.g. RTX 50) | `make build.fp4` / default `make run` (calls `build.fp4`) |
+| Install CUDA 13 + full FP4 build | `make blackwell` (removes apt CUDA 11 → CUDA 13 → CUTLASS → `build.fp4`) |
+
+FP16 builds default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. The **`gpu-cuda/Makefile` default target `run` invokes `build.fp4`**—on non-Blackwell GPUs use **`make run.no-fp4`** instead.
+
 ## Obtain the model file
 
 The default name in `qwen3-8b/Makefile` is:
@@ -149,12 +178,20 @@ The default name in `qwen3-8b/Makefile` is:
 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ```
 
-The GGUF is **not** shipped in the repo (license + size). Download it from the URL in `qwen3-8b/gguf.txt` and place it under `qwen3-8b/`.
+The GGUF is **not** shipped in the repo (license + size). Place it under `qwen3-8b/`. Recommended: aggregate **`make model`** (`wget` + bundled `.sha256sum` verification).
+
+```bash
+cd qwen3-8b
+make model
+```
+
+Manual download:
 
 ```bash
 cd qwen3-8b
 url=$(sed 's|/blob/main/|/resolve/main/|' gguf.txt)
 wget -O Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf "$url"
+sha256sum -c Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
 You should then have:
@@ -164,7 +201,8 @@ qwen3-8b/
 ├── Makefile
 ├── cpu/ … (`main.c` → `cpu/qwen3-cpu`)
 ├── cpu-multicore/ …
-├── gpu/ …
+├── gpu-rocm/ …
+├── gpu-cuda/ …
 ├── xdna2/ …
 ├── xdna2-bfp16/ …
 └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
@@ -185,7 +223,8 @@ Build the CPU binary first. An 8B model is slow on CPU; use a small `-n` (e.g. `
 
 ```bash
 cd qwen3-8b
-make build
+make model          # if missing: download and verify GGUF
+make build.cpu
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
@@ -197,10 +236,10 @@ On success, text should appear gradually after load.
 
 ```bash
 cd qwen3-8b
-make build
+make build.cpu
 ```
 
-Produces **`cpu/qwen3-cpu`**.
+Produces **`cpu/qwen3-cpu`** (or `make build` inside `cpu/`).
 
 ```bash
 ls -lh cpu/qwen3-cpu
@@ -214,16 +253,16 @@ ls -lh cpu/qwen3-cpu
   -n 16
 ```
 
-Using the `Makefile` `run` target:
+Using aggregate `run.cpu`:
 
 ```bash
-make run PROMPT="Give a one-sentence introduction of yourself."
+make run.cpu PROMPT="Give a one-sentence introduction of yourself."
 ```
 
 Model elsewhere:
 
 ```bash
-make run MODEL=/data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+make run.cpu MODEL=/data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
 ## CPU OpenMP
@@ -234,7 +273,7 @@ Uses multiple CPU cores; same model file as single-thread.
 
 ```bash
 cd qwen3-8b
-make build.omp
+make build.cpu-multicore
 ```
 
 Produces **`cpu-multicore/qwen3-cpu-omp`**.
@@ -272,30 +311,91 @@ If you see e.g. `gfx1201`, build with `GPU_ARCH=gfx1201`.
 
 ```bash
 cd qwen3-8b
-make build.rocm GPU_ARCH=gfx1201
+make build.gpu-rocm GPU_ARCH=gfx1201
 ```
 
 If ROCm is not under `/opt/rocm`:
 
 ```bash
-make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
-Produces **`gpu/qwen3-rocm`**.
+Produces **`gpu-rocm/qwen3-rocm`**.
 
 ### Run
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Explain what ROCm is for beginners." \
   -n 64
 ```
 
-Using `run.rocm`:
+Using `run.gpu-rocm`:
 
 ```bash
-make run.rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
+make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
 ```
+
+## CUDA GPU (NVIDIA)
+
+For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build under **`gpu-cuda/`**. Prompts run as a **prefill batch**; generation is **one-token decode**; attention uses **Flash Attention** (GQA).
+
+| Build | Weights at load | Linear layers at runtime |
+|-------|-----------------|---------------------------|
+| **`build.no-fp4`** | CPU dequant → **FP16** → VRAM (ROCm-like) | FP16 GEMV kernels |
+| **`build.fp4`** (Blackwell) | Linear tensors (Q/K/V/O, gate/up/down, LM head) → **NVFP4 cache** via **`fp4_qwen3_weight_from_f16_host`**; **`token_embd`** stays **FP16** on GPU | **`fp4_qwen3_mm`** (M=1 → FP4 GEMV; long prefill batches → Tensor Core GEMM when M≥128) |
+
+**`build.fp4`** targets **Blackwell (sm_120)** with CUTLASS **NVFP4**. On Ampere/Ada and older, use **`build.no-fp4` / `make run.no-fp4`** only.
+
+### Build (FP16 only, general GPUs)
+
+```bash
+cd qwen3-8b/gpu-cuda
+make build.no-fp4
+```
+
+Produces **`qwen3-gpu-cuda`**. Example with a specific architecture:
+
+```bash
+make build.no-fp4 CUDA_GENCODE=arch=compute_89,code=sm_89
+```
+
+### Build and run (Blackwell + NVFP4)
+
+If CUDA 13 and CUTLASS are not set up yet (needs root-like privileges):
+
+```bash
+cd qwen3-8b/gpu-cuda
+make blackwell
+```
+
+If CUDA 13 is already installed:
+
+```bash
+make cutlass          # clone third_party/cutlass (first time)
+make build.fp4        # sm_120a + BONSAI_FP4=1 + FA_BR=32
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+```
+
+At startup you should see **`Uploading weights to device (dequant -> NVFP4 linear layers)...`** and **`GPU: FP4 Tensor Core path enabled`** when the FP4 path is active.
+
+**Note:** the **`gpu-cuda/Makefile` default target is `run` → `build.fp4`**. On non-Blackwell GPUs use **`make run.no-fp4`**.
+
+### Run (binary directly)
+
+```bash
+./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+  -p "Explain what CUDA is for beginners." \
+  -n 64
+```
+
+After an FP16-only build:
+
+```bash
+make run.no-fp4 MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Short explanation in English."
+```
+
+Optional CUTLASS NVFP4 GEMM smoke test: `make fp4-test` (builds and runs **`fp4_verify.cu`**). See `doc/design.md` (CUDA section).
 
 ## AMD Ryzen AI XDNA2 NPU
 
@@ -355,14 +455,14 @@ make run.xdna2 PROMPT="Short explanation in English."
 
 ```bash
 cd qwen3-8b
-make build.xdna2.bfpx
+make build.xdna2-bfp16
 XDNA_FORCE_CPU=1 ./xdna2-bfp16/qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
   Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 ```bash
-make run.xdna2.bfpx PROMPT="Short explanation in English."
+make run.xdna2-bfp16 PROMPT="Short explanation in English."
 ```
 
 ### Notes
@@ -391,7 +491,7 @@ Start small:
 Then increase `-n`:
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Write a short poem." \
   -n 128
 ```
@@ -401,7 +501,7 @@ Then increase `-n`:
 Lower temperature and fix the seed when comparing runs:
 
 ```bash
-./gpu/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "One sentence: what is GGUF?" \
   -n 32 \
   -t 0.2 \
@@ -423,9 +523,15 @@ Typical files removed:
 
 - `cpu/qwen3-cpu`
 - `cpu-multicore/qwen3-cpu-omp`
-- `gpu/qwen3-rocm`
+- `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
+
+**CUDA** artifacts (`gpu-cuda/qwen3-gpu-cuda`, etc.) are **not** removed by aggregate `make clean`. To clean them:
+
+```bash
+cd qwen3-8b/gpu-cuda && make clean
+```
 
 `make clean` does **not** delete the GGUF model.
 
@@ -453,7 +559,22 @@ Expected for 8B on CPU alone. Try `-n 1` or `-n 4`:
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-For speed, use `./gpu/qwen3-rocm`.
+For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs or `gpu-cuda/qwen3-gpu-cuda` on NVIDIA GPUs.
+
+### `nvcc` not found / `nvlink` errors
+
+Ensure CUDA `bin` is on `PATH` or set `CUDA_HOME` in `gpu-cuda/Makefile`.
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+nvcc --version
+```
+
+If a PTX-only build is very slow, rebuild with `CUDA_GENCODE=arch=compute_XX,code=sm_XX` for your GPU.
+
+### `build.fp4` fails / `NVFP4 quantize failed`
+
+Confirm **`sm_120a`** build, CUDA 13, and **`make cutlass`**. On non-Blackwell GPUs use **`make build.no-fp4`**.
 
 ### `hipcc` not found
 
@@ -466,7 +587,7 @@ ls /opt/rocm/bin/hipcc
 If elsewhere:
 
 ```bash
-make build.rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 ```
 
 ### Wrong `GPU_ARCH`
@@ -478,7 +599,7 @@ rocminfo | grep -m 1 gfx
 ```
 
 ```bash
-make build.rocm GPU_ARCH=gfx1100
+make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 
 ### `/dev/accel/accel0` opens but `CREATE_HWCTX` returns `EINVAL`
@@ -503,8 +624,9 @@ Suggested order:
 2. `doc/design.md` — design, quantization, Qwen3 specifics.
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
-5. `qwen3-8b/gpu/main.c` — GPU memory, HIP kernels, GPU sampling.
-6. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
+5. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
+6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu` / `fp4_gemm.cu` — CUDA prefill/decode, FP16 GEMV, Flash Attention, load-time NVFP4 quantize and **`fp4_qwen3_mm`**.
+7. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope
 
@@ -515,7 +637,7 @@ Suggested order:
 - Universal support for every GGUF quantization
 - Guaranteed numerical match with official implementations
 
-The goal is to **understand, experiment with, and adapt** Qwen3-family GGUF text inference in C/HIP.
+The goal is to **understand, experiment with, and adapt** Qwen3-family GGUF text inference in C, HIP, and CUDA.
 
 ## More documentation
 
