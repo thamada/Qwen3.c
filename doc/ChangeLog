@@ -4,6 +4,22 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 16:46:11
+
+**`qwen3-8b/hf-model.py`**: 削除。**`make model`**（**`wget`** + **`.sha256sum`**）に GGUF 取得を一本化。
+
+**`doc/design.md`**: **`hf-model.py`** 関連の記述を削除し、**「モデル参照」** を **`make model`** と手動取得の 2 通りに整理。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 16:45:20
+
+**`qwen3-8b/Makefile`**: **`model`** ターゲットを追加。**`gguf.txt`** の URL（`blob/main` → `resolve/main`）から **`wget`** で **`$(MODEL)`** を取得し、**`$(MODEL).sha256sum`** が存在するとき **`sha256sum --check`** で検証。チェックサムファイル欠如・検証失敗時はエラー終了し、破損ファイルは削除。
+
+**`doc/design.md`**: ディレクトリ表の **`qwen3-8b/Makefile`** 一行、Make ターゲット表に **`model`**、ビルド例、**「モデル参照」**（**`make model`**・手動 **`wget`**）を反映。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-18 20:38:59
 
 **`qwen3-8b/hf-model.py`**: **`qwen3-8b/gguf.txt`** の Hugging Face **`blob` / `resolve` URL** を解釈し、**`hf download`** で既定配置先（スクリプトと同じディレクトリ、**`--local-dir`** で変更可）に取得。開始時に **`hf auth login`** を実行（**`HF_TOKEN`** または **`--token`** で非対話可）。Hub の tree API から当該ファイルの **LFS `oid`（SHA256）** を取得し、ダウンロード後のファイルと照合する。旧ファイル名 **`download_gguf_hf.py`** は **`hf-model.py`** に変更。

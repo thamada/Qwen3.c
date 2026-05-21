@@ -44,7 +44,7 @@
 | `qwen3-8b/gpu/main.c` | ROCm 推論（既定の HIP ビルド対象）。 |
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **`xdna2/main.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
-| `qwen3-8b/Makefile` | **`build.<サブディレクトリ名>` / `run.<サブディレクトリ名>`**（例: **`build.cpu`**・**`build.gpu`**）および **`clean` / `gen-xdna-kernels`** を **`cpu/`**・**`cpu-multicore/`**・**`gpu/`**・**`xdna2/`**・**`xdna2-bfp16/`** の各 **`Makefile`** に委譲。 |
+| `qwen3-8b/Makefile` | **`model`**（**`gguf.txt`** の URL を **`wget`** で取得し **`$(MODEL).sha256sum`** で検証。失敗時は破損ファイルを削除）、**`build.<サブディレクトリ名>` / `run.<サブディレクトリ名>`**（例: **`build.cpu`**・**`build.gpu`**）、**`clean` / `gen-xdna-kernels`** を **`cpu/`** ほか各サブディレクトリの **`Makefile`** に委譲。 |
 | `qwen3-8b/cpu/Makefile` ほか（各経路直下） | 当該サブディレクトリのみの **`make build`** / **`make run`** / **`clean`**（単体開発用）。出力バイナリは **`cpu/qwen3-cpu`** のように経路直下に生成。 |
 | `doc/design.md` | 本書。 |
 | `doc/ChangeLog` | 変更履歴。 |
@@ -54,16 +54,16 @@
 | `qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py` | **`qwen3-8b/xdna2/xdna-gemv/kernels/`** のスタブ `.bin` を生成（**`qwen3-8b`** の **`make gen-xdna-kernels`** がリポジトリルートから実行）。 |
 | `qwen3-8b/xdna2/xdna-gemv/toolchain/README.md` | **NPU 用 `bf16-gemv-*.bin` を自前生成する手引き**（Xilinx **mlir-aie**／**AMD IRON**／**Peano**／**`aiecc`** の公式手順に沿ったコマンド、Qwen-VL-8B と **IRON `GEMV(M,K)`** の対応、`--aie-generate-npu-insts` と `qwen3-xdna2` 統合時の注意）。**冒頭**で Linux カーネル文書 **AMD NPU** における **`ctrlcode`** と本リポジトリ実装の対応、**`qwen3-xdna2`（XRT 非依存）と公式サンプル（XRT 経由）の違い**を整理。**東京科学大学（2026年現在の名称。旧・東京工業大学）ACRi** ルーム公開の日本語チュートリアル（外部リンク・vadd 題材）への導線あり。本文は日本語（です・ます調）。 |
 | `.gitignore` | ビルド生成バイナリ・**`*.gguf`** 等に加え、**Python の `__pycache__/` と `*.py[cod]`** を除外。 |
-| `qwen3-8b/gguf.txt` | 既定 GGUF の取得元 URL 参照。Hugging Face の `blob/main` URL を `resolve/main` に置換して **`wget`** 等で取得できる。**`python3 hf-model.py`** なら同 URL をそのまま解釈し、**`hf` CLI**（**`huggingface_hub`**）で **認証・ダウンロード・Hub LFS メタデータとの SHA256 照合**まで自動化できる。 |
-| `qwen3-8b/hf-model.py` | **`gguf.txt`** 先頭行の HF URL から **`hf download`** で GGUF を取得。スクリプト内で **`hf auth login`**（**`HF_TOKEN`** / **`--token`** でトークン指定可）。期待ハッシュは **`Qwen_*.gguf.sha256sum`** に依存せず Hub の **LFS oid** で検証。 |
-| `qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum` | 既定 GGUF の SHA256 参照（手動 **`sha256sum`** 確認用。**`hf-model.py`** は Hub 側メタデータと突き合わせる）。 |
+| `qwen3-8b/gguf.txt` | 既定 GGUF の取得元 URL 参照。Hugging Face の `blob/main` URL を `resolve/main` に置換して **`wget`** する（**`make model`** が同処理を実行）。 |
+| `qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum` | 既定 GGUF の SHA256 参照（**`make model`** および手動 **`sha256sum -c`** 用）。 |
 
 ### 生成バイナリと Make ターゲット（`qwen3-8b/`）
 
-作業ディレクトリは **`qwen3-8b/`**（集約 **`Makefile`** が各サブディレクトリの **`Makefile`** を呼び出す）。既定 `MODEL=Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`、`GPU_ARCH` 既定例は `gfx1201`（実機の `rocminfo` に合わせる）。
+作業ディレクトリは **`qwen3-8b/`**（集約 **`Makefile`** が各サブディレクトリの **`Makefile`** を呼び出す）。既定 `MODEL=Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`、`GPU_ARCH` 既定例は `gfx1201`（実機の `rocminfo` に合わせる）。GGUF 未取得時は先に **`make model`**（詳細は **「モデル参照」**）。
 
 | Makefile ターゲット | 出力バイナリ | ソース |
 |---------------------|--------------|--------|
+| **`model`** | **`$(MODEL)`**（既定 **`Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**） | **`gguf.txt`** の URL → **`wget`**。検証は同ディレクトリの **`$(MODEL).sha256sum`**（**`sha256sum --check`**）。チェックサムファイル欠如・検証失敗時はエラー終了 |
 | `build.cpu` / `run.cpu` | `cpu/qwen3-cpu` | `cpu/main.c` |
 | `build.cpu-multicore` / `run.cpu-multicore` | `cpu-multicore/qwen3-cpu-omp` | `cpu-multicore/main.c`（`-fopenmp`、`OMP_NUM_THREADS`） |
 | `build.gpu` / `run.gpu` | `gpu/qwen3-rocm` | `gpu/main.c` |
@@ -73,6 +73,7 @@
 
 ```bash
 cd qwen3-8b
+make model                   # 既定 GGUF を gguf.txt から取得し .sha256sum で検証
 make build.cpu
 make build.cpu-multicore
 make build.gpu               # hipcc・ROCm 必須
@@ -304,7 +305,14 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 ## モデル参照
 
-利用する GGUF のファイル名は **`qwen3-8b/Makefile` の `MODEL`** を参照する。モデル本体は著作権とファイルサイズの都合でリポジトリに含めず、既定モデルの取得元は **`qwen3-8b/gguf.txt`** に URL として置く。手動取得では Hugging Face の `blob/main` URL を `resolve/main` に置換して実体ファイルを **`wget`** 等で取得できる。**`python3 qwen3-8b/hf-model.py`**（要: **`huggingface_hub`** および PATH 上の **`hf` CLI**）では **`hf auth login`** と **`hf download`** と **Hub の LFS SHA256 照合**をまとめて行える。**`qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum`** は手動の **`sha256sum`** 確認用の一例。別量子化・別サイズに切り替える場合は **`MODEL`** と本書の前提（メタキー `qwen3vl.*`・テンソル名）が実装と一致するかを確認すること。
+利用する GGUF のファイル名は **`qwen3-8b/Makefile` の `MODEL`** を参照する。モデル本体は著作権とファイルサイズの都合でリポジトリに含めず、既定モデルの取得元は **`qwen3-8b/gguf.txt`** に URL として置く。
+
+取得・検証の手順は次の 2 通りである。
+
+1. **`cd qwen3-8b && make model`**: **`gguf.txt`** 先頭 URL の `blob/main` を `resolve/main` に置換して **`wget`** し、リポジトリ同梱の **`$(MODEL).sha256sum`** で **`sha256sum --check`** する。チェックサムファイルが無い・検証に失敗した場合はメッセージを出して終了し、破損ダウンロードは **`$(MODEL)`** を削除する。
+2. **手動**: 上記と同様に URL を `resolve/main` に直して **`wget`** 等で取得し、**`sha256sum -c $(MODEL).sha256sum`** で確認する。
+
+**`qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum`** は既定 **`MODEL`** 用の参照。別量子化・別サイズに切り替える場合は **`MODEL`** と本書の前提（メタキー `qwen3vl.*`・テンソル名）が実装と一致するかを確認すること。
 
 ## 制約・既知の制限
 
