@@ -4,6 +4,24 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 21:19:33
+
+- **doc**: PolarQuant-R（KV キャッシュ圧縮）の実装説明を追加 — `doc/design.md` にアルゴリズム・VRAM 削減・Flash Attention 統合・ビルド手順、`README.md` / `README.en.md` に `build.polarquant` / `pq-test`、ファイル表に `polarquant.*` を追記。
+
+## 2026-05-21 21:16:24
+
+**`doc/design.md`**: **`build.fp4`** のロード／実行フロー（H2D 時 **NVFP4** 化、線形 **FP16 VRAM なし**、**`fp4_gemv_cached`** による decode、M≥128 の CUTLASS GEMM）を **「実行時の挙動」** と **「CUDA NVFP4 実装メモ」** に整理。VRAM 目安・decode 低速のトラブルシュート行を追記。
+
+**`README.md`**・**`README.en.md`**: 起動ログ文言（**`GEMM M>=128, GEMV decode`**）、実行経路表・読み方ガイドを現行実装に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
+## 2026-05-21 21:04:42
+
+**`doc/ChangeLog`** を **`doc/ChangeLog.md`** にリネーム。**`README.md`**・**`README.en.md`**・**`doc/design.md`** のパス表記を追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-21 20:53:55
 
 **`qwen3-8b/gpu-cuda/`**（**`db8ce6f`**）: **`BONSAI_FP4`** 時に線形層の **FP16 VRAM 複製を廃止**し **NVFP4 キャッシュのみ**（**`upload_linear_fp4`** → **`fp4_qwen3_weight_from_f16_host`**）。**`fp4_gemm`** に **FP4 GEMV**（**`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`**）を追加し、**`fp4_qwen3_mm`** が M=1 デコードと Prefill バッチを経路分岐。
@@ -14,7 +32,7 @@
 
 **`doc/design.md`**: 上記に追随。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-21 20:18:22
 
@@ -24,13 +42,13 @@
 
 **`doc/design.md`**: 上記に追随（バリアント表・ディレクトリ表・Make ターゲット・CUDA 節・実行時挙動・制約・トラブルシュート）。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-21 17:44:31
 
 **`README.md`**・**`README.en.md`**: **`gpu-cuda/`**（CUDA ビルド・実行・要件）を追記。実行経路表・ディレクトリツリー・モデル取得（**`make model`**）を更新。集約 Makefile のターゲット名に追随（**`build.cpu`**・**`build.cpu-multicore`**・**`build.xdna2-bfp16`** 等）。CUDA のトラブルシュート・**`make clean`** 注記を追加。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-21 17:42:28
 
@@ -38,7 +56,7 @@
 
 **`doc/design.md`**: 概要・実装バリアント表・ディレクトリ表・ビルド／実行（CUDA 節）・実行時挙動・トラブルシューティングに **`gpu-cuda/`** を追記。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-21 16:50:16
 
@@ -48,7 +66,7 @@
 
 **`doc/design.md`**: 概要・実装バリアント表・ディレクトリ表・Make ターゲット表・ビルド例の **`gpu/`** / **`build.gpu`** 表記を **`gpu-rocm/`** / **`build.gpu-rocm`** に更新。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-21 16:46:11
 
@@ -56,7 +74,7 @@
 
 **`doc/design.md`**: **`hf-model.py`** 関連の記述を削除し、**「モデル参照」** を **`make model`** と手動取得の 2 通りに整理。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-21 16:45:20
 
@@ -64,7 +82,7 @@
 
 **`doc/design.md`**: ディレクトリ表の **`qwen3-8b/Makefile`** 一行、Make ターゲット表に **`model`**、ビルド例、**「モデル参照」**（**`make model`**・手動 **`wget`**）を反映。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-18 20:38:59
 
@@ -74,13 +92,13 @@
 
 **`doc/design.md`**: ディレクトリ表の **`.gitignore`**・**`gguf.txt`**・**`hf-model.py`** の一行、**「モデル参照」** に上記を反映。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-18 20:18:49
 
 **`xdna-gemv/`** を **`qwen3-8b/xdna2/xdna-gemv/`** に移動。**`gen-xdna-gemv-stubs.py`** はスクリプト隣接の **`kernels/`** を既定出力とするよう変更。**`qwen3-8b/Makefile`**・**`qwen3-8b/xdna2/Makefile`** の **`gen-xdna-kernels`**、`README.md` / **`README.en.md`** / **`doc/design.md`** / 同梱ドキュメント・**`qwen3-8b/xdna2/main.c`** のパス表記を追随（**`qwen3-8b` からの `XDNA_GEMV_DIR`** 例は **`xdna2/xdna-gemv/kernels`**）。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-16 03:03:47
 
@@ -88,7 +106,7 @@
 
 **`doc/design.md`**: 実装バリアント表・ディレクトリ表・Make ターゲット表・ビルド例・**`XDNA_INCS`** 説明を上記に追随。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-16 02:38:57
 
@@ -96,7 +114,7 @@
 
 **`doc/design.md`**: ディレクトリ表の **`qwen3-8b/cpu-multicore/main.c`** 一行を上記に追随。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-16 02:22:26
 
@@ -104,13 +122,13 @@
 
 **`doc/design.md`**: ディレクトリ表および**補足：ドキュメント間の役割**における **`xdna-gemv/toolchain/README.md`** の説明を上記の内容に追随。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 14:12:50
 
 **`qwen3-8b/` の実行経路ごとにディレクトリを分割**し、いずれも **`main.c`** に統一。**`cpu/`**・**`cpu-multicore/`**・**`gpu/`**・**`xdna2/`**・**`xdna2-bfp16/`** にそれぞれ **`Makefile`** を配置。ルートの **`qwen3-8b/Makefile`** は **`make -C`** で各サブディレクトリに委譲し、実行ファイルパスも **`cpu/qwen3-cpu`** 等に変更。**`.gitignore`**・**`README.md`**・**`README.en.md`**・**`doc/design.md`**・**`doc/ChangeLog`**（コード例の実行パスのみ一部更新）・**`xdna-gemv/`** 配下の参照を追随。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 13:40:39
 
@@ -124,7 +142,7 @@
 
 **`doc/design.md`**: ディレクトリ表の **`xdna-gemv-toolchain/README.md`** 一行を手引きの位置づけに合わせて更新。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 13:25:04
 
@@ -134,13 +152,13 @@
 
 **`doc/design.md`**: ディレクトリ表 **`xdna-gemv-toolchain/README.md`** と **ドキュメント間の役割**、「詳細（入門）」、**XDNA2 NPU 実装メモ** に同文書参照を追加。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 13:13:06
 
 **`xdna-kernels/Makefile`**: **`XDNA_GEMV_BIN_URL_BASE`** の既定値を Makefile 内に記述（**`make` のみで取得を試行**）。**`help`** と **`xdna-kernels/README.md` §8.1** を追随。**`doc/design.md`** の一行説明を更新。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 04:51:57
 
@@ -150,7 +168,7 @@
 
 **`doc/design.md`**: ディレクトリ表に **`xdna-kernels/Makefile`** を追加。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 04:41:49
 
@@ -158,7 +176,7 @@
 
 **`doc/design.md`**: ディレクトリ表の **`xdna-kernels/README.md`** 一行と XDNA2 節の **「詳細（入門）」** を上記内容に合わせて拡張。**XDNA2 NPU 実装メモ**末尾に **GPU カーネル対比・プログラム可能性**は同 README（§3）参照を追記。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 04:28:45
 
@@ -196,7 +214,7 @@
 
 **`doc/design.md`**: XDNA2 実行例（**`--xdna-status` / `-X`**）、**実行時の挙動**、**コマンドライン補足**、トラブルシューティング、**XDNA2 NPU 実装メモ**、バリアント／ファイル一覧の **`main-xdna2.c` 一行**を上記に合わせて更新。
 
-**`doc/ChangeLog`**: 本エントリ。
+**`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 03:16:38
 
@@ -204,21 +222,21 @@
 
 **ドキュメント整合**: **`doc/design.md`**（バリアント表・ファイル一覧の一行・実行時挙動・制約の **~16 GB** 記述・**XDNA2 NPU 実装メモ**および BFPX 節での **`qwen3-xdna2` との比較文言**）、**`README.md` / `README.en.md`**（表記「BF16 常駐」・メモリ目安・BFPX 比較文）を現行実装に合わせ更新。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 
 **`README.md`**: 概要まわりで **欧文と和文が接する箇所**の半角スペースを読みやすさの方針に合わせて整理。**`LLM推論`**・**`Python環境` / `Pythonランタイム`**・**`C` 周り**などの表記を調整。**XDNA2 + BFPX** 節を、ioctl／チャンク GEMV、mmap の解放タイミング、CPU 側 **`mm_bfpx`** と単精度活性、**ビット完全一致の非保証**、品質説明になるよう**自然な文語**へ書き直し。表内の **`BF16` / `BFPX`** 複合語のスペースも合わせて整理。
 
 **`doc/design.md`**: 実装バリアント表・ファイル一覧の **`main-xdna2-bfpx`** 説明、**実行時の挙動（XDNA2 + BFPX）**、フォールバック注記を **`README.md` と同趣旨の用語・語順**に同期。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 01:52:46
 
 **`qwen3-8b/Makefile`**（ドキュメントと整合させるために内容を確定させた整理）:**`TARGET_*` を維持しない**運用へ合わせ、出力バイナリ名 **`qwen3-*`** を各レシピに直書きする方針を維持。セクション見出しの整理、**.PHONY** と **`clean`** の縦並び列挙。ROCm／XDNA の短い説明コメント。**`GPU_ARCH ?= …` と同じ行に `# …` と書くと GNU Make が値末尾に空白を残し `--offload-arch=` が破損することがある**ため、説明だけを次行コメントへ分離。
 
 - **`doc/design.md`**: ファイル構成の **`Makefile` 一行** と **共通変数表** を現状に同期（直書きの出力名、`CC`/`CFLAGS`/`LDFLAGS`、`XDNA_INCS`、`GPU_ARCH` と行末 `#` に関する注意）。
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 01:23:23
 
@@ -228,7 +246,7 @@
 
 **`doc/design.md`**: リポジトリの目的節で利用者向け入口を **`README.md` / `README.en.md`** に更新。**`補足：ドキュメント間の役割`** に **`README.en.md`** と、XDNA 背景の外部文書（**xdna-overview**）を追記。**`design.md` 更新時のチェックリスト** に README 2 言語の整合を 1 項目追加。**`ディレクトリとファイル構成`** 表にルートの **`README.md` / `README.en.md`** を追記。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 01:18:09
 
@@ -236,7 +254,7 @@
 
 **`doc/design.md`**: **`概要` → `リポジトリの目的とスコープ`** に README と整合するライブラリ非依存の範囲と **`ライブラリ非依存とその意義`** 小節を追加。**`補足：ドキュメント間の役割`** に **`README.md`** の位置づけを追記。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-14 01:09:19
 
@@ -254,7 +272,7 @@
 - **`qwen3-8b/Makefile`**: **`build.xdna2.bfpx` / `run.xdna2.bfpx`**、`TARGET_XDNA2_BFPX`、`clean`。旧 **`build.xdna2.mmap`** は削除済み。
 - **`.gitignore`**: **`qwen3-xdna2-bfpx`**（旧 mmap バイナリ名は削除）。
 - **`doc/design.md`**: バリアント表・ファイル構成・Make ターゲット表・XDNA2 実行例・実行時挙動・XDNA2 メモに **`main-xdna2-bfpx.c`** を追記。
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ### ビルド・実行
 
@@ -283,7 +301,7 @@ make build.xdna2.bfpx
 
 - **`qwen3-8b/Makefile`**: `build.xdna2` / `run.xdna2` ターゲットを追加。`TARGET_XDNA2 = qwen3-xdna2`、`XDNA_INCS` 変数で UAPI ヘッダのパスを上書き可能。`clean` も更新。
 - **`doc/design.md`**: 実装バリアント表、ファイル構成表、Make ターゲット表、ビルド・実行方法、実行時挙動、制約事項、トラブルシューティング、`XDNA2 NPU 実装メモ` の節を追加・更新。
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ### ビルド・実行
 
@@ -299,26 +317,26 @@ XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8  # CPU 強�
 
 **`doc/design.md`** のアーキテクチャ説明を拡充。主要データ構造、GGUF パース、重みテンソル対応、量子化と行列積、Tokenizer / ChatML、CPU forward、ROCm forward、生成ループとサンプリングについて、現行実装に沿った詳細説明を追加した。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-13 23:21:20
 
 **`qwen3-8b/main-rocm-fullgpu-flash-opt2.c`** を削除。`make build.rocm.fullgpu.flash.opt2` と同一ロジックの別名ソース・バイナリは不要となったため。**`qwen3-8b/Makefile`** から対応ターゲットを削除し、**`README.md`**・**`doc/design.md`**・**`.gitignore`**・**`qwen3-8b/main-rocm.c`** のビルド注記を **`build.rocm` / `qwen3-rocm` に一本化**。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-13 23:12:27
 
 **`README.md`** のモデル配置手順を更新。プロジェクト見出しを **Qwen3.c** に整理し、GGUF 本体をリポジトリに含めない方針を明記したうえで、**`qwen3-8b/gguf.txt`** の Hugging Face URL から `blob/main` を `resolve/main` に置換して `wget` する手順を追加した。
 
 - **`doc/design.md`**: ファイル構成に **`qwen3-8b/gguf.txt`** を追加し、モデル参照節に取得元 URL と SHA256 確認の役割を反映。
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-13 22:57:14
 
 **`README.md`** を新規作成。Qwen3 系 GGUF テキスト推論エンジンとしての概要、必要環境、モデル配置、SHA256 確認、CPU / OpenMP / ROCm のビルド方法、推論実行方法、主要オプション、トラブルシューティング、実装を読む順序を初心者向けに整理した。
 
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 
 ## 2026-05-13 22:41:41
 
@@ -332,5 +350,5 @@ XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8  # CPU 強�
 ### ドキュメント
 
 - **`doc/design.md`**: 概要に **`qwen3-8b/`** を現行ツリーとして明記。**[Qwen3-8B（`qwen3-8b/`）](#qwen3-8bqwen3-8b)** 節を追加（スコープ、`qwen3vl.*`、IQ デ量子化方針、Q/K norm、ChatML、`main.c` / `main-omp.c` / `main-rocm*.c`、Make ターゲットとバイナリ、ビルド例）。**ビルドと実行**に `qwen3-8b` 向け CPU/OpenMP/ROCm のサブ節を追加。
-- **`doc/ChangeLog`**: 本エントリ。
+- **`doc/ChangeLog.md`**: 本エントリ。
 

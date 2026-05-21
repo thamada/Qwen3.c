@@ -1,6 +1,6 @@
 # 設計仕様書
 
-> **注意**: 本ドキュメントは設計仕様書です。変更履歴や実装の詳細な変更点については、`ChangeLog`を参照してください。本ドキュメントでは、現在のシステムの設計と仕様を記述します。
+> **注意**: 本ドキュメントは設計仕様書です。変更履歴や実装の詳細な変更点については、`ChangeLog.md` を参照してください。本ドキュメントでは、現在のシステムの設計と仕様を記述します。
 
 ## 概要
 
@@ -28,7 +28,7 @@
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
 | `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定 AMD GPU エントリ**。 |
-| `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。**`build.no-fp4`**: ROCm 同趣旨（全線形 **FP16 VRAM**）。**`build.fp4`**: 線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**）、**`token_embd`** は **FP16**、norm は **F32**。線形は **`fp4_qwen3_mm`**（M=1→**FP4 GEMV**、M≥128→CUTLASS GEMM）。サンプリング **logits D2H**。集約 Makefile 外。 |
+| `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。**`build.no-fp4`**: ROCm 同趣旨（全線形 **FP16 VRAM**）。**`build.fp4`**: 線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**）、**`token_embd`** は **FP16**、norm は **F32**。線形は **`fp4_qwen3_mm`**（M=1→**FP4 GEMV**、M≥128→CUTLASS GEMM）。**`build.polarquant`**: KV キャッシュを **PolarQuant-R**（64 B/head、F32 比 ~8×）で VRAM 保持し、Attention タイル読み出し時に F32 復号。サンプリング **logits D2H**。集約 Makefile 外。 |
 | `qwen3-8b/xdna2/main.c` | **AMD Ryzen AI NPU (XDNA2)** | **CPU OpenMP 版と同様**に線形ウェイトは **GGUF mmap 上の量子化形式を参照**。埋め込みは行単位ブロック復号。各 **GEMV ごとに**当該重み行列を **`AMDXDNA_BO_SHMEM` の単一 BF16 スクラッチ**へ展開して NPU が DMA、`scratch_f32` でデ量子化～BF16 を兼用。rmsnorm などの小型 F32 も mmap 指す。`DRM ioctl` と **`ERT_START_NPU`** 経路、`/dev/accel/accelN` 不可／制御コード未配置時の **OpenMP BF16 CPU フォールバック（NPU と bit-identical）**は従来どおり。XRT 不要・UAPI inline 持ち運びは不変。**スクラッチサイズはテキスト経路 GEMV に必要な最大要素数のみ**（パーサ済み名前走査、`TensorInfo` は推論前に開放しうる）。**起動時レポートと `--xdna-status` / `-X`** で各形状の **`bf16-gemv-<n>x<d>.bin`** 可否・推論後の NPU/CPU GEMV カウンタを確認できる。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **AMD Ryzen AI NPU (XDNA2) + BFPX ホスト重み** | **`qwen3-8b/xdna2/main.c` と同一の DRM ioctl** および **チャンク BF16 GEMV（NPU 経路の枠組み）** を共有する。**密行列レイアウト**の重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 係数、ブロック長 64）** に変換しホストのみ保持し、GGUF mmap は変換完了後に解放する。**論理形状は OpenMP CPU 版（`cpu-multicore/main.c`）の `mm(..., n_in, n_out)` と一致**させ、`[n_in,n_out]` 型の GGUF 転置は **`bfpx_convert_weight_2d`** で吸収。量子化に加えブロック近似のため、**GEMV で逐次 BF16 に展開する mmap スクラッチ方式（`xdna2/main.c`）と同一ビットでの一致は期待できず**、品質が劣ることがある。NPU 不可時の CPU は **`mm_bfpx`** が単精度浮動小数点数の活性と BFPX 形式の重みの積を計算する。 |
 
@@ -44,18 +44,21 @@
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.cpu-multicore`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
-| `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。ターゲット **`build.no-fp4`**（FP16・PTX 既定）、**`build.fp4`**（**`sm_120a`** + **`BONSAI_FP4=1`** + **`FA_BR=32`**）、**`run`**（→ **`build.fp4`**）、**`run.no-fp4`**、**`blackwell`**（CUDA 13 導入 → **`build.fp4`**）、**`fp4-test`**。**`KERNELS_OBJ`** は **`BONSAI_FP4`/`FA_BR` 別名（`kernels.bfp4*.fabr*.o`）で stale `.o` 回避。 |
+| `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。ターゲット **`build.no-fp4`**（FP16・PTX 既定）、**`build.fp4`**（**`sm_120a`** + **`BONSAI_FP4=1`** + **`FA_BR=32`**）、**`build.polarquant`**（**`BONSAI_POLARQUANT=1`**）、**`run`**（→ **`build.fp4`**）、**`run.no-fp4`**、**`blackwell`**（CUDA 13 導入 → **`build.fp4`**）、**`fp4-test`**、**`pq-test`**。**`KERNELS_OBJ`** は **`BONSAI_FP4`/`BONSAI_POLARQUANT`/`FA_BR` 別名（`kernels.bfp4*.pq*.fabr*.o`）で stale `.o` 回避。 |
 | `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等。**`BONSAI_FP4`** 時は線形層を **`fp4_qwen3_mm`** のみ（**`use_fp4`**、FP16 線形 VRAM なし）。 |
 | `qwen3-8b/gpu-cuda/fp4_gemm.cu` / `fp4_gemm.h` | CUTLASS **NVFP4** GEMM（M≥128）とデバイス側 **FP4 GEMV**（**`fp4_gemv_cached`**、バッチ版）。 |
 | `qwen3-8b/gpu-cuda/fp4_qwen3.cu` / `fp4_qwen3.h` | ホスト FP16 → NVFP4 キャッシュ（**`fp4_qwen3_weight_from_f16_host`**）、F32 活性の **`fp4_qwen3_mm`**（M に応じて GEMV / GEMM）。 |
 | `qwen3-8b/gpu-cuda/fp4_verify.cu` | **`make fp4-test`** 用の CUTLASS GEMM 単体検証（推論バイナリには未リンク）。 |
+| `qwen3-8b/gpu-cuda/polarquant.cu` / `polarquant.h` | **PolarQuant-R** KV キャッシュ圧縮。ホスト側コードブック初期化（Lloyd-Max L=2〜4）、デバイス **`PQState`**、KV 書き込み API。 |
+| `qwen3-8b/gpu-cuda/polarquant_kernels.cuh` | デバイス側 encode/decode（ランダム符号 + FWHT-128、L=4 再帰 polar 量子化、**`PQBlock`** 8 bytes × 8 blocks）。 |
+| `qwen3-8b/gpu-cuda/polarquant_verify.cu` | **`make pq-test`** 用のラウンドトリップ検証（推論バイナリには未リンク）。 |
 | `qwen3-8b/gpu-cuda/third_party/cutlass/` | **`make cutlass` / `make blackwell`** で clone される CUTLASS（**`BONSAI_FP4`** 時のみリンク）。リポジトリ同梱ではない。 |
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **`xdna2/main.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
 | `qwen3-8b/Makefile` | **`model`**（**`gguf.txt`** の URL を **`wget`** で取得し **`$(MODEL).sha256sum`** で検証。失敗時は破損ファイルを削除）、**`build.<サブディレクトリ名>` / `run.<サブディレクトリ名>`**（例: **`build.cpu`**・**`build.gpu-rocm`**）、**`clean` / `gen-xdna-kernels`** を **`cpu/`** ほか各サブディレクトリの **`Makefile`** に委譲。 |
 | `qwen3-8b/cpu/Makefile` ほか（各経路直下） | 当該サブディレクトリのみの **`make build`** / **`make run`** / **`clean`**（単体開発用）。出力バイナリは **`cpu/qwen3-cpu`** のように経路直下に生成。 |
 | `doc/design.md` | 本書。 |
-| `doc/ChangeLog` | 変更履歴。 |
+| `doc/ChangeLog.md` | 変更履歴。 |
 | `qwen3-8b/xdna2/xdna-gemv/README.md` | **NPU GEMV 用 ctrlcode まわりの入口**。**`kernels/`**・**`toolchain/`**・スタブ再生成スクリプトへの導線。 |
 | `qwen3-8b/xdna2/xdna-gemv/kernels/Makefile` | **`bf16-gemv-*.bin` を `curl`/`wget` で一括取得**。既定の **`XDNA_GEMV_BIN_URL_BASE`** を Makefile 内に記述（上書き可）。詳細は **`qwen3-8b/xdna2/xdna-gemv/kernels/README.md` §8.1**。 |
 | `qwen3-8b/xdna2/xdna-gemv/kernels/README.md` | **ctrlcode**（**`bf16-gemv-<n>x<d>.bin`**）と GEMV 形状、ホスト／NPU 分担、用語ミニ辞典、スタブ **`GQF3XDNA`** と **`--xdna-status`**、8B 対応表、差し替え・再生成。**§3 で ROCm/HIP の GPU カーネルとの対比と「ユーザーが HIP のように書けるか」** の整理を含む入門。 |
@@ -79,6 +82,8 @@
 | （同上）**`build.fp4` / `run`**（既定） | 同上 | **`fp4_gemm.o`** + **`fp4_qwen3.o`** + **`kernels.bfp41.fabr32.o`** 等（**`sm_120a`**） |
 | （同上）**`blackwell`** | 同上 | apt CUDA 11 除去 → CUDA 13 → **`cutlass`** → **`build.fp4`** |
 | （同上）**`fp4-test`** | `fp4_verify`（一時） | **`fp4_verify.cu`** + **`fp4_gemm.o`** |
+| （同上）**`build.polarquant`** | 同上 | **`polarquant.o`** + **`kernels.bfp0.pq1.fabr*.o`**（KV キャッシュ PolarQuant-R） |
+| （同上）**`pq-test`** | `polarquant_verify`（一時） | **`polarquant_verify.cu`** + **`polarquant.o`** |
 | `build.xdna2` / `run.xdna2` | `xdna2/qwen3-xdna2` | `xdna2/main.c`（`-fopenmp`。`amdxdna` カーネルモジュールが `/dev/accel/accelN` を提供） |
 | **`gen-xdna-kernels`** | （出力なし） | `qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py` で **`qwen3-8b/xdna2/xdna-gemv/kernels/bf16-gemv-*.bin`** プレースホルダを再生成 |
 | **`build.xdna2-bfp16` / `run.xdna2-bfp16`** | **`xdna2-bfp16/qwen3-xdna2-bfpx`** | **`xdna2-bfp16/main.c`**（`-fopenmp`。NPU 経路・環境変数は `qwen3-xdna2` と同種。ホスト重みは BFPX） |
@@ -91,6 +96,8 @@ make build.cpu-multicore
 make build.gpu-rocm               # hipcc・ROCm 必須
 cd gpu-cuda && make build.no-fp4   # 汎用 NVIDIA GPU（FP16・PTX 可）
 cd gpu-cuda && make build.fp4      # Blackwell + NVFP4（要 CUDA 13 + CUTLASS）
+cd gpu-cuda && make build.polarquant   # PolarQuant-R KV キャッシュ（FP16 線形重み・任意 GPU）
+cd gpu-cuda && make build BONSAI_FP4=1 BONSAI_POLARQUANT=1   # NVFP4 + PolarQuant 同時
 make build.xdna2             # Linux >= 6.10 + amdxdna カーネルモジュール（XRT 不要）
 make gen-xdna-kernels        # xdna2/xdna-gemv/kernels に bf16-gemv-* プレースホルダ生成（実 NPU ctrlcode ではない）
 make build.xdna2-bfp16       # 同上 + BFPX ホスト重み版バイナリ
@@ -167,8 +174,9 @@ make blackwell
 | `BLACKWELL_GENCODE` | **`build.fp4`** 用 | `arch=compute_120a,code=sm_120a` |
 | `MODEL` | GGUF パス（gpu-cuda からの相対） | `../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf` |
 | `BONSAI_FP4` | NVFP4 線形層（**`fp4_qwen3`**） | `0`（**`build.fp4`** / 既定 **`run`** で `1`） |
+| `BONSAI_POLARQUANT` | PolarQuant-R KV キャッシュ | `0`（**`build.polarquant`** で `1`） |
 | `FA_BR` | Flash Attention の K/V タイル幅 | 未指定時 64；**`build.fp4`** は 32 |
-| `KERNELS_OBJ` | **`kernels.cu` の出力名** | `kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR).o` |
+| `KERNELS_OBJ` | **`kernels.cu` の出力名** | `kernels.bfp4$(BONSAI_FP4).pq$(BONSAI_POLARQUANT).fabr$(FA_BR).o` |
 
 **`gpu-cuda/Makefile` の `.DEFAULT_GOAL` は `run` → `build.fp4`**。Blackwell 以外では **`make run.no-fp4`** を使う。**`nvcc` / `nvlink` は `PATH` に CUDA の `bin` を通す**。apt **`nvidia-cuda-toolkit`（CUDA 11）** と **CUDA 13** は併存させない（**`make blackwell`** が 11.x を除去して 13 を入れる）。
 
@@ -211,7 +219,8 @@ make build.xdna2-bfp16
 
 - **`build.no-fp4`**: ROCm 版と同様—CPU 逆量子化 → **全線形 FP16 VRAM** → **`mm_f16_gemv_kernel`**。
 - **`build.fp4`**: 線形（Q/K/V/O、gate/up/down、LM head）は **`upload_linear_fp4`** でホスト FP16 ステージング後 **NVFP4 キャッシュのみ**（線形の FP16 VRAM 複製なし）。**`token_embd`** は **FP16**、norm 系は **F32**。**`gpu_model_create`** が **`wq_fp4` 等**を採用し **`use_fp4=1`**。起動ログ例: **`dequant -> NVFP4 linear layers`**、**`FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`**。
-- **線形の実行**: **`fp4_qwen3_mm`** — **M=1**（デコード）と短い M は **`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`**（**`fp4_gemm.cu`**）；**M≥128** は CUTLASS **`fp4_gemm_run_cached`**（長い Prefill バッチ）。
+- **`build.polarquant`**: KV キャッシュは F32 の代わりに **`PQBlock`** 配列（**64 B/head**）。K/V 書き込みは **`polarquant_kv_write_one`** / **`polarquant_kv_write_batch`** でエンコード。Attention は **`flash_attn_gqa_pq_kernel`** / **`flash_attn_prefill_gqa_pq_kernel`** がタイル単位で **`pq_decode_head`** により F32 復号。起動ログ例: **`PolarQuant-R: KV cache enabled (64 B/head, ~8x vs F32)`**。**`head_dim=128` 固定**（Qwen3-VL-8B 向け）。
+- **線形の実行**: **`fp4_qwen3_mm`** — **M&lt;128**（デコードおよび短い Prefill）は **`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`**（**`fp4_gemm.cu`**。NVFP4 重みを直接参照し **M=128 パディングなし**）；**M≥128** は CUTLASS **`fp4_gemm_run_cached`**（長い Prefill バッチ）。**`BONSAI_FP4=0`** 時は FP16 GEMV。
 
 **XDNA2（`qwen3-xdna2`）**: 線形ウェイトは **mmap された GGUF** を **`main-omp.c` と同様**に参照する（埋め込みは mmap 上行の量子化レイアウトからブロック単位復号）。各 **GEMV** のたび、その行列だけを **`AMDXDNA_BO_SHMEM` に確保した単一 BF16 スクラッチ**へ CPU で復号・BF16 化し、`SYNC_BO` でデバイス可視にしたうえで、入力 BF16・重み・出力への `xdna_addr` を **`ERT_START_NPU`** で `DRM_IOCTL_AMDXDNA_EXEC_CMD` に渡す構成は従来どおり。**レイヤー分の恒久 BF16 重み BO は保持しない**。RMSNorm／Qwen3 ヘッド RMSNorm／Attention 等も **CPU**。NPU が使えないときは BF16 GEMV が **OpenMP** にフォールバックする（実装どおり bit-identical）。
 
@@ -291,7 +300,7 @@ CPU 版は重み全体を float に展開しない。`mm_quant_rows` が出力�
 
 ROCm 版および CUDA **`build.no-fp4`** はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、F16 staging 経由で **全線形を FP16 VRAM** に載せる。norm は F32 のまま GPU。実行時 GEMV は FP16 カーネル（ROCm: `mm_f16_gemv_kernel`、CUDA: 同名相当）。
 
-CUDA **`build.fp4`** は線形 tensor をホストで F16 化したうえで **NVFP4 キャッシュ**（**`fp4_qwen3_weight_from_f16_host`**）にのみ格納し、**埋め込み行だけ FP16 VRAM** に残す。実行時の線形は **`fp4_qwen3_mm`**（FP4 GEMV または Tensor Core GEMM）。いずれも推論中の GGUF 逐次デ量子化は行わない。
+CUDA **`build.fp4`** は線形 tensor をホストで F16 化したうえで **NVFP4 キャッシュ**（**`fp4_qwen3_weight_from_f16_host`** → **`fp4_quantize_weights_host_f16`**）にのみ H2D し、**線形の FP16 VRAM 複製は行わない**。**`token_embd.weight` だけ FP16 VRAM**、norm 系は **F32 VRAM**。起動時の **`gpu_model_create` で FP16→NVFP4 再変換は行わない**（**`wq_fp4` 等**をそのまま採用）。実行時の線形は **`fp4_qwen3_mm`**（M&lt;128 → FP4 GEMV、M≥128 → Tensor Core GEMM）。いずれも推論中の GGUF 逐次デ量子化は行わない。
 
 ### トークナイザーと ChatML
 
@@ -335,7 +344,7 @@ ROCm 版の `forward_gpu` および CUDA 版の `gpu_forward` / `gpu_forward_pre
 
 - `emb_f16_kernel`: token embedding の 1 行を FP16 から float activation に展開する。
 - `rmsnorm_kernel`: block 内 reduction で二乗平均を求め、`float4` 単位も使って RMSNorm を適用する。
-- `mm_f16_gemv_kernel`: 1 warp が 1 出力行を担当し、warp reduction で GEMV の和を作る。1 block は複数行を処理する。
+- `mm_f16_gemv_kernel`: 1 warp が 1 出力行を担当し、warp reduction で GEMV の和を作る。1 block は複数行を処理する（**`build.no-fp4`** の線形層。**`build.fp4`** の線形は **`fp4_gemv_kernel`** 経路）。
 - `rmsnorm_head_kernel`: Q/K の各 head を 1 block で処理し、Qwen3 の head RMSNorm を in-place で適用する。
 - `rope_kernel`: head 内の偶数・奇数ペアに対して RoPE 回転を適用する。
 - `kv_cache_write_kernel`: 現在 token の K/V を layer offset と position offset から求めた cache 位置へ書く。
@@ -373,7 +382,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 - **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。
 - **ROCm 版**: AMD GPU・ROCm・`hipcc`、`GPU_ARCH` と実機 ISA の一致が必要。
-- **CUDA 版（`qwen3-gpu-cuda`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。集約 Makefile 未統合。**汎用 GPU** は **`build.no-fp4`**（PTX 可）。**Blackwell NVFP4** は **CUDA 13**・CUTLASS・**`build.fp4`**（既定 **`make run`** はこちら—非 Blackwell では **`run.no-fp4`**）。**`third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。
+- **CUDA 版（`qwen3-gpu-cuda`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。集約 Makefile 未統合。**汎用 GPU** は **`build.no-fp4`**（PTX 可）。**Blackwell NVFP4** は **CUDA 13**・CUTLASS・**`build.fp4`**（既定 **`make run`** はこちら—非 Blackwell では **`run.no-fp4`**）。**`third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。**`build.fp4`** では線形重みは NVFP4 のみ VRAM に載り、**`build.no-fp4` 比で線形 FP16 分（8B 級で約 15 GiB 相当）を節約**できる（代わりに **`token_embd`** は FP16 のまま）。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
 - **テキストのみ**: Vision・マルチモーダル入力は未対応。
 - **コンテキスト長**: `-l` 既定 512。長くすると KV メモリ（CPU ヒープまたは VRAM）が増加する。
@@ -425,6 +434,9 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | Blackwell FP4 ビルド失敗 | CUDA 11 と 13 の混在・CUTLASS 未取得 | **`make blackwell`** または **`make cutlass`** → **`make build.fp4`** |
 | 非 Blackwell で **`make run` が失敗** | 既定が **`build.fp4`（sm_120a）** | **`make run.no-fp4`** または **`make build.no-fp4`** を使用 |
 | **`NVFP4 quantize failed`** | **`build.fp4`** を非 Blackwell で実行、CUTLASS 未導入 | **`sm_120a`**・CUDA 13・**`make cutlass`**。汎用 GPU は **`build.no-fp4`** |
+| **`build.fp4` で decode が極端に遅い** | 古いバイナリが M=1 を CUTLASS M=128 パディング経路に落としている | 最新 **`fp4_gemv_cached`** 入りビルドか確認。起動ログに **`GEMM M>=128, GEMV decode`** が出ること |
+| **`polarquant_init: head_dim must be 128`** | モデルの **`head_dim`** が 128 でない | 現状 **Qwen3-VL-8B** のみ想定。**`build.no-fp4`** または PolarQuant 無効ビルドを使用 |
+| **`pq-test` FAIL** | コードブック未初期化・GPU 非対応 | **`make pq-test`** の **`max_abs_err` / `rel`** を確認（閾値 rel ≤ 0.35） |
 | mmap 失敗 | パス・権限 | `MODEL` を確認 |
 | CPU が極端に遅い | IQ デ量子化コスト | ROCm 版の利用、`-n` を小さく |
 | `/dev/accel/accel0` を開けない | `render` グループ未参加 / `amdxdna` 未ロード | `sudo usermod -aG render "$USER"`、`lsmod \| grep amdxdna` を確認 |
@@ -440,7 +452,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 - **`qwen3-8b/xdna2/xdna-gemv/kernels/README.md`**: XDNA2 の **ctrlcode**・GEMV 形状・スタブ／実機バイナリ・**`--xdna-status`** の入門。**GPU（ROCm/HIP）カーネルとの対比**（§3）もここで扱う。
 - **`qwen3-8b/xdna2/xdna-gemv/toolchain/README.md`**: **mlir-aie / IRON / Peano / `aiecc`** に沿った **NPU 用 `bf16-gemv-*.bin` 自前生成**の手引き（コマンド列と注意点）。**`qwen3-xdna2` は ioctl のみで XRT 非依存**であること、IRON／mlir-aie の公式サンプルが取る **XRT 検証パス**、および Linux カーネル文書 **AMD NPU** における **`ctrlcode`** の整理を冒頭で対照するための参照になっている。**東京科学大学（2026年現在の名称。旧・東京工業大学）ACRi** ルームの日本語チュートリアル（外部リンク）も紹介される。本文は日本語（です・ます調）。
 - **`doc/design.md`（本書）**: 現行の設計・仕様。
-- **`doc/ChangeLog`**: 日付付き変更履歴。
+- **`doc/ChangeLog.md`**: 日付付き変更履歴。
 - **外部（参考）**: **AMD XDNA** のアーキテクチャ概要・世代・ソフトウェアスタック等は、別リポジトリ **[thamada/xdna-overview](https://github.com/thamada/xdna-overview)** にまとめてある（本リポジトリの実装説明とは独立した背景資料）。
 
 実装の詳細は **`qwen3-8b/*/main.c`**（経路ごとにディレクトリが分かれ、ファイル名はいずれも **`main.c`**）の先頭コメントとソースを参照する。
@@ -449,8 +461,78 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 1. **`qwen3-8b/`** にソースまたはターゲットを増やしたら、**構成表**と **バイナリ表**を更新する。  
 2. **`Makefile`** の変更と本書を同期する。  
-3. 仕様変更は **`doc/ChangeLog`** にも記載する。  
+3. 仕様変更は **`doc/ChangeLog.md`** にも記載する。  
 4. 利用者向け手順や方針を **`README.md`** で変えたら、 **`README.en.md`** も同趣旨に揃える（またはその逆）。
+
+## 補足：CUDA NVFP4（`build.fp4`）実装メモ
+
+**`qwen3-8b/gpu-cuda/`** の Blackwell 向け経路。**`BONSAI_FP4=1`** ビルド時のみ有効。
+
+### ロード（H2D）
+
+1. **`upload_weights_gpu`**（**`main.c`**）: GGUF を CPU で逆量子化し、ホスト **F32/F16 ステージング**（`materialize_host_f16`）へ展開。
+2. 線形 tensor（Q/K/V/O、gate/up/down、LM head）: **`upload_linear_fp4`** が **`fp4_qwen3_weight_from_f16_host`** を呼び、**NVFP4 キャッシュ**（`d_fp4` + CUTLASS インターリーブ **`d_sf`**）だけを VRAM に載せる。**線形 FP16 の device バッファは作らない**。
+3. **`token_embd.weight`**: 従来どおり **FP16 VRAM**（embedding lookup 用）。
+4. norm 系: **F32 VRAM**。
+5. **`gpu_model_create`**（**`kernels.cu`**）: **`wq_fp4` 等**を **`dev_adopt_layers_fp4`** で採用。**`use_fp4=1`**。起動時の FP16→NVFP4 変換ループは **ない**。
+
+### 実行（線形層）
+
+**`fp4_qwen3_mm`**（**`fp4_qwen3.cu`**）が M で分岐する。
+
+| M | 経路 | 実装 |
+|---|------|------|
+| **1**（decode） | FP4 GEMV | **`fp4_gemv_cached`** — warp リダクション、SF インデックスは **`sfb_sf_index`**（CuTe **`layout_SFB`** と一致） |
+| **2〜127**（短い Prefill） | FP4 GEMV バッチ | **`fp4_gemv_batch_cached`** |
+| **≥128**（長い Prefill） | CUTLASS Tensor Core GEMM | **`fp4_gemm_run_cached`**（活性 BF16 をその場量子化） |
+
+**`kernels.cu`** の **`gpu_mm` / `gpu_mm_batch`** は **`BONSAI_FP4`** 時、線形をすべて **`fp4_qwen3_mm`** に委譲する。
+
+### ビルド上の注意
+
+- **`main.o`** も **`BONSAI_FP4=1`** でコンパイル（**`Makefile`**）。
+- **`kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR).o`** で FP4 フラグ変更時の stale `.o` を防止。
+- 検証: **`make fp4-test`**（**`fp4_verify.cu`** — CUTLASS GEMM レイアウト）。
+
+## 補足：CUDA PolarQuant-R（`build.polarquant`）実装メモ
+
+論文 [PolarQuant: Quantizing KV Caches with Polar Transformation](https://arxiv.org/abs/2502.02617)（**PolarQuant-R**）に沿った KV キャッシュ圧縮。**`BONSAI_FP4`** とは独立（**`BONSAI_POLARQUANT=1`**）。NVFP4 線形重みと併用可能: `make build BONSAI_FP4=1 BONSAI_POLARQUANT=1`。
+
+### アルゴリズム概要
+
+1. **前処理（PolarQuant-R）**: head 次元ベクトル \(x \in \mathbb{R}^{128}\) に固定ランダム符号 \(\sigma_i \in \{\pm1\}\) を掛け、**FWHT-128**（Walsh-Hadamard）後 \(1/\sqrt{128}\) でスケール（`polarquant_kernels.cuh`）。
+2. **ブロック分割**: 128 次元を **8 ブロック × 16 座標**。各ブロックは **L=4 再帰 polar 量子化**（**`pq_encode_block` / `pq_decode_block`**）。
+3. **L=4 再帰 polar 量子化**: L1 は 8 ペアの位相 \(\theta \in [0,2\pi)\) を 16 段（4 bit × 8）；L2〜L4 は振幅比角度 \(\phi \in [0,\pi/2]\) を各 4 段（2 bit）。半径は **fp16**、各座標の符号は 16 bit マスク。
+4. **`PQBlock`（8 bytes）**: fp16 半径 + L1 インデックス（32 bit）+ L2/L3/L4 インデックス（各 2 bit）+ 符号ビット。
+5. **コードブック**: 起動時 **`polarquant_init`**（`polarquant.cu`）で L1 は等分割、L2〜L4 は Lloyd-Max（20 反復）最適化セントロイドを **`PQState`** として H2D。
+
+### VRAM 削減（Qwen3-VL-8B 想定）
+
+| 項目 | F32 KV | PolarQuant-R |
+|------|--------|--------------|
+| head あたり | 512 B | **64 B**（`PQ_BYTES_HEAD`） |
+| 圧縮率 | — | **約 8×** |
+| 36 layer × 512 seq（K+V 概算） | ~144 MiB | ~18 MiB |
+
+F32 復号は Attention タイルの共有メモリ上のみ。永続 VRAM に F32 KV は載せない。
+
+### Flash Attention 統合（`kernels.cu`）
+
+- **`BONSAI_POLARQUANT`** 時、`kc`/`vc`（F32）の代わりに **`kc_pq`/`vc_pq`**（`PQBlock` 配列）。
+- 書き込み: **`polarquant_kv_write_one`**（decode）/ **`polarquant_kv_write_batch`**（prefill）。
+- カーネル: **`flash_attn_gqa_pq_kernel`** / **`flash_attn_prefill_gqa_pq_kernel`** — タイル読み出し時 **`pq_decode_head`** で F32 復号後、既存 Flash Attention と同様に QK^T / softmax / V。
+- **制約**: **`head_dim=128` 固定**（`PQ_HEAD_DIM`）。Qwen3-VL-8B（`n_kv_heads=8`）向け。
+
+### ビルド・検証
+
+```bash
+cd qwen3-8b/gpu-cuda
+make build.polarquant
+make pq-test    # ラウンドトリップ rel ≤ 0.35 で OK
+make build BONSAI_FP4=1 BONSAI_POLARQUANT=1   # NVFP4 + PolarQuant
+```
+
+起動ログ: **`PolarQuant-R: KV cache enabled (64 B/head, ~8x vs F32)`**
 
 ## 補足：XDNA2 NPU 実装メモ
 

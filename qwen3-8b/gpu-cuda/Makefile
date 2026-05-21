@@ -41,6 +41,8 @@ CUTLASS_TAG ?= v3.9.0
 
 # Blackwell FP4 ビルド: BONSAI_FP4=1（make run / make build.fp4 が設定）
 BONSAI_FP4 ?= 0
+# PolarQuant KV cache: BONSAI_POLARQUANT=1（make build.polarquant）
+BONSAI_POLARQUANT ?= 0
 
 FP4_CXXFLAGS = -std=c++17 --expt-relaxed-constexpr \
                -I$(CUTLASS_DIR)/include \
@@ -49,9 +51,15 @@ FP4_CXXFLAGS = -std=c++17 --expt-relaxed-constexpr \
 
 FP4_FLAG :=
 FP4_OBJS :=
+PQ_FLAG :=
+PQ_OBJS :=
 ifneq ($(BONSAI_FP4),0)
 FP4_FLAG  := -DBONSAI_FP4=1
 FP4_OBJS  := fp4_gemm.o fp4_qwen3.o
+endif
+ifneq ($(BONSAI_POLARQUANT),0)
+PQ_FLAG   := -DBONSAI_POLARQUANT=1
+PQ_OBJS   := polarquant.o
 endif
 
 # Blackwell (sm_120) は静的 shared 上限 48 KB。FA_BR=32 で Flash Attention が収まる。
@@ -61,10 +69,10 @@ ifneq ($(FA_BR),)
 FA_BR_FLAG := -DFA_BR=$(FA_BR)
 endif
 
-# BONSAI_FP4 / FA_BR が変わったら kernels を必ず再コンパイル（古い .o 再利用防止）
-KERNELS_OBJ := kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR_VAL).o
+# BONSAI_FP4 / FA_BR / BONSAI_POLARQUANT が変わったら kernels を必ず再コンパイル
+KERNELS_OBJ := kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR_VAL).pq$(BONSAI_POLARQUANT).o
 
-.PHONY: build build.fp4 run run.no-fp4 clean blackwell cutlass fp4-test
+.PHONY: build build.fp4 build.polarquant run run.no-fp4 clean blackwell cutlass fp4-test pq-test
 
 fp4-test: fp4_gemm.o | cutlass
 	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu fp4_gemm.o $(LDFLAGS)
@@ -72,11 +80,14 @@ fp4-test: fp4_gemm.o | cutlass
 
 .DEFAULT_GOAL := run
 
-build: main.o $(KERNELS_OBJ) $(FP4_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o qwen3-gpu-cuda main.o $(KERNELS_OBJ) $(FP4_OBJS) $(LDFLAGS)
+build: main.o $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o qwen3-gpu-cuda main.o $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS) $(LDFLAGS)
 
 build.fp4: cutlass
 	$(MAKE) build CUDA_GENCODE="$(BLACKWELL_GENCODE)" FA_BR="$(BLACKWELL_FA_BR)" BONSAI_FP4=1
+
+build.polarquant:
+	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_POLARQUANT=1
 
 build.no-fp4:
 	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_FP4=0
@@ -84,14 +95,21 @@ build.no-fp4:
 main.o: main.c gpu.h fp4_qwen3.h
 	$(CC) $(CFLAGS) $(FP4_FLAG) -c main.c -o main.o
 
-$(KERNELS_OBJ): kernels.cu gpu.h fp4_qwen3.h
-	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) -c kernels.cu -o $@
+$(KERNELS_OBJ): kernels.cu gpu.h fp4_qwen3.h polarquant.h
+	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) $(PQ_FLAG) -c kernels.cu -o $@
 
 fp4_gemm.o: fp4_gemm.cu fp4_gemm.h | cutlass
 	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_gemm.cu -o fp4_gemm.o
 
 fp4_qwen3.o: fp4_qwen3.cu fp4_qwen3.h fp4_gemm.h | cutlass
 	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -c fp4_qwen3.cu -o fp4_qwen3.o
+
+polarquant.o: polarquant.cu polarquant.h polarquant_kernels.cuh
+	$(NVCC) $(NVCCFLAGS) -c polarquant.cu -o polarquant.o
+
+pq-test: polarquant.o
+	$(NVCC) $(NVCCFLAGS) -DBONSAI_POLARQUANT=1 -o polarquant_verify polarquant_verify.cu polarquant.o $(LDFLAGS)
+	./polarquant_verify
 
 cutlass:
 	@if [ ! -f "$(CUTLASS_DIR)/include/cutlass/cutlass.h" ]; then \
@@ -105,7 +123,7 @@ run.no-fp4: build.no-fp4
 	./qwen3-gpu-cuda "$(MODEL)" -p "$(PROMPT)"
 
 clean:
-	rm -f qwen3-gpu-cuda fp4_verify main.o kernels.*.o fp4_gemm.o fp4_qwen3.o
+	rm -f qwen3-gpu-cuda fp4_verify polarquant_verify main.o kernels.*.o fp4_gemm.o fp4_qwen3.o polarquant.o
 
 # apt CUDA 11 を削除 → NVIDIA 公式 CUDA 13 をインストール → Blackwell FP4 ビルド
 blackwell:

@@ -38,7 +38,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
-| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。**`build.no-fp4`**: 全線形層 FP16。**`build.fp4`**（Blackwell）: 線形層をロード時 **NVFP4** 化（`fp4_qwen3` + CUTLASS）、埋め込みは FP16。集約 `Makefile` 外 |
+| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。**`build.no-fp4`**: 全線形層 FP16 VRAM。**`build.fp4`**（Blackwell）: 線形層は H2D 時 **NVFP4 のみ**（`fp4_qwen3` + CUTLASS）、decode は **FP4 GEMV**、長 Prefill は Tensor Core GEMM。**`build.polarquant`**: KV キャッシュ **PolarQuant-R**（64 B/head、~8× 圧縮）。埋め込みのみ FP16 VRAM。集約 `Makefile` 外 |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
@@ -53,7 +53,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 ├── README.md
 ├── README.en.md
 ├── doc/
-│   ├── ChangeLog
+│   ├── ChangeLog.md
 │   └── design.md
 └── qwen3-8b/
     ├── Makefile
@@ -73,6 +73,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     │   ├── kernels.cu
     │   ├── gpu.h
     │   ├── fp4_gemm.cu / fp4_qwen3.cu / fp4_verify.cu  （Blackwell FP4 時）
+    │   ├── polarquant.cu / polarquant_kernels.cuh / polarquant_verify.cu  （PolarQuant-R KV 時）
     │   └── third_party/cutlass/  （make cutlass で取得）
     ├── xdna2/
     │   ├── Makefile
@@ -166,7 +167,10 @@ nvidia-smi
 |------|-----------------------------------|
 | **FP16 のみ**（Ampere/Ada 等・PTX 可） | `make build.no-fp4` または `make run.no-fp4` |
 | **Blackwell NVFP4**（RTX 50 系等） | `make build.fp4` / 既定の `make run`（内部で `build.fp4`） |
+| **PolarQuant-R KV キャッシュ**（任意 GPU・FP16 線形） | `make build.polarquant` |
+| **NVFP4 + PolarQuant 同時** | `make build BONSAI_FP4=1 BONSAI_POLARQUANT=1` |
 | CUDA 13 の導入から一式 | `make blackwell`（apt CUDA 11 除去 → CUDA 13 → CUTLASS → `build.fp4`） |
+| PolarQuant ラウンドトリップ検証 | `make pq-test` |
 
 FP16 ビルドの既定は PTX（`compute_86`）。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。**`gpu-cuda/Makefile` の既定ターゲット `run` は `build.fp4` を呼ぶ**ため、Blackwell 以外では **`make run.no-fp4`** を使ってください。
 
@@ -338,12 +342,13 @@ make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="日本語で短く説明してくだ�
 
 NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` には `build.gpu-cuda` は無い**ため、`gpu-cuda/` で単体ビルドします。プロンプトは **Prefill バッチ**、生成は **1 トークン Decode**、Attention は **Flash Attention**（GQA）です。
 
-| ビルド | ロード時の重み | 線形層の実行 |
-|--------|----------------|--------------|
-| **`build.no-fp4`** | CPU 逆量子化 → **FP16** → VRAM（ROCm 版と同趣旨） | FP16 GEMV カーネル |
-| **`build.fp4`**（Blackwell） | 線形層（Q/K/V/O、gate/up/down、LM head）を **NVFP4 キャッシュ**へ変換（**`fp4_qwen3_weight_from_f16_host`**）。**`token_embd`** は FP16 のまま VRAM | **`fp4_qwen3_mm`**（M=1 は FP4 GEMV、長い Prefill バッチは M≥128 で Tensor Core GEMM） |
+| ビルド | ロード時の重み | 線形層 / KV キャッシュの実行 |
+|--------|----------------|------------------------------|
+| **`build.no-fp4`** | CPU 逆量子化 → **FP16** → VRAM（ROCm 版と同趣旨） | FP16 GEMV カーネル。KV は **F32** |
+| **`build.fp4`**（Blackwell） | H2D 時に線形層を **NVFP4 キャッシュのみ** VRAM へ。**`token_embd`** のみ FP16 | **`fp4_qwen3_mm`** — decode / 短 Prefill は **FP4 GEMV**、長 Prefill は CUTLASS GEMM |
+| **`build.polarquant`** | 線形は FP16（`build.no-fp4` 同趣旨） | KV は **PolarQuant-R**（64 B/head）。Attention タイル読み出し時に F32 復号 |
 
-**Blackwell（sm_120 系）** 向け **`build.fp4`** は CUTLASS **NVFP4** を使います。Ampere/Ada 等では **`build.no-fp4` / `make run.no-fp4`** のみを想定してください。
+**Blackwell（sm_120 系）** 向け **`build.fp4`** は CUTLASS **NVFP4** を使います。Ampere/Ada 等では **`build.no-fp4` / `make run.no-fp4`** のみを想定してください。**PolarQuant-R** は [arxiv:2502.02617](https://arxiv.org/abs/2502.02617) に基づく KV 圧縮で、**`head_dim=128` 固定**（Qwen3-VL-8B 向け）。F32 KV 比 **約 8×** の VRAM 削減（36 layer × 512 seq で ~144 MiB → ~18 MiB 概算）。
 
 ### ビルド（FP16 のみ・汎用 GPU）
 
@@ -375,9 +380,25 @@ make build.fp4        # sm_120a + BONSAI_FP4=1 + FA_BR=32
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-起動ログに **`Uploading weights to device (dequant -> NVFP4 linear layers)...`** と **`GPU: FP4 Tensor Core path enabled`** が出れば FP4 経路が有効です。
+起動ログに **`Uploading weights to device (dequant -> NVFP4 linear layers)...`** と **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`** が出れば FP4 経路が有効です。
 
 **注意**: `gpu-cuda/Makefile` の **既定ターゲットは `run` → `build.fp4`** です。Blackwell 以外の GPU では **`make run.no-fp4`** を使ってください。
+
+### ビルド（PolarQuant-R KV キャッシュ）
+
+線形重みは FP16 のまま、KV キャッシュだけ PolarQuant-R で圧縮します（Blackwell 不要）。
+
+```bash
+cd qwen3-8b/gpu-cuda
+make build.polarquant
+make pq-test    # エンコード→復号のラウンドトリップ検証
+```
+
+起動ログに **`PolarQuant-R: KV cache enabled (64 B/head, ~8x vs F32)`** が出れば有効です。NVFP4 と併用する場合:
+
+```bash
+make build BONSAI_FP4=1 BONSAI_POLARQUANT=1
+```
 
 ### 実行（バイナリを直接）
 
@@ -633,8 +654,8 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 5. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
-6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu` / `fp4_gemm.cu`  
-   CUDA 版の Prefill／Decode、FP16 GEMV、Flash Attention、ロード時 NVFP4 量化と **`fp4_qwen3_mm`**。
+6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `polarquant.cu`  
+   CUDA 版の Prefill／Decode、Flash Attention。**`build.no-fp4`**: FP16 GEMV。**`build.fp4`**: H2D 時 NVFP4 ロード、**`fp4_gemv_cached`**（decode）と **`fp4_qwen3_mm`**（GEMM/GEMV 分岐）。**`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。
 
 7. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
@@ -653,6 +674,6 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 ## 詳細ドキュメント
 
 - 設計仕様: `doc/design.md`
-- 変更履歴: `doc/ChangeLog`
+- 変更履歴: `doc/ChangeLog.md`
 
 困ったときは、まず `qwen3-8b/Makefile` のターゲット名と、実行時に渡しているモデルパスを確認してください。ビルドと実行の大半の問題は、この 2 つの不一致から起きます。
