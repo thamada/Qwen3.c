@@ -4,6 +4,18 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 21:19:33
+
+- **doc**: PolarQuant-R（KV キャッシュ圧縮）の実装説明を追加 — `doc/design.md` にアルゴリズム・VRAM 削減・Flash Attention 統合・ビルド手順、`README.md` / `README.en.md` に `build.polarquant` / `pq-test`、ファイル表に `polarquant.*` を追記。
+
+## 2026-05-21 21:16:24
+
+**`doc/design.md`**: **`build.fp4`** のロード／実行フロー（H2D 時 **NVFP4** 化、線形 **FP16 VRAM なし**、**`fp4_gemv_cached`** による decode、M≥128 の CUTLASS GEMM）を **「実行時の挙動」** と **「CUDA NVFP4 実装メモ」** に整理。VRAM 目安・decode 低速のトラブルシュート行を追記。
+
+**`README.md`**・**`README.en.md`**: 起動ログ文言（**`GEMM M>=128, GEMV decode`**）、実行経路表・読み方ガイドを現行実装に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-21 21:04:42
 
 **`doc/ChangeLog`** を **`doc/ChangeLog.md`** にリネーム。**`README.md`**・**`README.en.md`**・**`doc/design.md`** のパス表記を追随。

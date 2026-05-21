@@ -21,6 +21,11 @@
  * still under investigation. Decode uses fast FP16 GEMV (M=1). */
 #endif
 
+#ifdef BONSAI_POLARQUANT
+#include "polarquant.h"
+#include "polarquant_kernels.cuh"
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -64,6 +69,95 @@ static __device__ float fa_sh_reduce_sum(float val, float *red_sh)
  * Flash Attention の online softmax。K/V タイルを shared に staging してから QK^T / PV。
  * grid: n_heads blocks, block: FA_HD threads。
  */
+#ifdef BONSAI_POLARQUANT
+static __global__ void flash_attn_gqa_pq_kernel(float *xb, const float *q,
+    const PQBlock *kc_pq, const PQBlock *vc_pq, const PQState *pq_st,
+    int npos, int n_heads, int hd, int n_kv, int kv_mul, float scale)
+{
+    int h = blockIdx.x;
+    if (h >= n_heads || hd > FA_HD || !pq_st) return;
+
+    int kvh = h / kv_mul;
+    const float *qh = q + (size_t)h * hd;
+    const PQBlock *kbase = kc_pq + (size_t)kvh * PQ_NBLK;
+    const PQBlock *vbase = vc_pq + (size_t)kvh * PQ_NBLK;
+    float *oh = xb + (size_t)h * hd;
+
+    __shared__ float k_tile[FA_BR][FA_HD];
+    __shared__ float v_tile[FA_BR][FA_HD];
+    __shared__ float q_sh[FA_HD];
+    __shared__ float o_sh[FA_HD];
+    __shared__ float scores[FA_BR];
+    __shared__ float red_sh[FA_HD];
+
+    if (threadIdx.x < hd) {
+        q_sh[threadIdx.x] = qh[threadIdx.x];
+        o_sh[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t0 = 0; t0 < npos; t0 += FA_BR) {
+        int tc = npos - t0;
+        if (tc > FA_BR) tc = FA_BR;
+
+        for (int j = 0; j < tc; j++) {
+            if (threadIdx.x == 0) {
+                pq_decode_head(pq_st,
+                    kbase + (size_t)(t0 + j) * n_kv * PQ_NBLK,
+                    k_tile[j]);
+                pq_decode_head(pq_st,
+                    vbase + (size_t)(t0 + j) * n_kv * PQ_NBLK,
+                    v_tile[j]);
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x < tc) {
+            float s = 0.0f;
+            for (int d = 0; d < hd; d++)
+                s += q_sh[d] * k_tile[threadIdx.x][d];
+            scores[threadIdx.x] = s * scale;
+        }
+        __syncthreads();
+
+        float m_tile = fa_sh_reduce_max(
+            (threadIdx.x < tc) ? scores[threadIdx.x] : -1e30f, red_sh);
+        __syncthreads();
+
+        float m_new = fmaxf(m, m_tile);
+        float alpha = (m > -1e29f) ? expf(m - m_new) : 0.0f;
+
+        if (threadIdx.x < hd)
+            o_sh[threadIdx.x] *= alpha;
+
+        if (threadIdx.x < tc)
+            scores[threadIdx.x] = expf(scores[threadIdx.x] - m_new);
+        __syncthreads();
+
+        float l_tile = fa_sh_reduce_sum(
+            (threadIdx.x < tc) ? scores[threadIdx.x] : 0.0f, red_sh);
+        __syncthreads();
+
+        if (threadIdx.x < hd) {
+            float acc = 0.0f;
+            for (int j = 0; j < tc; j++)
+                acc += scores[j] * v_tile[j][threadIdx.x];
+            o_sh[threadIdx.x] += acc;
+        }
+        __syncthreads();
+
+        l = l * alpha + l_tile;
+        m = m_new;
+    }
+
+    if (threadIdx.x < hd)
+        oh[threadIdx.x] = o_sh[threadIdx.x] / l;
+}
+#endif
+
 static __global__ void flash_attn_gqa_kernel(float *xb, const float *q,
     const float *kc, const float *vc, int npos, int n_heads, int hd,
     int kv_dim, int kv_mul, float scale)
@@ -152,6 +246,98 @@ static __global__ void flash_attn_gqa_kernel(float *xb, const float *q,
  * Prefill Attention — 各プロンプト位置 t を block (t, head) で並列。
  * 因果マスク: 位置 t は K/V の 0..t のみ参照（npos = t + 1）。
  */
+#ifdef BONSAI_POLARQUANT
+static __global__ void flash_attn_prefill_gqa_pq_kernel(float *xb, const float *q,
+    const PQBlock *kc_pq, const PQBlock *vc_pq, const PQState *pq_st,
+    int n_tokens, int n_heads, int hd, int n_kv, int kv_mul, float scale)
+{
+    int bt = blockIdx.x;
+    int t = bt / n_heads;
+    int h = bt % n_heads;
+    if (t >= n_tokens || h >= n_heads || hd > FA_HD || !pq_st) return;
+
+    const int npos = t + 1;
+    int kvh = h / kv_mul;
+    const float *qh = q + ((size_t)t * n_heads + h) * hd;
+    const PQBlock *kbase = kc_pq + (size_t)kvh * PQ_NBLK;
+    const PQBlock *vbase = vc_pq + (size_t)kvh * PQ_NBLK;
+    float *oh = xb + ((size_t)t * n_heads + h) * hd;
+
+    __shared__ float k_tile[FA_BR][FA_HD];
+    __shared__ float v_tile[FA_BR][FA_HD];
+    __shared__ float q_sh[FA_HD];
+    __shared__ float o_sh[FA_HD];
+    __shared__ float scores[FA_BR];
+    __shared__ float red_sh[FA_HD];
+
+    if (threadIdx.x < hd) {
+        q_sh[threadIdx.x] = qh[threadIdx.x];
+        o_sh[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t0 = 0; t0 < npos; t0 += FA_BR) {
+        int tc = npos - t0;
+        if (tc > FA_BR) tc = FA_BR;
+
+        for (int j = 0; j < tc; j++) {
+            if (threadIdx.x == 0) {
+                pq_decode_head(pq_st,
+                    kbase + (size_t)(t0 + j) * n_kv * PQ_NBLK,
+                    k_tile[j]);
+                pq_decode_head(pq_st,
+                    vbase + (size_t)(t0 + j) * n_kv * PQ_NBLK,
+                    v_tile[j]);
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x < tc) {
+            float s = 0.0f;
+            for (int d = 0; d < hd; d++)
+                s += q_sh[d] * k_tile[threadIdx.x][d];
+            scores[threadIdx.x] = s * scale;
+        }
+        __syncthreads();
+
+        float m_tile = fa_sh_reduce_max(
+            (threadIdx.x < tc) ? scores[threadIdx.x] : -1e30f, red_sh);
+        __syncthreads();
+
+        float m_new = fmaxf(m, m_tile);
+        float alpha = (m > -1e29f) ? expf(m - m_new) : 0.0f;
+
+        if (threadIdx.x < hd)
+            o_sh[threadIdx.x] *= alpha;
+
+        if (threadIdx.x < tc)
+            scores[threadIdx.x] = expf(scores[threadIdx.x] - m_new);
+        __syncthreads();
+
+        float l_tile = fa_sh_reduce_sum(
+            (threadIdx.x < tc) ? scores[threadIdx.x] : 0.0f, red_sh);
+        __syncthreads();
+
+        if (threadIdx.x < hd) {
+            float acc = 0.0f;
+            for (int j = 0; j < tc; j++)
+                acc += scores[j] * v_tile[j][threadIdx.x];
+            o_sh[threadIdx.x] += acc;
+        }
+        __syncthreads();
+
+        l = l * alpha + l_tile;
+        m = m_new;
+    }
+
+    if (threadIdx.x < hd)
+        oh[threadIdx.x] = o_sh[threadIdx.x] / l;
+}
+#endif
+
 static __global__ void flash_attn_prefill_gqa_kernel(float *xb, const float *q,
     const float *kc, const float *vc, int n_tokens, int n_heads, int hd,
     int kv_dim, int kv_mul, float scale)
@@ -558,6 +744,10 @@ struct GpuModel {
     float *x, *xb, *xb2, *hb, *hb2;
     float *q, *k, *v, *logits;
     float *kc, *vc;
+#ifdef BONSAI_POLARQUANT
+    PQBlock *kc_pq, *vc_pq;
+    int use_polarquant;
+#endif
 
     float *x_batch, *xb_batch, *xb2_batch;
     float *q_batch, *k_batch, *v_batch;
@@ -750,8 +940,20 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
     CUDA_CHECK(cudaMalloc(&gm->k,      (size_t)kv_dim * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&gm->v,      (size_t)kv_dim * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&gm->logits, (size_t)vocab * sizeof(float)));
+#ifdef BONSAI_POLARQUANT
+    if (polarquant_init(cfg->head_dim) != 0) {
+        fprintf(stderr, "PolarQuant init failed\n");
+        exit(1);
+    }
+    gm->kc_pq = (PQBlock *)polarquant_kv_cache_alloc(L, max_seq, cfg->n_kv_heads);
+    gm->vc_pq = (PQBlock *)polarquant_kv_cache_alloc(L, max_seq, cfg->n_kv_heads);
+    gm->kc = NULL;
+    gm->vc = NULL;
+    gm->use_polarquant = 1;
+#else
     CUDA_CHECK(cudaMalloc(&gm->kc,     (size_t)L * max_seq * kv_dim * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&gm->vc,     (size_t)L * max_seq * kv_dim * sizeof(float)));
+#endif
 
     gm->batch_cap = max_seq;
     {
@@ -809,7 +1011,17 @@ void gpu_model_destroy(GpuModel *gm)
     cudaFree(gm->hb); cudaFree(gm->hb2);
     cudaFree(gm->q); cudaFree(gm->k); cudaFree(gm->v);
     cudaFree(gm->logits);
-    cudaFree(gm->kc); cudaFree(gm->vc);
+#ifdef BONSAI_POLARQUANT
+    if (gm->use_polarquant) {
+        polarquant_kv_cache_free(gm->kc_pq);
+        polarquant_kv_cache_free(gm->vc_pq);
+        polarquant_shutdown();
+    } else
+#endif
+    {
+        cudaFree(gm->kc);
+        cudaFree(gm->vc);
+    }
     cudaFree(gm->x_batch);
     cudaFree(gm->xb_batch);
     cudaFree(gm->xb2_batch);
@@ -878,6 +1090,18 @@ void gpu_forward(GpuModel *gm, int token, int pos)
             rope_kernel<<<(pairs + 255) / 256, 256>>>(gm->k, n_kv, hd, pos, c->rope_theta);
         }
 
+#ifdef BONSAI_POLARQUANT
+        size_t loff = (size_t)l * max_seq * c->n_kv_heads * PQ_NBLK;
+        PQBlock *kc_pos = gm->kc_pq + loff + (size_t)pos * c->n_kv_heads * PQ_NBLK;
+        PQBlock *vc_pos = gm->vc_pq + loff + (size_t)pos * c->n_kv_heads * PQ_NBLK;
+        polarquant_kv_write_one(kc_pos, gm->k, kv_dim);
+        polarquant_kv_write_one(vc_pos, gm->v, kv_dim);
+
+        flash_attn_gqa_pq_kernel<<<n_heads, FA_HD>>>(
+            gm->xb, gm->q, gm->kc_pq + loff, gm->vc_pq + loff,
+            (const PQState *)polarquant_device_state(),
+            npos, n_heads, hd, c->n_kv_heads, kv_mul, scale);
+#else
         size_t loff = (size_t)l * max_seq * kv_dim;
         float *kc_pos = gm->kc + loff + (size_t)pos * kv_dim;
         float *vc_pos = gm->vc + loff + (size_t)pos * kv_dim;
@@ -887,6 +1111,7 @@ void gpu_forward(GpuModel *gm, int token, int pos)
         flash_attn_gqa_kernel<<<n_heads, FA_HD>>>(
             gm->xb, gm->q, gm->kc + loff, gm->vc + loff,
             npos, n_heads, hd, kv_dim, kv_mul, scale);
+#endif
 
         gpu_mm(gm->xb2, gm->xb, &gm->wo, l, dim, dim, wt, 1);
         add_kernel<<<(dim + 255) / 256, 256>>>(gm->x, gm->xb2, dim);
@@ -955,6 +1180,18 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
                 gm->k_batch, n_kv, hd, c->rope_theta, n_tokens);
         }
 
+#ifdef BONSAI_POLARQUANT
+        size_t loff = (size_t)l * max_seq * c->n_kv_heads * PQ_NBLK;
+        PQBlock *kc_pos = gm->kc_pq + loff;
+        PQBlock *vc_pos = gm->vc_pq + loff;
+        polarquant_kv_write_batch(kc_pos, gm->k_batch, kv_dim, n_tokens);
+        polarquant_kv_write_batch(vc_pos, gm->v_batch, kv_dim, n_tokens);
+
+        flash_attn_prefill_gqa_pq_kernel<<<n_tokens * n_heads, FA_HD>>>(
+            gm->xb_batch, gm->q_batch, kc_pos, vc_pos,
+            (const PQState *)polarquant_device_state(),
+            n_tokens, n_heads, hd, c->n_kv_heads, kv_mul, scale);
+#else
         size_t loff = (size_t)l * max_seq * kv_dim;
         kv_write_batch_kernel<<<n_tokens, 256>>>(
             gm->kc + loff, gm->k_batch, kv_dim, n_tokens);
@@ -964,6 +1201,7 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
         flash_attn_prefill_gqa_kernel<<<n_tokens * n_heads, FA_HD>>>(
             gm->xb_batch, gm->q_batch, gm->kc + loff, gm->vc + loff,
             n_tokens, n_heads, hd, kv_dim, kv_mul, scale);
+#endif
 
         gpu_mm_batch(gm->xb2_batch, gm->xb_batch, &gm->wo, l, dim, dim, wt, n_tokens);
         add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
