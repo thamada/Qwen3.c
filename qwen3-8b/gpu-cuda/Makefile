@@ -71,8 +71,10 @@ endif
 
 # BONSAI_FP4 / FA_BR / BONSAI_POLARQUANT が変わったら kernels を必ず再コンパイル
 KERNELS_OBJ := kernels.bfp4$(BONSAI_FP4).fabr$(FA_BR_VAL).pq$(BONSAI_POLARQUANT).o
+MAIN_OBJ    := main.bfp4$(BONSAI_FP4).pq$(BONSAI_POLARQUANT).o
 
-.PHONY: build build.fp4 build.polarquant run run.no-fp4 clean blackwell cutlass fp4-test pq-test
+.PHONY: build build.fp4 build.polarquant build.fp4.polarquant \
+        run run.no-fp4 run.fp4.polarquant clean blackwell cutlass fp4-test pq-test
 
 fp4-test: fp4_gemm.o | cutlass
 	$(NVCC) $(NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu fp4_gemm.o $(LDFLAGS)
@@ -80,8 +82,8 @@ fp4-test: fp4_gemm.o | cutlass
 
 .DEFAULT_GOAL := run
 
-build: main.o $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o qwen3-gpu-cuda main.o $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS) $(LDFLAGS)
+build: $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o qwen3-gpu-cuda $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS) $(LDFLAGS)
 
 build.fp4: cutlass
 	$(MAKE) build CUDA_GENCODE="$(BLACKWELL_GENCODE)" FA_BR="$(BLACKWELL_FA_BR)" BONSAI_FP4=1
@@ -89,11 +91,16 @@ build.fp4: cutlass
 build.polarquant:
 	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_POLARQUANT=1
 
-build.no-fp4:
-	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_FP4=0
+# Blackwell NVFP4 線形 + PolarQuant-R KV（最大 VRAM 節約）
+build.fp4.polarquant: cutlass
+	$(MAKE) build CUDA_GENCODE="$(BLACKWELL_GENCODE)" FA_BR="$(BLACKWELL_FA_BR)" \
+		BONSAI_FP4=1 BONSAI_POLARQUANT=1
 
-main.o: main.c gpu.h fp4_qwen3.h
-	$(CC) $(CFLAGS) $(FP4_FLAG) -c main.c -o main.o
+build.no-fp4:
+	$(MAKE) build CUDA_GENCODE="$(CUDA_GENCODE)" BONSAI_FP4=0 BONSAI_POLARQUANT=0
+
+$(MAIN_OBJ): main.c gpu.h fp4_qwen3.h polarquant.h
+	$(CC) $(CFLAGS) $(FP4_FLAG) $(PQ_FLAG) -c main.c -o $@
 
 $(KERNELS_OBJ): kernels.cu gpu.h fp4_qwen3.h polarquant.h
 	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) $(PQ_FLAG) -c kernels.cu -o $@
@@ -122,8 +129,12 @@ cutlass:
 run.no-fp4: build.no-fp4
 	./qwen3-gpu-cuda "$(MODEL)" -p "$(PROMPT)"
 
+run.fp4.polarquant: build.fp4.polarquant
+	./qwen3-gpu-cuda "$(MODEL)" -p "$(PROMPT)"
+
 clean:
-	rm -f qwen3-gpu-cuda fp4_verify polarquant_verify main.o kernels.*.o fp4_gemm.o fp4_qwen3.o polarquant.o
+	rm -f qwen3-gpu-cuda fp4_verify polarquant_verify \
+	      main.o main.bfp4*.o kernels.*.o fp4_gemm.o fp4_qwen3.o polarquant.o
 
 # apt CUDA 11 を削除 → NVIDIA 公式 CUDA 13 をインストール → Blackwell FP4 ビルド
 blackwell:
