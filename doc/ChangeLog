@@ -4,6 +4,20 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 17:44:31
+
+**`README.md`**・**`README.en.md`**: **`gpu-cuda/`**（CUDA ビルド・実行・要件）を追記。実行経路表・ディレクトリツリー・モデル取得（**`make model`**）を更新。集約 Makefile のターゲット名に追随（**`build.cpu`**・**`build.cpu-multicore`**・**`build.xdna2-bfp16`** 等）。CUDA のトラブルシュート・**`make clean`** 注記を追加。
+
+**`doc/ChangeLog`**: 本エントリ。
+
+## 2026-05-21 17:42:28
+
+**`qwen3-8b/gpu-cuda/`**: NVIDIA **CUDA** 向けテキストデコーダ推論を追加（**`main.c`**・**`kernels.cu`**・**`gpu.h`**）。ロード時に CPU で逆量子化 → **FP16** → VRAM、**Prefill** は **`gpu_forward_prefill`**（プロンプト全トークン並列）、**Decode** は 1 トークン **`gpu_forward`**。線形層は **FP16 GEMV**、Attention は **Flash Attention**（GQA・`head_dim=128`）。サンプリングは logits の **D2H** 後に CPU。出力バイナリは **`qwen3-gpu-cuda`**（当ディレクトリの **`Makefile`** で **`make build` / `make run`**）。既定 **`CUDA_GENCODE`** は PTX **`compute_86`**（JIT 対応）。**Blackwell**（RTX 50 系等）向けに **`make blackwell`**（apt CUDA 11 除去 → CUDA 13 導入 → **CUTLASS** `third_party/cutlass` 取得 → **`BONSAI_FP4=1`**・**`sm_120a`**・**`FA_BR=32`**）を用意。集約 **`qwen3-8b/Makefile`** には未統合（**`build.gpu-cuda`** なし）。
+
+**`doc/design.md`**: 概要・実装バリアント表・ディレクトリ表・ビルド／実行（CUDA 節）・実行時挙動・トラブルシューティングに **`gpu-cuda/`** を追記。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-21 16:50:16
 
 **`qwen3-8b/gpu/`** を **`qwen3-8b/gpu-rocm/`** にリネーム（**`main.c`**・**`Makefile`** を移動）。集約 **`qwen3-8b/Makefile`** の **`build.gpu` / `run.gpu`** を **`build.gpu-rocm` / `run.gpu-rocm`** に変更し、実行パスを **`gpu-rocm/qwen3-rocm`** に更新。**`clean`** の対象ディレクトリも **`gpu-rocm`** に追随。

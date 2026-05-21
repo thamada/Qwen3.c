@@ -6,7 +6,7 @@
 
 ### リポジトリの目的とスコープ
 
-本リポジトリは、**Qwen3 系（Qwen3-VL-8B-Instruct）** の **GGUF** 形式モデルを、**単一または少数の C/HIP ソースファイル**からビルド可能な形で **推論（テキスト生成）**するエンジンである。**PyTorch・TensorFlow・JAX・ONNX Runtime など、機械学習向けのユーザランドライブラリ／ランタイムにはリンクしない。** コアは **標準 C と `libm`**。GPU 版は **ROCm/HIP**（コンパイラ・ランタイムでありニューラルネット用の高レベルフレームワークではない）、CPU 並列は **OpenMP**、XDNA2 NPU 版は **`amdxdna` DRM ioctl（UAPI）** を直接利用する。Python ランタイムや `torch` に依存する層は置かない。**GGUF の読み取り・トークナイズ・Transformer フォワード・サンプリング**を一連のコードパスとして理解・改変しやすくすることを目的とする。学習・ファインチューニング・バッチ推論の最適化はスコープ外であり、主に **対話形式のインタラクティブ生成**（プロンプト＋続きの生成）を想定する。
+本リポジトリは、**Qwen3 系（Qwen3-VL-8B-Instruct）** の **GGUF** 形式モデルを、**単一または少数の C／HIP／CUDA ソースファイル**からビルド可能な形で **推論（テキスト生成）**するエンジンである。**PyTorch・TensorFlow・JAX・ONNX Runtime など、機械学習向けのユーザランドライブラリ／ランタイムにはリンクしない。** コアは **標準 C と `libm`**。AMD GPU 版は **ROCm/HIP**（コンパイラ・ランタイムでありニューラルネット用の高レベルフレームワークではない）、NVIDIA GPU 版は **CUDA Toolkit / `nvcc`**（同様に低レベル）、CPU 並列は **OpenMP**、XDNA2 NPU 版は **`amdxdna` DRM ioctl（UAPI）** を直接利用する。Python ランタイムや `torch` に依存する層は置かない。**GGUF の読み取り・トークナイズ・Transformer フォワード・サンプリング**を一連のコードパスとして理解・改変しやすくすることを目的とする。学習・ファインチューニング・バッチ推論の最適化はスコープ外であり、主に **対話形式のインタラクティブ生成**（プロンプト＋続きの生成）を想定する。
 
 #### ライブラリ非依存とその意義
 
@@ -19,7 +19,7 @@
 
 **最高性能や機能網羅を第一目的とはしない。** 主眼は、LLM 推論をブラックボックスにせず、実装の細部を把握したうえで改造できることである。利用者向けの入口説明は **`README.md`**（日本語）および **`README.en.md`**（英語）に詳しい。
 
-文中の「decoder-only」「GQA」「FlashAttention 系デコードカーネル」等は、**Transformer デコーダの一般的なパターン**を指す。**推論ソースはすべて `qwen3-8b/` 配下であり、実行経路ごとに `cpu/`・`cpu-multicore/`・`gpu-rocm/`・`xdna2/`・`xdna2-bfp16/` の各ディレクトリに **`main.c` を置いた単一ソース構成**とする。** 対象例は **Qwen3-VL-8B-Instruct** の **IQ2_S / IQ3_S 等が混在した GGUF**（例: `Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`）。**Vision（画像エンコード・deepstack・画像トークン）は実装しない**。**テキスト用デコーダのみ**を実行する。
+文中の「decoder-only」「GQA」「FlashAttention 系デコードカーネル」等は、**Transformer デコーダの一般的なパターン**を指す。**推論ソースはすべて `qwen3-8b/` 配下であり、実行経路ごとに `cpu/`・`cpu-multicore/`・`gpu-rocm/`・`gpu-cuda/`・`xdna2/`・`xdna2-bfp16/` の各ディレクトリに **`main.c`（CUDA 版は **`kernels.cu`** 併用）を置いた単一ソース構成**とする。** 対象例は **Qwen3-VL-8B-Instruct** の **IQ2_S / IQ3_S 等が混在した GGUF**（例: `Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`）。**Vision（画像エンコード・deepstack・画像トークン）は実装しない**。**テキスト用デコーダのみ**を実行する。
 
 ### 実装バリアント（本リポジトリに含まれるもの）
 
@@ -27,7 +27,8 @@
 |--------|----------|------|
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
-| `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定エントリ**。 |
+| `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定 AMD GPU エントリ**。 |
+| `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA** | ROCm 版と同趣旨：**CPU 逆量子化 → FP16 VRAM**、**Prefill バッチ**（`gpu_forward_prefill`）＋ **Decode 1 トークン**（`gpu_forward`）。**FP16 GEMV**・**Flash Attention**（GQA、`FA_BR`/`FA_HD`）。サンプリングは **logits D2H 後 CPU**。集約 Makefile 外。**`cd gpu-cuda && make build`** で **`qwen3-gpu-cuda`**。任意で **`BONSAI_FP4`**（CUTLASS・Blackwell **`make blackwell`**）。 |
 | `qwen3-8b/xdna2/main.c` | **AMD Ryzen AI NPU (XDNA2)** | **CPU OpenMP 版と同様**に線形ウェイトは **GGUF mmap 上の量子化形式を参照**。埋め込みは行単位ブロック復号。各 **GEMV ごとに**当該重み行列を **`AMDXDNA_BO_SHMEM` の単一 BF16 スクラッチ**へ展開して NPU が DMA、`scratch_f32` でデ量子化～BF16 を兼用。rmsnorm などの小型 F32 も mmap 指す。`DRM ioctl` と **`ERT_START_NPU`** 経路、`/dev/accel/accelN` 不可／制御コード未配置時の **OpenMP BF16 CPU フォールバック（NPU と bit-identical）**は従来どおり。XRT 不要・UAPI inline 持ち運びは不変。**スクラッチサイズはテキスト経路 GEMV に必要な最大要素数のみ**（パーサ済み名前走査、`TensorInfo` は推論前に開放しうる）。**起動時レポートと `--xdna-status` / `-X`** で各形状の **`bf16-gemv-<n>x<d>.bin`** 可否・推論後の NPU/CPU GEMV カウンタを確認できる。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **AMD Ryzen AI NPU (XDNA2) + BFPX ホスト重み** | **`qwen3-8b/xdna2/main.c` と同一の DRM ioctl** および **チャンク BF16 GEMV（NPU 経路の枠組み）** を共有する。**密行列レイアウト**の重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 係数、ブロック長 64）** に変換しホストのみ保持し、GGUF mmap は変換完了後に解放する。**論理形状は OpenMP CPU 版（`cpu-multicore/main.c`）の `mm(..., n_in, n_out)` と一致**させ、`[n_in,n_out]` 型の GGUF 転置は **`bfpx_convert_weight_2d`** で吸収。量子化に加えブロック近似のため、**GEMV で逐次 BF16 に展開する mmap スクラッチ方式（`xdna2/main.c`）と同一ビットでの一致は期待できず**、品質が劣ることがある。NPU 不可時の CPU は **`mm_bfpx`** が単精度浮動小数点数の活性と BFPX 形式の重みの積を計算する。 |
 
@@ -41,7 +42,11 @@
 | `README.en.md` | 同上（英語）。 |
 | `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.cpu-multicore`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
-| `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（既定の HIP ビルド対象）。 |
+| `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。 |
+| `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
+| `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。変数 **`CUDA_HOME`**・**`CUDA_GENCODE`**（既定 PTX `compute_86`）。**`make blackwell`** は CUDA 13 導入＋CUTLASS 取得＋**`BONSAI_FP4=1`**・**`sm_120a`**。 |
+| `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等の CUDA カーネル。 |
+| `qwen3-8b/gpu-cuda/third_party/cutlass/` | **`make cutlass` / `make blackwell`** で clone される CUTLASS（**`BONSAI_FP4`** 時のみリンク）。リポジトリ同梱ではない。 |
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **`xdna2/main.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
 | `qwen3-8b/Makefile` | **`model`**（**`gguf.txt`** の URL を **`wget`** で取得し **`$(MODEL).sha256sum`** で検証。失敗時は破損ファイルを削除）、**`build.<サブディレクトリ名>` / `run.<サブディレクトリ名>`**（例: **`build.cpu`**・**`build.gpu-rocm`**）、**`clean` / `gen-xdna-kernels`** を **`cpu/`** ほか各サブディレクトリの **`Makefile`** に委譲。 |
@@ -67,6 +72,7 @@
 | `build.cpu` / `run.cpu` | `cpu/qwen3-cpu` | `cpu/main.c` |
 | `build.cpu-multicore` / `run.cpu-multicore` | `cpu-multicore/qwen3-cpu-omp` | `cpu-multicore/main.c`（`-fopenmp`、`OMP_NUM_THREADS`） |
 | `build.gpu-rocm` / `run.gpu-rocm` | `gpu-rocm/qwen3-rocm` | `gpu-rocm/main.c` |
+| （集約 Makefile なし）`gpu-cuda/Makefile` の **`build` / `run`** | `gpu-cuda/qwen3-gpu-cuda` | `gpu-cuda/main.c` + `kernels.cu`（**`nvcc`**・**`libcudart`**。Blackwell FP4 時は CUTLASS オブジェクト追加） |
 | `build.xdna2` / `run.xdna2` | `xdna2/qwen3-xdna2` | `xdna2/main.c`（`-fopenmp`。`amdxdna` カーネルモジュールが `/dev/accel/accelN` を提供） |
 | **`gen-xdna-kernels`** | （出力なし） | `qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py` で **`qwen3-8b/xdna2/xdna-gemv/kernels/bf16-gemv-*.bin`** プレースホルダを再生成 |
 | **`build.xdna2-bfp16` / `run.xdna2-bfp16`** | **`xdna2-bfp16/qwen3-xdna2-bfpx`** | **`xdna2-bfp16/main.c`**（`-fopenmp`。NPU 経路・環境変数は `qwen3-xdna2` と同種。ホスト重みは BFPX） |
@@ -77,13 +83,14 @@ make model                   # 既定 GGUF を gguf.txt から取得し .sha256s
 make build.cpu
 make build.cpu-multicore
 make build.gpu-rocm               # hipcc・ROCm 必須
+cd gpu-cuda && make build    # nvcc・CUDA Toolkit（集約 Makefile 未登録）
 make build.xdna2             # Linux >= 6.10 + amdxdna カーネルモジュール（XRT 不要）
 make gen-xdna-kernels        # xdna2/xdna-gemv/kernels に bf16-gemv-* プレースホルダ生成（実 NPU ctrlcode ではない）
 make build.xdna2-bfp16       # 同上 + BFPX ホスト重み版バイナリ
 OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp "$(MODEL)" -p "Hello" -n 4
 ```
 
-**CPU（IQ 混在 8B）**はブロック単位デ量子化のため **非常に遅くなり得る**。実用スループットは **ROCm 版**を優先する想定である。
+**CPU（IQ 混在 8B）**はブロック単位デ量子化のため **非常に遅くなり得る**。実用スループットは **ROCm 版**（AMD GPU）または **`gpu-cuda`**（NVIDIA GPU）を優先する想定である。
 
 ## ビルドと実行
 
@@ -125,6 +132,32 @@ make build.gpu-rocm GPU_ARCH=gfx1201
 make run.gpu-rocm PROMPT="Hello"
 ```
 
+### CUDA（NVIDIA GPU）
+
+集約 **`qwen3-8b/Makefile`** には **`build.gpu-cuda`** が無い。**`qwen3-8b/gpu-cuda/`** で単体ビルドする。
+
+```bash
+cd qwen3-8b/gpu-cuda
+make build                              # 既定 CUDA_GENCODE=arch=compute_86,code=compute_86（PTX）
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+# 実 GPU アーキテクチャを直接指定する例:
+make build CUDA_GENCODE=arch=compute_89,code=sm_89
+# Blackwell（RTX 50 系等）: CUDA 13 + CUTLASS + NVFP4（要 root で apt 操作）
+make blackwell
+make run.no-fp4 MODEL=../model.gguf     # FP4 無しで実行
+```
+
+| 変数 | 意味 | 既定例 |
+|------|------|--------|
+| `CUDA_HOME` | CUDA Toolkit ルート | `/usr/local/cuda` |
+| `NVCC` | CUDA コンパイラ | `$(CUDA_HOME)/bin/nvcc` |
+| `CUDA_GENCODE` | `-gencode` 引数 | `arch=compute_86,code=compute_86` |
+| `MODEL` | GGUF パス（gpu-cuda からの相対） | `../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf` |
+| `BONSAI_FP4` | Blackwell FP4 経路（CUTLASS） | `0`（`make blackwell` で `1`） |
+| `FA_BR` | Flash Attention の K/V タイル幅 | decode 既定 64；Blackwell ビルドは 32 |
+
+**`nvcc` / `nvlink` は `PATH` に CUDA の `bin` を通す**（`/usr/local/bin/nvcc` のみだとリンク失敗しうる）。apt の **`nvidia-cuda-toolkit`（CUDA 11 系）** と **CUDA 13 公式パッケージ**は併存させず、Blackwell では **`make blackwell`** が 11.x 除去後に 13 を入れる。
+
 ### XDNA2（AMD Ryzen AI NPU）
 
 ```bash
@@ -160,6 +193,8 @@ make build.xdna2-bfp16
 
 **ROCm（`qwen3-rocm`）**: ロード時に F16 重みを VRAM に配置。各ステップは **埋め込み〜全レイヤー〜LM ヘッド**を GPU 上で実行。教師強制区間では LM ヘッドを省略可能。**`0 < top-p < 1`** の nucleus は実装上 **logits 全語彙を D2H** して CPU で処理する場合がある（実装コメント参照）。それ以外は GPU で argmax / softmax＋多項サンプル等。
 
+**CUDA（`qwen3-gpu-cuda`）**: ロード方針は ROCm 版と同様（CPU 逆量子化 → FP16 → VRAM）。プロンプト区間は **`gpu_forward_prefill`** で全トークンをバッチ処理し、生成区間は **`gpu_forward`** で 1 トークンずつ。線形層・Attention・RoPE・残差等は **`kernels.cu`** 上のカーネル。**サンプリングはホスト**（logits を D2H）。起動時に prefill/decode のスループット要約を stderr に出す実装あり。**`BONSAI_FP4=1`** ビルド時は Blackwell 向け FP4 経路（CUTLASS）が有効化される（通常ビルドでは無効）。
+
 **XDNA2（`qwen3-xdna2`）**: 線形ウェイトは **mmap された GGUF** を **`main-omp.c` と同様**に参照する（埋め込みは mmap 上行の量子化レイアウトからブロック単位復号）。各 **GEMV** のたび、その行列だけを **`AMDXDNA_BO_SHMEM` に確保した単一 BF16 スクラッチ**へ CPU で復号・BF16 化し、`SYNC_BO` でデバイス可視にしたうえで、入力 BF16・重み・出力への `xdna_addr` を **`ERT_START_NPU`** で `DRM_IOCTL_AMDXDNA_EXEC_CMD` に渡す構成は従来どおり。**レイヤー分の恒久 BF16 重み BO は保持しない**。RMSNorm／Qwen3 ヘッド RMSNorm／Attention 等も **CPU**。NPU が使えないときは BF16 GEMV が **OpenMP** にフォールバックする（実装どおり bit-identical）。
 
 推論開始前に **`=== XDNA GEMV / NPU ctrlcode status ===`** ブロックを標準出力へ出し、`XDNA_FORCE_CPU`・DRM オープン可否・`XDNA_GEMV_DIR`・テキスト経路で使う **6 種類の GEMV 形状**それぞれについて `bf16-gemv-<n>x<d>.bin` を **`[ OK ]`（実 ctrlcode）／`[STUB]`（リポジトリ同梱プレースホルダ・マジック `GQF3XDNA`）／`MISS`** で表示する（実機でロードされるのは非 STUB のみ）。推論後は **NPU GEMV 回数／CPU GEMV 回数**に加え、**すべて NPU／すべて CPU／混在**を短文で表示する（実際に `EXEC_CMD` が成功したかはランタイムカウントが基準）。**`--xdna-status`** または **`-X`** は GGUF パースと `npu_open` のみ行い当該レポートを出力して **終了**する（重みロード・生成ループなし）。**`qwen3-8b/xdna2/xdna-gemv/kernels/`** の `.bin` プレースホルダの再生成はリポジトリルートで `python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels`、または `qwen3-8b` で `make gen-xdna-kernels`。
@@ -186,10 +221,10 @@ make build.xdna2-bfp16
 1. **GGUF と量子化形式の定義**: GGUF の値型、GGML tensor dtype、`QK_K=256` の K-quant / IQ ブロック構造を定義する。`BlockQ4_K`、`BlockQ5_K`、`BlockIQ2_S`、`BlockIQ3_S` は GGML の packed layout に合わせて `#pragma pack(push, 1)` で定義する。
 2. **IQ2_S / IQ3_S の復元テーブル**: `iq2s_grid`、`iq3s_grid` などを持ち、GGML 側の小さな格子表現を `float` に戻す。
 3. **モデル構造体**: `Config` がモデル形状、`TensorInfo` が GGUF 内 tensor descriptor、`Tok` が tokenizer、`Weights` / `WeightsDev` が重み、`State` が実行時バッファ、`Model` がそれらをまとめる。
-4. **ロード処理**: `mmap` した GGUF からメタデータと tensor descriptor を読み、CPU 版は tensor へのポインタを保持し、ROCm 版は重みを GPU にアップロードする。
-5. **推論処理**: 1 トークン単位の forward を繰り返し、プロンプト区間は teacher forcing、生成区間は logits から次トークンを選ぶ。
+4. **ロード処理**: `mmap` した GGUF からメタデータと tensor descriptor を読み、CPU 版は tensor へのポインタを保持し、ROCm / CUDA 版は重みを GPU にアップロードする。
+5. **推論処理**: 1 トークン単位の forward を繰り返し、プロンプト区間は teacher forcing、生成区間は logits から次トークンを選ぶ（CUDA 版はプロンプトを **Prefill バッチ**で先に処理）。
 
-この構成により、CPU 版は「GGUF の量子化重みをその場で読む参照実装」、ROCm 版は「同じモデル構造を GPU 常駐重みに変換して動かす実装」として対応づけられる。
+この構成により、CPU 版は「GGUF の量子化重みをその場で読む参照実装」、ROCm / CUDA 版は「同じモデル構造を GPU 常駐重みに変換して動かす実装」として対応づけられる。
 
 ### 主要データ構造
 
@@ -236,7 +271,7 @@ Tokenizer は `tokenizer.ggml.tokens`、`tokenizer.ggml.scores`、`tokenizer.ggm
 
 CPU 版は重み全体を float に展開しない。`mm_quant_rows` が出力行ごとに量子化 row を走査し、row 内の各 256 要素 block を stack 上の `float blk[QK_K]` に復元して、入力ベクトルとの内積に足し込む。これによりメモリ使用量は抑えられるが、同じ重みを毎 token で復元するため速度は遅い。
 
-ROCm 版はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、さらに F16 staging buffer に変換して GPU にアップロードする。norm tensor は F32 のまま GPU に置く。実行時の GEMV は `mm_f16_gemv_kernel` で FP16 重みを読み、accumulator は float で計算する。この方針はロード時間と VRAM 使用量を増やす代わりに、推論中の量子化復元を避けて GPU カーネルの種類を単純にする。
+ROCm 版および CUDA 版はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、さらに F16 staging buffer に変換して GPU にアップロードする。norm tensor は F32 のまま GPU に置く。実行時の GEMV は FP16 重みカーネル（ROCm: `mm_f16_gemv_kernel`、CUDA: 同名相当）で読み、accumulator は float で計算する。この方針はロード時間と VRAM 使用量を増やす代わりに、推論中の量子化復元を避けて GPU カーネルの種類を単純にする。
 
 ### トークナイザーと ChatML
 
@@ -272,9 +307,9 @@ CPU 版の forward は、すべて `float` の activation buffer 上で逐次実
 
 プロンプト消費中は次 token が既知なので、最後のプロンプト token 以外では LM head を省略できる。
 
-### ROCm forward
+### ROCm / CUDA forward（GPU）
 
-ROCm 版の `forward_gpu` は embedding から LM head まで device buffer 上で実行する。各カーネル起動の依存は default stream の順序に任せ、forward の最後に `hipDeviceSynchronize()` する。
+ROCm 版の `forward_gpu` および CUDA 版の `gpu_forward` / `gpu_forward_prefill` は、embedding から LM head まで device buffer 上で実行する（CUDA は Prefill と Decode でエントリが分かれる）。各カーネル起動の依存は default stream の順序に任せ、forward の最後に `hipDeviceSynchronize()` する。
 
 主なカーネルは次の通りである。
 
@@ -318,6 +353,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 - **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。
 - **ROCm 版**: AMD GPU・ROCm・`hipcc`、`GPU_ARCH` と実機 ISA の一致が必要。
+- **CUDA 版（`qwen3-gpu-cuda`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。集約 Makefile 未統合のため **`qwen3-8b/gpu-cuda`** で単体ビルド。Blackwell FP4 は **CUDA 13** と CUTLASS 取得が前提。**`third_party/cutlass`** は clone 生成物でリポジトリに常時同梱されない。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
 - **テキストのみ**: Vision・マルチモーダル入力は未対応。
 - **コンテキスト長**: `-l` 既定 512。長くすると KV メモリ（CPU ヒープまたは VRAM）が増加する。
@@ -364,6 +400,9 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 |------|----------|------------|
 | `hipcc` not found | `ROCM` 誤り | `make ROCM=/opt/rocm` 等 |
 | ISA 不一致 | `GPU_ARCH` 誤り | `rocminfo` で確認 |
+| `nvcc` not found / `nvlink` 失敗 | `PATH` に CUDA `bin` が無い | `export PATH=/usr/local/cuda/bin:$PATH` または **`gpu-cuda/Makefile`** の `CUDA_HOME` を確認 |
+| CUDA で PTX は動くが極端に遅い | `CUDA_GENCODE` が PTX のみ | 実機 **`sm_XX`** を `code=sm_XX` で指定して再ビルド |
+| Blackwell FP4 ビルド失敗 | CUDA 11 と 13 の混在・CUTLASS 未取得 | **`make blackwell`** の手順（11.x 除去 → 13 導入 → **`make cutlass`**）に従う |
 | mmap 失敗 | パス・権限 | `MODEL` を確認 |
 | CPU が極端に遅い | IQ デ量子化コスト | ROCm 版の利用、`-n` を小さく |
 | `/dev/accel/accel0` を開けない | `render` グループ未参加 / `amdxdna` 未ロード | `sudo usermod -aG render "$USER"`、`lsmod \| grep amdxdna` を確認 |
