@@ -4,6 +4,18 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-21 20:53:55
+
+**`qwen3-8b/gpu-cuda/`**（**`db8ce6f`**）: **`BONSAI_FP4`** 時に線形層の **FP16 VRAM 複製を廃止**し **NVFP4 キャッシュのみ**（**`upload_linear_fp4`** → **`fp4_qwen3_weight_from_f16_host`**）。**`fp4_gemm`** に **FP4 GEMV**（**`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`**）を追加し、**`fp4_qwen3_mm`** が M=1 デコードと Prefill バッチを経路分岐。
+
+**`fdd860d`**（同ブランチ・前コミット）: **`main.c` / `kernels.cu`** で Blackwell **NVFP4** ロードと **`gpu_model_create`** の FP4 採用、**`fp4_gemm`** 拡張。
+
+**`README.md`**・**`README.en.md`**: **`build.no-fp4` / `build.fp4`** のロード・実行対照表、起動ログ、**`NVFP4 quantize failed`** のトラブルシュート。
+
+**`doc/design.md`**: 上記に追随。
+
+**`doc/ChangeLog`**: 本エントリ。
+
 ## 2026-05-21 20:18:22
 
 **`qwen3-8b/gpu-cuda/`**: **`fp4_bonsai`** を **`fp4_qwen3`**（CUTLASS NVFP4 ブリッジ）に置換。**`Makefile`** に **`build.fp4`**・**`build.no-fp4`**・**`run.no-fp4`** を追加。既定 **`run` → `build.fp4`**（Blackwell）。**`KERNELS_OBJ`** で **`BONSAI_FP4`/`FA_BR` 別オブジェクト**。**`fp4_verify.cu`** と **`fp4-test`** ターゲット。

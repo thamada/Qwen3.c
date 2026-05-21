@@ -28,7 +28,7 @@
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
 | `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定 AMD GPU エントリ**。 |
-| `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA** | ROCm 版と同趣旨：**CPU 逆量子化 → FP16 VRAM**、**Prefill バッチ**（`gpu_forward_prefill`）＋ **Decode 1 トークン**（`gpu_forward`）。**FP16 GEMV**・**Flash Attention**（GQA、`FA_BR`/`FA_HD`）。サンプリングは **logits D2H 後 CPU**。集約 Makefile 外。汎用 GPU は **`make build.no-fp4` / `make run.no-fp4`**（PTX 既定）。Blackwell 向け **`make build.fp4`** または既定 **`make run`**（内部で **`build.fp4`**）で **NVFP4**（**`fp4_qwen3`** + CUTLASS **`fp4_gemm`**）。環境一式は **`make blackwell`**。 |
+| `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。**`build.no-fp4`**: ROCm 同趣旨（全線形 **FP16 VRAM**）。**`build.fp4`**: 線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**）、**`token_embd`** は **FP16**、norm は **F32**。線形は **`fp4_qwen3_mm`**（M=1→**FP4 GEMV**、M≥128→CUTLASS GEMM）。サンプリング **logits D2H**。集約 Makefile 外。 |
 | `qwen3-8b/xdna2/main.c` | **AMD Ryzen AI NPU (XDNA2)** | **CPU OpenMP 版と同様**に線形ウェイトは **GGUF mmap 上の量子化形式を参照**。埋め込みは行単位ブロック復号。各 **GEMV ごとに**当該重み行列を **`AMDXDNA_BO_SHMEM` の単一 BF16 スクラッチ**へ展開して NPU が DMA、`scratch_f32` でデ量子化～BF16 を兼用。rmsnorm などの小型 F32 も mmap 指す。`DRM ioctl` と **`ERT_START_NPU`** 経路、`/dev/accel/accelN` 不可／制御コード未配置時の **OpenMP BF16 CPU フォールバック（NPU と bit-identical）**は従来どおり。XRT 不要・UAPI inline 持ち運びは不変。**スクラッチサイズはテキスト経路 GEMV に必要な最大要素数のみ**（パーサ済み名前走査、`TensorInfo` は推論前に開放しうる）。**起動時レポートと `--xdna-status` / `-X`** で各形状の **`bf16-gemv-<n>x<d>.bin`** 可否・推論後の NPU/CPU GEMV カウンタを確認できる。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **AMD Ryzen AI NPU (XDNA2) + BFPX ホスト重み** | **`qwen3-8b/xdna2/main.c` と同一の DRM ioctl** および **チャンク BF16 GEMV（NPU 経路の枠組み）** を共有する。**密行列レイアウト**の重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 係数、ブロック長 64）** に変換しホストのみ保持し、GGUF mmap は変換完了後に解放する。**論理形状は OpenMP CPU 版（`cpu-multicore/main.c`）の `mm(..., n_in, n_out)` と一致**させ、`[n_in,n_out]` 型の GGUF 転置は **`bfpx_convert_weight_2d`** で吸収。量子化に加えブロック近似のため、**GEMV で逐次 BF16 に展開する mmap スクラッチ方式（`xdna2/main.c`）と同一ビットでの一致は期待できず**、品質が劣ることがある。NPU 不可時の CPU は **`mm_bfpx`** が単精度浮動小数点数の活性と BFPX 形式の重みの積を計算する。 |
 
@@ -45,9 +45,9 @@
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
 | `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。ターゲット **`build.no-fp4`**（FP16・PTX 既定）、**`build.fp4`**（**`sm_120a`** + **`BONSAI_FP4=1`** + **`FA_BR=32`**）、**`run`**（→ **`build.fp4`**）、**`run.no-fp4`**、**`blackwell`**（CUDA 13 導入 → **`build.fp4`**）、**`fp4-test`**。**`KERNELS_OBJ`** は **`BONSAI_FP4`/`FA_BR` 別名（`kernels.bfp4*.fabr*.o`）で stale `.o` 回避。 |
-| `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等。**`BONSAI_FP4`** 時は **`fp4_qwen3_mm`** で線形層の一部を NVFP4 経路に切替。 |
-| `qwen3-8b/gpu-cuda/fp4_gemm.cu` / `fp4_gemm.h` | CUTLASS ブロックスケール **NVFP4** GEMM（Blackwell SM120+）。 |
-| `qwen3-8b/gpu-cuda/fp4_qwen3.cu` / `fp4_qwen3.h` | ホスト／デバイス FP16 重み → NVFP4 キャッシュ、F32 活性の **`fp4_qwen3_mm`** ブリッジ（旧 **`fp4_bonsai`** 置換）。 |
+| `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等。**`BONSAI_FP4`** 時は線形層を **`fp4_qwen3_mm`** のみ（**`use_fp4`**、FP16 線形 VRAM なし）。 |
+| `qwen3-8b/gpu-cuda/fp4_gemm.cu` / `fp4_gemm.h` | CUTLASS **NVFP4** GEMM（M≥128）とデバイス側 **FP4 GEMV**（**`fp4_gemv_cached`**、バッチ版）。 |
+| `qwen3-8b/gpu-cuda/fp4_qwen3.cu` / `fp4_qwen3.h` | ホスト FP16 → NVFP4 キャッシュ（**`fp4_qwen3_weight_from_f16_host`**）、F32 活性の **`fp4_qwen3_mm`**（M に応じて GEMV / GEMM）。 |
 | `qwen3-8b/gpu-cuda/fp4_verify.cu` | **`make fp4-test`** 用の CUTLASS GEMM 単体検証（推論バイナリには未リンク）。 |
 | `qwen3-8b/gpu-cuda/third_party/cutlass/` | **`make cutlass` / `make blackwell`** で clone される CUTLASS（**`BONSAI_FP4`** 時のみリンク）。リポジトリ同梱ではない。 |
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
@@ -207,7 +207,11 @@ make build.xdna2-bfp16
 
 **ROCm（`qwen3-rocm`）**: ロード時に F16 重みを VRAM に配置。各ステップは **埋め込み〜全レイヤー〜LM ヘッド**を GPU 上で実行。教師強制区間では LM ヘッドを省略可能。**`0 < top-p < 1`** の nucleus は実装上 **logits 全語彙を D2H** して CPU で処理する場合がある（実装コメント参照）。それ以外は GPU で argmax / softmax＋多項サンプル等。
 
-**CUDA（`qwen3-gpu-cuda`）**: ロード方針は ROCm 版と同様（CPU 逆量子化 → FP16 → VRAM）。プロンプト区間は **`gpu_forward_prefill`** で全トークンをバッチ処理し、生成区間は **`gpu_forward`** で 1 トークンずつ。線形層・Attention・RoPE・残差等は **`kernels.cu`** 上のカーネル。**サンプリングはホスト**（logits を D2H）。起動時に prefill/decode のスループット要約を stderr に出す実装あり。**`BONSAI_FP4=1`**（**`build.fp4`**）時は **`fp4_qwen3`** が FP16 重みを NVFP4 キャッシュへ変換し、線形 GEMV の一部を **`fp4_qwen3_mm`**（内部で CUTLASS **`fp4_gemm`**）に委譲する。Prefill の FP4 は実装制約により制限あり（**`kernels.cu`** の **`FP4_MM_MIN_M`** 等）。**`build.no-fp4`** では FP16 カーネルのみ。
+**CUDA（`qwen3-gpu-cuda`）**: プロンプトは **`gpu_forward_prefill`**、生成は **`gpu_forward`**（1 トークン）。Attention・RoPE・残差は **`kernels.cu`**。**サンプリングはホスト**（logits D2H）。prefill/decode のスループット要約を stderr に出力。
+
+- **`build.no-fp4`**: ROCm 版と同様—CPU 逆量子化 → **全線形 FP16 VRAM** → **`mm_f16_gemv_kernel`**。
+- **`build.fp4`**: 線形（Q/K/V/O、gate/up/down、LM head）は **`upload_linear_fp4`** でホスト FP16 ステージング後 **NVFP4 キャッシュのみ**（線形の FP16 VRAM 複製なし）。**`token_embd`** は **FP16**、norm 系は **F32**。**`gpu_model_create`** が **`wq_fp4` 等**を採用し **`use_fp4=1`**。起動ログ例: **`dequant -> NVFP4 linear layers`**、**`FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`**。
+- **線形の実行**: **`fp4_qwen3_mm`** — **M=1**（デコード）と短い M は **`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`**（**`fp4_gemm.cu`**）；**M≥128** は CUTLASS **`fp4_gemm_run_cached`**（長い Prefill バッチ）。
 
 **XDNA2（`qwen3-xdna2`）**: 線形ウェイトは **mmap された GGUF** を **`main-omp.c` と同様**に参照する（埋め込みは mmap 上行の量子化レイアウトからブロック単位復号）。各 **GEMV** のたび、その行列だけを **`AMDXDNA_BO_SHMEM` に確保した単一 BF16 スクラッチ**へ CPU で復号・BF16 化し、`SYNC_BO` でデバイス可視にしたうえで、入力 BF16・重み・出力への `xdna_addr` を **`ERT_START_NPU`** で `DRM_IOCTL_AMDXDNA_EXEC_CMD` に渡す構成は従来どおり。**レイヤー分の恒久 BF16 重み BO は保持しない**。RMSNorm／Qwen3 ヘッド RMSNorm／Attention 等も **CPU**。NPU が使えないときは BF16 GEMV が **OpenMP** にフォールバックする（実装どおり bit-identical）。
 
@@ -285,7 +289,9 @@ Tokenizer は `tokenizer.ggml.tokens`、`tokenizer.ggml.scores`、`tokenizer.ggm
 
 CPU 版は重み全体を float に展開しない。`mm_quant_rows` が出力行ごとに量子化 row を走査し、row 内の各 256 要素 block を stack 上の `float blk[QK_K]` に復元して、入力ベクトルとの内積に足し込む。これによりメモリ使用量は抑えられるが、同じ重みを毎 token で復元するため速度は遅い。
 
-ROCm 版および CUDA 版はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、さらに F16 staging buffer に変換して GPU にアップロードする。norm tensor は F32 のまま GPU に置く。実行時の GEMV は FP16 重みカーネル（ROCm: `mm_f16_gemv_kernel`、CUDA: 同名相当）で読み、accumulator は float で計算する。この方針はロード時間と VRAM 使用量を増やす代わりに、推論中の量子化復元を避けて GPU カーネルの種類を単純にする。
+ROCm 版および CUDA **`build.no-fp4`** はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、F16 staging 経由で **全線形を FP16 VRAM** に載せる。norm は F32 のまま GPU。実行時 GEMV は FP16 カーネル（ROCm: `mm_f16_gemv_kernel`、CUDA: 同名相当）。
+
+CUDA **`build.fp4`** は線形 tensor をホストで F16 化したうえで **NVFP4 キャッシュ**（**`fp4_qwen3_weight_from_f16_host`**）にのみ格納し、**埋め込み行だけ FP16 VRAM** に残す。実行時の線形は **`fp4_qwen3_mm`**（FP4 GEMV または Tensor Core GEMM）。いずれも推論中の GGUF 逐次デ量子化は行わない。
 
 ### トークナイザーと ChatML
 
@@ -418,6 +424,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | CUDA で PTX は動くが極端に遅い | `CUDA_GENCODE` が PTX のみ | 実機 **`sm_XX`** を `code=sm_XX` で指定して再ビルド |
 | Blackwell FP4 ビルド失敗 | CUDA 11 と 13 の混在・CUTLASS 未取得 | **`make blackwell`** または **`make cutlass`** → **`make build.fp4`** |
 | 非 Blackwell で **`make run` が失敗** | 既定が **`build.fp4`（sm_120a）** | **`make run.no-fp4`** または **`make build.no-fp4`** を使用 |
+| **`NVFP4 quantize failed`** | **`build.fp4`** を非 Blackwell で実行、CUTLASS 未導入 | **`sm_120a`**・CUDA 13・**`make cutlass`**。汎用 GPU は **`build.no-fp4`** |
 | mmap 失敗 | パス・権限 | `MODEL` を確認 |
 | CPU が極端に遅い | IQ デ量子化コスト | ROCm 版の利用、`-n` を小さく |
 | `/dev/accel/accel0` を開けない | `render` グループ未参加 / `amdxdna` 未ロード | `sudo usermod -aG render "$USER"`、`lsmod \| grep amdxdna` を確認 |
