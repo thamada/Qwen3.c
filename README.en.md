@@ -53,7 +53,7 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
 ├── README.md
 ├── README.en.md
 ├── doc/
-│   ├── ChangeLog
+│   ├── ChangeLog.md
 │   └── design.md
 └── qwen3-8b/
     ├── Makefile
@@ -642,6 +642,6 @@ The goal is to **understand, experiment with, and adapt** Qwen3-family GGUF text
 ## More documentation
 
 - Design: `doc/design.md`
-- Changelog: `doc/ChangeLog`
+- Changelog: `doc/ChangeLog.md`
 
 When stuck, check `qwen3-8b/Makefile` target names and the model path you pass at runtime—most build/run issues come from those two drifting apart.

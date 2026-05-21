@@ -53,7 +53,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 ├── README.md
 ├── README.en.md
 ├── doc/
-│   ├── ChangeLog
+│   ├── ChangeLog.md
 │   └── design.md
 └── qwen3-8b/
     ├── Makefile
@@ -653,6 +653,6 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 ## 詳細ドキュメント
 
 - 設計仕様: `doc/design.md`
-- 変更履歴: `doc/ChangeLog`
+- 変更履歴: `doc/ChangeLog.md`
 
 困ったときは、まず `qwen3-8b/Makefile` のターゲット名と、実行時に渡しているモデルパスを確認してください。ビルドと実行の大半の問題は、この 2 つの不一致から起きます。
