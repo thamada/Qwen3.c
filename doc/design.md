@@ -25,7 +25,7 @@
 
 | ソース | 実行環境 | 概要 |
 |--------|----------|------|
-| `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。 |
+| `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は活性 **Q8_K** 化（**`quantize_row_q8_K`**）後、**`vec_dot_*_q8_K`** で **ggml-cpu/quants.c** 準拠の整数内積（no per-row float[256] dequant）。出力行は OpenMP 並列。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。**`openblas_set_num_threads(1)`** で OpenBLAS 側は 1 スレッド固定（並列度は **`OMP_NUM_THREADS`**）。**`-ffast-math`** は IQ 量子化で数値が崩れるため Makefile では無効。**`-march=native`** 既定。 |
 | `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定 AMD GPU エントリ**。 |
@@ -42,7 +42,7 @@
 |------|------|
 | `README.md` | ビルド・実行・方針の説明（日本語）。 |
 | `README.en.md` | 同上（英語）。 |
-| `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。 |
+| `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。**Prefill progress bar**（**`prefill_progress_*`**）と prefill / decode スループット要約を stderr に出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.cpu-multicore`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS 推論。**F32 GEMV** と Attention 集約を **`cblas_sgemv`** に委譲。量子化 GEMV は **Q8_K 活性化 + `vec_dot_*_q8_K` 整数内積**（IQ2_S / IQ3_S / Q4_K / Q5_K）。**`State.q8`** で活性バッファを保持。**Prefill progress bar**（**`prefill_progress_*`**）と prefill / decode スループット要約を stderr に出力。**`pkg-config openblas`** で link。ヘッダが非標準パスなら **`CPPFLAGS`** で指定（**`cpu-blas/Makefile`** コメント参照）。 |
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。 |
@@ -249,7 +249,7 @@ make build.xdna2-bfp16
 
 ## 実行時の挙動
 
-**CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロックデ量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積（**`mm_f32`**）と Attention の K 内積・V 合成を **`cblas_sgemv`** に集約。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は入力を **`quantize_row_q8_K`** で Q8_K 化し、**`vec_dot_*_q8_K`** で重み行と整数内積（no per-row float[256] dequant）。出力行の OpenMP 並列は **`cpu-multicore`** と同様。プロンプト区間は **1 トークンずつ teacher forcing**（CUDA 版の Prefill バッチとは異なる）。**`qwen3-cpu-blas`** はその逐次 prefill 中に stderr へ **Prefill progress bar**（**`Prefill [====...]`**、幅 40、`\r` 更新）を表示し、prefill / decode 完了時および終了時に **tok/s 要約**（**`--- throughput ---`**）を stderr に出す。
+**CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロックデ量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積（**`mm_f32`**）と Attention の K 内積・V 合成を **`cblas_sgemv`** に集約。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は入力を **`quantize_row_q8_K`** で Q8_K 化し、**`vec_dot_*_q8_K`** で重み行と整数内積（no per-row float[256] dequant）。出力行の OpenMP 並列は **`cpu-multicore`** と同様。プロンプト区間は **1 トークンずつ teacher forcing**（CUDA 版の Prefill バッチとは異なる）。**`qwen3-cpu`** / **`qwen3-cpu-blas`** はその逐次 prefill 中に stderr へ **Prefill progress bar**（**`Prefill [====...]`**、幅 40、`\r` 更新）を表示し、prefill / decode 完了時および終了時に **tok/s 要約**（**`--- throughput ---`**）を stderr に出す。
 
 **ROCm（`qwen3-rocm`）**: ロード時に F16 重みを VRAM に配置。各ステップは **埋め込み〜全レイヤー〜LM ヘッド**を GPU 上で実行。教師強制区間では LM ヘッドを省略可能。**`0 < top-p < 1`** の nucleus は実装上 **logits 全語彙を D2H** して CPU で処理する場合がある（実装コメント参照）。それ以外は GPU で argmax / softmax＋多項サンプル等。
 
