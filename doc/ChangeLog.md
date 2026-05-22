@@ -4,6 +4,107 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 04:34:38
+
+**`qwen3-8b/cpu-blas/`** — 量子化 GEMV の **AVX2 最適化**と **層内 Q8_K 量子化共有**。
+
+#### 前提：Q8_K 活性化 GEMV とは
+
+- **IQ2_S / IQ3_S / Q4_K / Q5_K** の重み行と float 活性 **`x[n]`** の GEMV は、llama.cpp / ggml と同様 **「活性を Q8_K に量子化 → 重みブロックと整数内積」** で計算する（per-row **`float[256]` 全復号**は行わない）。
+- 活性 **`BlockQ8_K`**（ggml **`block_q8_K`** 準拠）:
+  - **`float d`**: スーパーブロック scale（**`d = 1/iscale`**。**`iscale = -127/maxv`**。**`maxv`** はブロック内 **符号付き**最大値）。
+  - **`int8_t qs[256]`**: QK_K=256 要素の量子化係数。
+  - **`int16_t bsums[16]`**: **`qs`** を 16 要素ずつ足した partial sum（Q4_K / Q5_K の **dmin × mins** 補正で使用）。
+- 重み側スーパーブロック（参考）: **`BlockQ4_K`** 144 B（**`d`/`dmin` FP16 + scales[12] + qs[128] nibble**）、**`BlockQ5_K`** 176 B（**+ qh[32]** 第 5 bit）、**`BlockIQ2_S`** 82 B、**`BlockIQ3_S`** 110 B。
+- **`State.q8`**: **`calloc(hidden_dim / QK_K, sizeof(BlockQ8_K))`**（Qwen3-VL-8B なら **14336/256 = 56 ブロック**）。Attention / gate/up（**`n=dim=4096` → 16 ブロック**）と **down**（**`n=hidden_dim` → 56 ブロック**）の両方に足りるサイズ。
+
+#### 背景（従来 `mm_quant_rows` の問題）
+
+- 旧 **`mm_quant_rows`** は **GEMV 呼び出しのたび** 先頭で **`quantize_row_q8_K(x, q8, n)`**、続けて OpenMP で **`d` 行**の **`vec_dot_row_q8_K`**。
+- **`forward` 1 層・1 token** の quantize 回数（量子化 GEMV 全テンソル想定）:
+
+| 呼び出し | 入力 **`x`** | 旧 quantize |
+|---|---|---|
+| **`mm(wq/wk/wv)`** | attn RMSNorm 後 **`xb`** | **3**（同一ベクトルなのに重複） |
+| **`mm(wo)`** | attn 出力 **`xb`** | 1 |
+| **`mm(gate/up)`** | ffn RMSNorm 後 **`xb`** | **2**（重複） |
+| **`mm(down)`** | SwiGLU 後 **`hb`** | 1 |
+
+- **`dim=4096`** では 1 quantize = **16 スーパーブロック ×（256 回 abs-max + 256 int8 変換 + 16 bsums）**。Attention+FFN だけで **冗長 4 quantize/層** → **28 層で ~112 quantize/token 削減**の余地。
+
+#### 層内 Q8_K 量子化共有
+
+- **`mm(o, x, w, n, d, type, q8, q8_ready)`** — **`q8_ready=1`** なら quantize 省略、**`mm_quant_dot_rows`** のみ。
+- **`forward` 制御**（層 **`l`**）:
+
+```text
+rmsnorm → xb
+q8_att = is_q8_mm_type(wq_t[l])
+if (q8_att) quantize_row_q8_K(xb → q8, n=dim)    // 層内 1 回
+mm(q/k/v, xb, ..., q8, q8_att)                   // 3 GEMV で Q8 読み取り共有
+... OpenBLAS attention ...
+mm(xb2, xb, wo, ..., q8, 0)                      // attn 出力 xb → 都度 quantize
+
+rmsnorm → xb
+q8_ffn = is_q8_mm_type(gate_t[l])
+if (q8_ffn) quantize_row_q8_K(xb → q8, n=dim)
+mm(gate/up, xb, ..., q8, q8_ffn)
+SwiGLU → hb
+mm(xb, hb, down, n=hidden, ..., q8, 0)           // 入力・長さ変更 → 都度 quantize
+mm(logits, x, out, ..., q8, 0)                   // LM head
+```
+
+- **判定キー**: Attention は **`wq_t[l]`**、FFN は **`gate_t[l]`** のみ参照。**wq が F16 で wk が Q4_K** 等の混在では **`q8_att=0`** → wk/wv が **個別 quantize**（旧挙動）。
+- **OpenMP**: quantize は **単スレッド**、並列 **`mm_quant_dot_rows`** は **quantize 後に `q8` 読取のみ** → data race なし。
+- **層あたり quantize（理想ケース）**: 旧 **7 → 新 4**（wq/wk/wv: 3→1、gate/up: 2→1。wo/down/output は不変）。
+
+#### API 分離
+
+- **`mm_quant_dot_rows`**: **`row = wb + i * row_bytes_quant(type, n)`** → **`o[i] = vec_dot_row_q8_K(...)`**。OpenMP **`schedule(static)`** で出力行並列。
+- **`vec_dot_row_q8_K`**: IQ2_S / IQ3_S / Q4_K / Q5_K を **`switch`** ディスパッチ。
+
+#### AVX2 共通ユーティリティ
+
+- **`hsum_float_8`**: **`__m256`** 8 float の水平和。
+- **`get_scale_shuffle_k4(i)`**: Q4/Q5 の 6-bit scale を **`_mm256_shuffle_epi8`** 用に 32 lane へ複製。**256 B 静的 `k_shuffle[]`**（インデックス **`2*j+0/1`**, **`j=0..3`**）。
+- **`MM256_SET_M128I`**: 128-bit scale ベクトルの 256-bit 複製。
+
+#### AVX2 — `quantize_row_q8_K`（非 AVX2: **`quantize_row_q8_K_ref`**）
+
+1. **abs-max**: **`__m256` ×8 load** + **`andnot(signBit)`**。ただし **符号付き `maxv`** 保持のため max 更新は **スカラー**（ggml と同じ semantics）。
+2. **`iscale=-127/maxv`**, **`d=1/iscale`**。ゼロブロックは **`d=0`**, zero fill。
+3. **int8 化**: **32 要素/iter** — **`mul → round_ps(NEAREST) → cvtps_epi32 → min(127) → packs → permutevar8x32 → store`**。
+4. **`bsums`**: 16 要素ずつ **スカラー sum**（AVX 化なし）。
+5. ref は **`lrintf`**、AVX2 は **`round_ps`** — いずれも **127 キャップ**。
+
+#### AVX2 — `vec_dot_q4_K_q8_K`（非 AVX2: **`_generic`**）
+
+- **式（1 ブロック）**: **`dot += d·Σ(scale·q4·q8) − dmin·Σ(mins·bsums)`**。 **`d=y.d·f16(x.d)`**, **`dmin=−y.d·f16(x.dmin)`**。
+- **generic のコスト**: **`aux8[256]`** へ nibble 全面展開 → 8 要素 **`aux16=q8·a`** ループ × 多段。**~300 B+ スタック/呼び出し**。
+- **AVX2**: **`kmask1/2/3`** で **scales[12]** 復号 → **dmin 項を `acc_m` に fmadd** → **64 要素サブループ ×4** で **`maddubs_epi16(q4,q8)` + `madd_epi16(scale,·)` → `sumi`** → **`acc += d·sumi`**。**`aux8` 不要**。
+- **返却**: **`hsum_float_8(acc) + hsum(acc_m)`**。
+
+#### AVX2 — `vec_dot_q5_K_q8_K`（非 AVX2: **`_generic`**）
+
+- **`qh[32]`** から **`hmask` 1 bit shift** で第 5 bit を取り **`q5 = q5l + (q5h<<4)`** 相当を **`add_epi8`**。
+- 64 要素を **`q5_0/q5_1` × `q8_0/q8_1`** の 2 組で **`maddubs`**。**dmin は `summs` スカラー**。
+- **返却**: **`hsum_float_8(acc) + summs`**。
+
+#### IQ2_S / IQ3_S（スカラー据置）
+
+- **1024 エントリ grid**・**signs ビット分岐**・IQ3 **grid1/grid2** 交互 — AVX2 化対象外。
+- **IQ2_M モデル**では dot 本体は従来速度だが **層内 Q8 共有による quantize 削減**が主 gain。
+
+#### ビルド・スコープ
+
+- **`-march=native`** → 通常 **`__AVX2__`**。SIMD 対象は **quantize + Q4_K/Q5_K dot の 3 関数のみ**。
+- **スコープ外**: IQ2/IQ3 dot、**bsums/abs-max の signed-max 部分**、OpenBLAS 経路、token **emb_lookup** の block dequant、**層跨ぎ Q8 再利用**、KV（float32 のまま）。
+- **`-ffast-math` 無効** — AVX2 導入後も IQ/Q8 精度方針は不変。
+
+**`doc/design.md`**: **`cpu-blas`** のバリアント表・ディレクトリ表・量子化と行列積・実行時挙動・制約・トラブルシュートを上記に追随。**`cpu-blas/Makefile`** の **`make openblas`** と **`cblas.h` 未検出時の案内**を追記。**「`cpu-blas`：Q8_K 活性化 GEMV（層内共有・AVX2）」** 節を新設し、ChangeLog 同等の深掘り（3 経路比較・数式・型別 dot・OpenBLAS 分担・IQ2_M gain 内訳）を設計仕様として記載。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 03:53:52
 
 **`README.md`**・**`README.en.md`**: **高度な機能（マルチターン・Thinking）** 節を **公式の想定 / 本リポジトリの現状 / 参考 URL** の構成に整理。テンプレート背景・マルチターン・Thinking 向けの **技術参考リンク**を追記。thinking マーカーが ChatML 特殊トークンではなく通常テキストとしてトークン化される旨を明記。
