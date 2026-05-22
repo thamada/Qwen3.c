@@ -180,7 +180,7 @@ Put CUDA’s **`bin`** directory on **`PATH`** (linking can fail if only `/usr/l
 | PolarQuant round-trip verify | `make pq-test` in either directory |
 | CUTLASS NVFP4 GEMM unit verify | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fp4-test` (**Blackwell / sm_120a required**) |
 
-FP16 builds (`gpu-cuda`) default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. NVFP4 builds (`gpu-cuda-nvfp4`) default to **`sm_120a`**. **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** are compiled with **`BLACKWELL_NVCCFLAGS`** (**`-std=c++17`** + fixed **`sm_120a`**). On CUDA 13, CUTLASS triggers deprecation warnings; the Makefile adds **`-Wno-deprecated-declarations`** (we do not patch **`third_party/cutlass`** in this repo).
+FP16 builds (`gpu-cuda`) default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. NVFP4 builds (`gpu-cuda-nvfp4`) default to **`sm_120a`**. **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** are compiled with **`BLACKWELL_NVCCFLAGS`** (**`-std=c++17`** + fixed **`sm_120a`**). CUTLASS **`v4.5.0`** is fetched via **`make cutlass`** into **`third_party/cutlass`**; CUDA 13 deprecated vector-type warnings are resolved upstream in CUTLASS.
 
 ## Obtain the model file
 

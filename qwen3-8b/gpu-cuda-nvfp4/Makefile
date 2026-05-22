@@ -35,17 +35,42 @@ BLACKWELL_GENCODE ?= arch=compute_120a,code=sm_120a
 BLACKWELL_FA_BR     ?= 32
 
 CUTLASS_DIR ?= third_party/cutlass
-CUTLASS_TAG ?= v3.9.0
+CUTLASS_TAG ?= v4.5.0
 
 FP4_CXXFLAGS = -I$(CUTLASS_DIR)/include \
                -I$(CUTLASS_DIR)/tools/util/include \
                -DCUTLASS_ARCH_MMA_SM120_SUPPORTED
 
-# NVFP4 GEMM オブジェクトは sm_120a 固定 gencode（CUTLASS は C++17 必須）
-# CUTLASS 由来の非推奨警告: CUDA 13 で long4 等のベクトル型が非推奨になり、
-# third_party/cutlass/include/cutlass/platform/platform.h が -Wdeprecated-declarations
-# を発する。当リポジトリ側で修正できないため -Wno-deprecated-declarations で抑制する。
-BLACKWELL_NVCCFLAGS = -O3 -std=c++17 -Xcompiler -Wall,-Wextra,-Wno-unused-parameter,-Wno-deprecated-declarations \
+# NVFP4 GEMM オブジェクトは sm_120a 固定 gencode（CUTLASS v4.5.0 + C++17 必須）
+#
+# CUTLASS v4.5.0 は CUDA 13 で非推奨になった long4 等のベクトル型を使わないため、
+# 旧版 (v3.9.0) で必要だった -Wno-deprecated-declarations は不要。
+#
+# ただし v4.5.0 には別の nvcc 警告 (#20012) がある:
+#   third_party/cutlass/.../sm100_static_tile_scheduler.hpp が
+#     CUTLASS_HOST_DEVICE StaticPersistentTileScheduler100() = default;
+#   のように「= default コンストラクタに __device__/__host__ を付ける」と
+#   nvcc が「その属性は無視される」と警告する（当リポジトリのコードではなく CUTLASS 側）。
+# 当リポジトリでは third_party/cutlass を改変しない。
+# CUTLASS 公式ビルド (python/cutlass_cppgen/backend/compiler.py) も同じ nvcc オプションで
+# この1件だけ警告を抑止しているため、それに合わせる:
+#   -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored
+#
+# 参考:
+#   CUTLASS v4.5.0 リリース
+#     https://github.com/NVIDIA/cutlass/releases/tag/v4.5.0
+#   CUDA 13 非推奨ベクトル型への CUTLASS 側対応 (platform.h)
+#     https://github.com/NVIDIA/cutlass/blob/v4.5.0/include/cutlass/platform/platform.h
+#   警告 #20012 の発生箇所 (sm100_static_tile_scheduler.hpp)
+#     https://github.com/NVIDIA/cutlass/blob/v4.5.0/include/cutlass/gemm/kernel/sm100_static_tile_scheduler.hpp#L53-L54
+#   CUTLASS 公式 nvcc ビルドでの同オプション使用 (compiler.py L159)
+#     https://github.com/NVIDIA/cutlass/blob/v4.5.0/python/cutlass_cppgen/backend/compiler.py#L156-L160
+#   nvcc --diag-suppress / -Xcudafe (NVIDIA NVCC マニュアル)
+#     https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#diag-suppress-errnum-diag-suppress
+#   = default コンストラクタへの __device__/__host__ 警告の背景 (Kokkos #1470)
+#     https://github.com/kokkos/kokkos/issues/1470#issuecomment-378918573
+BLACKWELL_NVCCFLAGS = -O3 -std=c++17 -Xcompiler -Wall,-Wextra,-Wno-unused-parameter \
+                      -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored \
                       -use_fast_math --expt-relaxed-constexpr \
                       -gencode $(BLACKWELL_GENCODE)
 
@@ -113,6 +138,13 @@ pq-test: polarquant.o
 cutlass:
 	@if [ ! -f "$(CUTLASS_DIR)/include/cutlass/cutlass.h" ]; then \
 		echo "=== Cloning CUTLASS $(CUTLASS_TAG) ==="; \
+		mkdir -p third_party; \
+		git clone --depth 1 --branch $(CUTLASS_TAG) \
+			https://github.com/NVIDIA/cutlass.git $(CUTLASS_DIR); \
+	elif [ -d "$(CUTLASS_DIR)/.git" ] && \
+	     [ "$$(git -C $(CUTLASS_DIR) describe --tags --exact-match 2>/dev/null)" != "$(CUTLASS_TAG)" ]; then \
+		echo "=== Upgrading CUTLASS to $(CUTLASS_TAG) ==="; \
+		rm -rf $(CUTLASS_DIR); \
 		mkdir -p third_party; \
 		git clone --depth 1 --branch $(CUTLASS_TAG) \
 			https://github.com/NVIDIA/cutlass.git $(CUTLASS_DIR); \
