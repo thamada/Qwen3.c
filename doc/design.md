@@ -27,7 +27,7 @@
 |--------|----------|------|
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
-| `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は活性 **Q8_K** 化（**`quantize_row_q8_K`**）後、**`vec_dot_*_q8_K`** で **ggml-cpu/quants.c** 準拠の整数内積（no per-row float[256] dequant）。**Attention の wq/wk/wv** と **FFN の gate/up** は同一活性に対し **Q8_K 量子化を層内 1 回のみ**（**`mm(..., q8_ready)`**）。**`__AVX2__`** 時は **`quantize_row_q8_K`** と Q4_K / Q5_K の **`vec_dot_*_q8_K`** を AVX2 実装（非 AVX2 はスカラー参照実装）。出力行は OpenMP 並列。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。**`openblas_set_num_threads(1)`** で OpenBLAS 側は 1 スレッド固定（並列度は **`OMP_NUM_THREADS`**）。**`-ffast-math`** は IQ 量子化で数値が崩れるため Makefile では無効。**`-march=native`** 既定。 |
+| `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。量子化 GEMV は **Q8_K 活性化 + 全型 `vec_dot_*_q8_K` 整数内積**（**`__AVX2__`** で IQ2_S/IQ3_S/Q4_K/Q5_K）。**層内 Q8 共有**（**`mm(..., q8_ready)`**）。**RoPE cos/sin キャッシュ**、**prefill 中 LM head スキップ**（**`FWD_NO_LM`**）、**greedy 時 `mm_argmax_row`**（**`FWD_LM_ARGMAX`**）。**F16 埋め込み**は **F16C+AVX2** で 8 要素 SIMD 変換。**Prefill progress bar** とスループット要約を stderr に出力。**`-march=native`** 既定。 |
 | `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定 AMD GPU エントリ**。 |
 | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA（FP16）** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。全線形 **FP16 VRAM**（ROCm 同趣旨）。任意で **`build.polarquant`**: KV キャッシュ **PolarQuant-R**（64 B/head、F32 比 ~8×）。サンプリング **logits D2H**。集約 Makefile 外。 |
 | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | **NVIDIA CUDA（NVFP4）** | 上記と同じ Prefill / Decode / Flash Attention。線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**、**`BONSAI_FP4=1`** 固定）、**`token_embd`** は **FP16**、norm は **F32**。線形は **`fp4_qwen3_mm`**（M=1→**FP4 GEMV**、M≥128→CUTLASS GEMM）。任意で **`build.polarquant`**: NVFP4 線形 + PolarQuant-R KV（Blackwell 向け最大 VRAM 節約）。要 **CUDA 13 + CUTLASS + sm_120 系 GPU**。集約 Makefile 外。 |
@@ -44,7 +44,7 @@
 | `README.en.md` | 同上（英語）。 |
 | `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。**Prefill progress bar**（**`prefill_progress_*`**）と prefill / decode スループット要約を stderr に出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.cpu-multicore`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
-| `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS 推論。**F32 GEMV** と Attention 集約を **`cblas_sgemv`** に委譲。量子化 GEMV は **Q8_K 活性化 + `vec_dot_*_q8_K`**（実装詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**）。**Prefill progress bar** と prefill / decode スループット要約を stderr に出力。**`pkg-config openblas`** で link。 |
+| `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS。**Q8_K GEMV**（全型 AVX2 整数内積・層内 Q8 共有）、**RoPE キャッシュ**、**lm_mode**（prefill LM スキップ / greedy argmax）、**F16 emb F16C**。詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**。**Prefill progress bar** を stderr に出力。 |
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（FP16 線形層）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
@@ -249,7 +249,7 @@ make build.xdna2-bfp16
 
 ## 実行時の挙動
 
-**CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロックデ量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積（**`mm_f32`**）と Attention の K 内積・V 合成を **`cblas_sgemv`** に集約。量子化 GEMV は **Q8_K 活性化 + 整数内積**（**層内 Q8 共有**・**AVX2** 詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」** 参照）。プロンプト区間は **1 トークンずつ teacher forcing**（CUDA 版の Prefill バッチとは異なる）。**`qwen3-cpu`** / **`qwen3-cpu-blas`** は stderr に **Prefill progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **tok/s 要約**を出力。
+**CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロックデ量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積と Attention を **`cblas_sgemv`** に集約。量子化 GEMV は **Q8_K + 全型 AVX2 整数内積**（詳細は **「量子化と行列積」** 参照）。**prefill** 中（最終プロンプト token 以外）は **LM head をスキップ**。**`-t 0`（greedy）** では **全 vocab logits を確保せず `mm_argmax_row`**。**RoPE** は起動時 **cos/sin キャッシュ**参照。プロンプト区間は **1 トークンずつ teacher forcing**。**Prefill progress bar** と tok/s 要約を stderr に出力。
 
 **ROCm（`qwen3-rocm`）**: ロード時に F16 重みを VRAM に配置。各ステップは **埋め込み〜全レイヤー〜LM ヘッド**を GPU 上で実行。教師強制区間では LM ヘッドを省略可能。**`0 < top-p < 1`** の nucleus は実装上 **logits 全語彙を D2H** して CPU で処理する場合がある（実装コメント参照）。それ以外は GPU で argmax / softmax＋多項サンプル等。
 
@@ -300,7 +300,7 @@ make build.xdna2-bfp16
 
 `Tok` は語彙文字列、語彙長、BPE score、特殊トークン ID、ハッシュ表、byte fallback 用 token を持つ。`<|im_start|>` と `<|im_end|>` は ChatML 用に語彙から探索し、見つかった場合は `im_start` / `im_end` として保存する。
 
-`State` は forward 中の一時バッファを持つ。主なものは hidden state `x`、RMSNorm 後や射影後に使う `xb` / `xb2`、FFN の `hb` / `hb2`、attention の `q` / `k` / `v`、logits、KV cache である。CPU / ROCm / CUDA **`gpu-cuda`（FP16）** では **`kc` / `vc`**（float32、**`n_layers * max_seq * kv_dim`** 要素 × Key/Value）。**`cpu-blas`** では量子化 GEMV 用に **`q8`**（**`BlockQ8_K`**、**`hidden_dim / QK_K`** ブロック分。**Qwen3-VL-8B なら 56 ブロック**。Attention/gate/up の **`n=dim`** と down の **`n=hidden_dim`** の両方に対応）を追加で確保する。層内共有・AVX2 の詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」** を参照。CUDA **`build.polarquant`**（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**）では **`kc_pq` / `vc_pq`**（**`PQBlock`** 配列、**`n_layers * max_seq * n_kv_heads * PQ_BYTES_HEAD`**）に置き換える。
+`State` は forward 中の一時バッファを持つ。主なものは hidden state `x`、RMSNorm 後や射影後に使う `xb` / `xb2`、FFN の `hb` / `hb2`、attention の `q` / `k` / `v`、logits、KV cache である。CPU / ROCm / CUDA **`gpu-cuda`（FP16）** では **`kc` / `vc`**（float32、**`n_layers * max_seq * kv_dim`** 要素 × Key/Value）。**`cpu-blas`** では量子化 GEMV 用 **`q8`**（**`hidden_dim / QK_K`** ブロック）に加え、greedy 用 **`State.argmax_tok`**、**`Model.rope_cr` / `Model.rope_ci`**（**`max_seq × head_dim/2`** ずつ、RoPE キャッシュ）を保持する。層内 Q8 共有・全型 AVX2 dot・LM モード等の詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」** を参照。CUDA **`build.polarquant`**（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**）では **`kc_pq` / `vc_pq`**（**`PQBlock`** 配列、**`n_layers * max_seq * n_kv_heads * PQ_BYTES_HEAD`**）に置き換える。
 
 ### GGUF パーサー
 
@@ -403,7 +403,8 @@ bsums[k] = Σ_{j=0}^{15} qs[k*16 + j]
 |------|------|
 | **`mm(o, x, w, n, d, type, q8, q8_ready)`** | 型分岐。量子化型かつ **`q8_ready=0`** のとき **`quantize_row_q8_K(x, q8, n)`** → **`mm_quant_dot_rows`**。**`q8_ready=1`** なら quantize 省略 |
 | **`mm_quant_dot_rows(..., const q8)`** | OpenMP で **`i=0..d-1`**: **`o[i] = vec_dot_row_q8_K(n, row_i, type, q8)`** |
-| **`vec_dot_row_q8_K`** | **`switch(type)`** → **`vec_dot_iq2_s_q8_K`** / **`vec_dot_iq3_s_q8_K`** / **`vec_dot_q4_K_q8_K`** / **`vec_dot_q5_K_q8_K`** |
+| **`mm_argmax_row(x, w, n, d, type, q8)`** | greedy 用。**全 **`o[]`** 非確保**。OpenMP 行 argmax（量子化型 / F32 **`cblas_sdot`** / F16 スカラー） |
+| **`vec_dot_row_q8_K`** | **`switch(type)`** → 各 **`vec_dot_*_q8_K`**（AVX2 または generic） |
 | **`is_q8_mm_type(type)`** | Q4_K / Q5_K / IQ2_S / IQ3_S のみ真 |
 
 **`n % QK_K != 0`** の量子化 GEMV は **`mm` 内で exit**（Qwen3-VL-8B の **`dim`/`hidden_dim` は 256 の倍数）。
@@ -426,7 +427,10 @@ SwiGLU: hb[i] = silu(hb[i]) * hb2[i]
 mm(xb, hb, down, n=hidden, ..., q8, 0)           // 入力 hb・長さ hidden → 都度 quantize（56 ブロック）
 ...
 rmsnorm → x
-mm(logits, x, out, n=dim, d=vocab, ..., q8, 0)  // LM head（vocab 行並列 OpenMP）
+// lm_mode に応じて LM head（generate が決定）:
+//   FWD_NO_LM     → スキップ（prefill 中 pos < n_prompt-1）
+//   FWD_LM_FULL   → rmsnorm → mm(logits)
+//   FWD_LM_ARGMAX → rmsnorm → mm_argmax_row → argmax_tok
 ```
 
 | 呼び出し | 入力 **`x`** | **`n`** | 共有 | 判定キー / 備考 |
@@ -456,16 +460,19 @@ mm(logits, x, out, n=dim, d=vocab, ..., q8, 0)  // LM head（vocab 行並列 Ope
 
 **共通**: 入力長 **`n`** は **`nb = n/QK_K`** スーパーブロックに分割。**`q8`** と重み row のブロック **`i`** を対応させ **`sumf += ...`**。**1 出力要素 = 1 重み行 dot**。
 
-**IQ2_S — `vec_dot_iq2_s_q8_K`**（スカラー、grid 参照）:
+**IQ2_S — `vec_dot_iq2_s_q8_K`**（**`__AVX2__`** / **`_generic`**）:
 
-- 32 要素サブブロック **`ib32`** ごとに **4-bit scale `ls1/ls2`**、**`iq2s_grid[1024]`** から 8 要素 grid を引き、**`signs`** ビットで符号反転。
-- **`sumi += q8[j] * grid[j] * (±1)`** を scale で重み付け。**最終 `*out = 0.125f * sumf`**（ggml 準拠の定数係数）。
-- **分岐・間接参照が多く AVX2 化対象外**。IQ2_M では **dot 本体の速度より quantize 削減**が効く。
+- **generic**: 32 要素サブブロックごと **`iq2s_grid`** 参照 + **`signs`** ビット分岐 + **`0.125f * sumf`**。
+- **AVX2**（ggml 準拠）:
+  - **`iq2s_grid`** を **`_mm256_set_epi64x`** で 4 組ロード（**`qs`/`qh`** index）。
+  - **`signs`**: **`k_mask1/k_mask2` + `shuffle_epi8`** → **`cmpeq` + `xor/sub`** で Q8 符号反転。
+  - **`maddubs_epi16(q2, q8s)` → `madd_epi16(scale,·)`** を **`sumi1/sumi2`** に累積 → **`fmadd(d, sumi, accumf)`**。
+  - **`*out = 0.125f * hsum_float_8(accumf)`**。
 
-**IQ3_S — `vec_dot_iq3_s_q8_K`**（スカラー）:
+**IQ3_S — `vec_dot_iq3_s_q8_K`**（**`__AVX2__`** / **`_generic`**）:
 
-- 64 要素ペアごとに **`iq3s_grid`** + **`signs`**。2 つの 32 要素 half を **`ls1`/`ls2`** で別 scale。
-- **`*out = sumf`**（IQ2 とは係数が異なる）。
+- **generic**: 64 要素ペア + **`iq3s_grid`** + **`signs`**、**`2*ls+1`** scale。
+- **AVX2**: grid index を **`sllv_epi32` + `iq3s_grid[ix]` gather**（16 index）。signs は IQ2_S 同型。**`*out = hsum_float_8(accumf)`**。
 
 **Q4_K — `vec_dot_q4_K_q8_K`**（AVX2 / generic）:
 
@@ -509,7 +516,7 @@ dot += d * Σ_j (scale_j * Σ_k q4_{j,k} * q8_k)  -  dmin * Σ_m (min_m * bsum_m
 | **`get_scale_shuffle_k4(i)`** | **256 B `k_shuffle[]`** から **`__m256i`** load。**Q4/Q5 の 6-bit scale** を **`_mm256_shuffle_epi8`** で 32 byte lane に複製 |
 | **`MM256_SET_M128I(a,b)`** | 128-bit scale を 256-bit に複製（**`_mm256_insertf128`**） |
 
-**SIMD 対象は 3 関数のみ**（quantize, Q4_K dot, Q5_K dot）。IQ2/IQ3 dot、bsums 計算、signed-max 決定はスカラー。
+**SIMD 対象**（**`__AVX2__`** 時）: **`quantize_row_q8_K`**、**`vec_dot_iq2_s_q8_K`**、**`vec_dot_iq3_s_q8_K`**、**`vec_dot_q4_K_q8_K`**、**`vec_dot_q5_K_q8_K`**（いずれも **`_generic`/`_ref` フォールバック**）。**bsums 計算**・**signed-max 決定**はスカラー。**F16 埋め込み**は **`__F16C__`** 追加時に **`_mm256_cvtph_ps`**。
 
 ##### OpenBLAS との分担（同一 `forward` 内）
 
@@ -522,6 +529,46 @@ dot += d * Σ_j (scale_j * Σ_k q4_{j,k} * q8_k)  -  dmin * Σ_m (min_m * bsum_m
 | **Attention V 合成** | **`softmax(att_h)`** 後 **`cblas_sgemv(Trans)`** で value 重み付き和 |
 | **OpenBLAS スレッド** | **`openblas_set_num_threads(1)`** 固定 |
 
+| **OpenBLAS スレッド** | **`openblas_set_num_threads(1)`** 固定 |
+| **greedy LM head** | **`mm_argmax_row`**: OpenMP 行並列 max（**`logits[vocab]` 非確保**） |
+| **F16 埋め込み** | **`emb_lookup`**: **F16C+AVX2** で 8 要素 **`cvtph_ps`**（単スレッド） |
+
+##### RoPE cos/sin キャッシュ
+
+- **`init_rope_cache(m)`**（**`main`** で **`load_weights` 後**）: **`pos = 0..max_seq-1`**, **`i = 0..head_dim/2-1`** で **`rope_cr[pos*hd2+i] = cos(pos·freq)`**, **`rope_ci[...] = sin(...)`**。**`freq = 1/rope_theta^(2i/head_dim)`**。
+- **`apply_rope(vec, n_heads, head_dim, pos, rope_cr, rope_ci)`**: **`pcr/pci = cache + pos*hd2`** を参照。**`powf/cosf/sinf` を forward 中に呼ばない**。
+- メモリ: **2 × max_seq × (head_dim/2) × sizeof(float)**。Qwen3-VL-8B 既定（**512×64×4×2 ≈ 256 KiB**）。
+
+##### `forward` の LM head モード（`lm_mode`）
+
+| 値 | 意味 | LM head 処理 |
+|----|------|-------------|
+| **`FWD_NO_LM`** | prefill 中（最終プロンプト token 以外） | **`output_norm` + LM head スキップ** |
+| **`FWD_LM_FULL`** | サンプリング（**`temp > 0`** または top-p） | **`rmsnorm` → `mm(logits, ...)`** → **`sample_token(logits)`** |
+| **`FWD_LM_ARGMAX`** | greedy（**`temp <= 0`**） | **`rmsnorm` → `mm_argmax_row` → `State.argmax_tok`** |
+
+**`generate`** の選択ロジック:
+
+```text
+lm_mode = FWD_NO_LM
+if (pos >= n_prompt - 1)
+    lm_mode = (temp <= 0) ? FWD_LM_ARGMAX : FWD_LM_FULL
+forward(m, token, pos, lm_mode)
+...
+next = (lm_mode == FWD_LM_ARGMAX) ? s->argmax_tok : sample_token(s->logits, ...)
+```
+
+- **prefill スキップ効果**: プロンプト長 **`N`** なら **~(N-1) ×（output_norm + vocab 行 GEMV）** を省略（最後の prefill token のみ LM 実行）。
+- **greedy argmax 効果**: **`s->logits[vocab_size]`**（~600k float ≈ 2.4 MiB）への書き込みと **softmax 不要**。量子化 LM head では **1 回 Q8 quantize + OpenMP 行 argmax**。
+
+##### `mm_argmax_row`
+
+- **入力**: RMSNorm 後 **`x[dim]`**、重み **`output.weight`**（**`[vocab, dim]`** 行 major）。
+- **量子化型**: **`quantize_row_q8_K(x, q8, dim)`** → OpenMP **`for i in 0..vocab-1`**: **`vec_dot_row_q8_K`** → thread-local **`(lb, lv)`** → **`critical`** で global max。
+- **F32 型**: 行ごと **`cblas_sdot(n, row, 1, x, 1)`**。
+- **F16 型**: 行ごとスカラー F16 内積。
+- **戻り値**: argmax token id。**`State.argmax_tok`** に格納。
+
 ##### IQ2_M モデルでの gain の内訳
 
 Qwen3-VL-8B **IQ2_M** では **大部分の線形が IQ2_S**。
@@ -529,21 +576,24 @@ Qwen3-VL-8B **IQ2_M** では **大部分の線形が IQ2_S**。
 | 最適化 | IQ2_S 重みへの効果 |
 |--------|-------------------|
 | **層内 Q8 共有** | **大**（quantize 3→1 / 2→1） |
-| **Q8_K 整数 dot（従来から）** | **`cpu-multicore` の dequant 比で既に有利** |
-| **AVX2 dot** | **なし**（スカラーのまま） |
-| **AVX2 quantize** | **あり**（全量子化 GEMV で活性 quantize に効く） |
+| **Q8_K 整数 dot** | **`cpu-multicore` dequant 比で有利** |
+| **AVX2 IQ2_S dot** | **大**（IQ2_M の主ボトルネックだった dot を SIMD 化） |
+| **AVX2 quantize** | **あり** |
+| **prefill LM スキップ** | **大**（prefill 各 token で vocab GEMV 省略） |
+| **greedy argmax** | **大**（decode で logits 全確保・softmax 省略） |
+| **RoPE キャッシュ** | **中**（全 layer × head で **cos/sin 再計算**削減） |
 
-Q4_K / Q5_K が混在するテンソルでは **AVX2 dot** も有効。
+Q4_K / Q5_K 混在テンソルでは **AVX2 Q4/Q5 dot** も有効。
 
 ##### スコープ外（明示）
 
-- **IQ2/IQ3 整数内積**の SIMD 化
-- **token `emb_lookup`**: 量子化 embedding 行は **従来どおり block-wise `dequant_one_block_to`**（Q8 経路ではない）
+- **token 量子化 `emb_lookup`**: 量子化 embedding 行は **block-wise `dequant_one_block_to`**（Q8 経路外）。F16 のみ **F16C SIMD** 化。
 - **層跨ぎ / token 跨ぎ Q8 再利用**
 - **KV キャッシュ**の量子化
+- **top-p / 温度サンプリング**時の argmax ショートカット（**`FWD_LM_FULL`** 必須）
 - **`-ffast-math`**（IQ / Q8_K / RMSNorm の数値崩れ。Makefile 無効）
 
-変更履歴の詳細な経緯は **`doc/ChangeLog.md`**（**2026-05-23 04:34:38**）を参照。
+変更履歴: **`doc/ChangeLog.md`**（**2026-05-23 04:53:10**、**04:34:38**）。
 
 ROCm 版および CUDA **`gpu-cuda`（FP16）** はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、F16 staging 経由で **全線形を FP16 VRAM** に載せる。norm は F32 のまま GPU。実行時 GEMV は FP16 カーネル（ROCm: `mm_f16_gemv_kernel`、CUDA: 同名相当）。
 
@@ -599,7 +649,7 @@ Qwen3 ファミリー（QwQ 等の reasoning 系を含む）では、公式ス�
 1. **`rmsnorm(x → xb)`** — スカラー/OpenMP（他 CPU 版同様）。
 2. **`q8_att`** 判定 → 必要なら **`quantize_row_q8_K(xb → q8)`**（**1 回**）。
 3. **`mm(q)`**, **`mm(k)`**, **`mm(v)`** — 量子化型なら **`q8_ready=1`** で **共有 Q8** を参照。**`d=dim` / `kv_dim`** 行の OpenMP 行並列 dot。
-4. **`rmsnorm_head_inplace(q/k)`**, **`apply_rope`**, **KV cache 書込** — スカラー/OpenMP。
+4. **`rmsnorm_head_inplace(q/k)`**, **`apply_rope`**（**`Model.rope_cr/ci` キャッシュ参照**）, **KV cache 書込** — スカラー/OpenMP。
 5. **Attention** — 各 head **`cblas_sgemv`**（K 内積）→ **`softmax`** → **`cblas_sgemv`**（V 合成）。**`openblas_set_num_threads(1)`** 下で OpenMP が **`n_heads`** 並列。
 6. **`mm(xb2, xb, wo, q8_ready=0)`** — attn 出力 **`xb`** を入力に **都度 quantize**。
 7. **残差 `x += xb2`**。
@@ -608,9 +658,15 @@ Qwen3 ファミリー（QwQ 等の reasoning 系を含む）では、公式ス�
 10. **`mm(xb, hb, down, n=hidden, q8_ready=0)`** — **56 ブロック quantize** + **`d=dim`** 行 dot。
 11. **残差 `x += xb`**。
 
-生成ループ末尾: **`rmsnorm` → `mm(logits, x, out, vocab, q8_ready=0)`**。
+**LM head**（**`generate`** が **`lm_mode`** を決定）:
 
-**埋め込み `emb_lookup`**: 量子化 token 行は **Q8 経路を使わず** **`dequant_one_block_to`** で **`x`** に float 展開（推論中の最初の **`x`** 構築のみ）。
+| **`lm_mode`** | 条件 | 処理 |
+|---|---|---|
+| **`FWD_NO_LM`** | **`pos < n_prompt - 1`** | スキップ |
+| **`FWD_LM_FULL`** | decode または prefill 最終 token、**`temp > 0`** | **`rmsnorm` → `mm(logits)` → `sample_token`** |
+| **`FWD_LM_ARGMAX`** | 同上、**`temp <= 0`** | **`rmsnorm` → `mm_argmax_row` → `argmax_tok`** |
+
+**埋め込み `emb_lookup`**: 量子化 token 行は **`dequant_one_block_to`**。F16 行は **F16C+AVX2** 時 **8 要素 SIMD `cvtph_ps`**（それ以外 OpenMP **`host_f16f32`**）。
 
 1 token の処理は次の順序である。
 
@@ -622,9 +678,9 @@ Qwen3 ファミリー（QwQ 等の reasoning 系を含む）では、公式ス�
 6. GQA に従い、query head `h` は `kvh = h / kv_mul` の KV head を参照する。過去 `0..pos` の score を softmax し、Value の重み付き和を作る。
 7. attention 出力を `attn_output.weight` で射影し、残差として `x` に加える。
 8. `ffn_norm`、`ffn_gate`、`ffn_up`、`SiLU(gate) * up`、`ffn_down` の順で FFN を実行し、再び残差を加える。
-9. logits が必要な位置だけ `output_norm` と `output.weight` を実行する。
+9. logits が必要な位置だけ `output_norm` と `output.weight` を実行する（**`cpu-blas`** は **`lm_mode`** で **prefill スキップ / greedy argmax / フル logits** を切替）。
 
-プロンプト消費中は次 token が既知なので、最後のプロンプト token 以外では LM head を省略できる。
+プロンプト消費中は次 token が既知なので、最後のプロンプト token 以外では LM head を省略できる（**`cpu-blas`** は **`FWD_NO_LM`** で **`forward` 内から省略**。**`cpu` / `cpu-multicore`** も同趣旨だが **`lm_mode` 引数はない**）。
 
 ### ROCm / CUDA forward（GPU）
 
@@ -670,7 +726,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 ## 制約・既知の制限
 
-- **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え量子化 GEMV を **Q8_K + 整数内積**（層内 Q8 共有・AVX2 最適化）に置き換えるため **`cpu-multicore` より速くなることが多い**。**`-ffast-math`** を付けると IQ / Q8_K 量子化で出力が壊れる。**`-march=native`** は移植性より当該 CPU 向け最適化（AVX2 等）を優先する。
+- **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え量子化 GEMV を **Q8_K + 全型 AVX2 整数内積**（層内 Q8 共有）に置き換え、**RoPE キャッシュ**・**prefill LM スキップ**・**greedy `mm_argmax_row`** でオーバーヘッドを削るため **`cpu-multicore` より速くなることが多い**。**`-ffast-math`** を付けると IQ / Q8_K 量子化で出力が壊れる。**`-march=native`** は **AVX2/F16C** 等を有効化（移植性より当該 CPU 向け最適化）。
 - **ROCm 版**: AMD GPU・ROCm・`hipcc`、`GPU_ARCH` と実機 ISA の一致が必要。
 - **CUDA 版（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。集約 Makefile 未統合。**汎用 GPU** は **`gpu-cuda`**（PTX 可）。**Blackwell NVFP4** は **`gpu-cuda-nvfp4`**（**CUDA 13**・CUTLASS・**`sm_120a`**）。**`build.polarquant`** は KV のみ PolarQuant-R（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**、任意 GPU 可／NVFP4 併用可）。**`gpu-cuda-nvfp4/third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。**`gpu-cuda-nvfp4`** では線形重みは NVFP4 のみ VRAM に載り、**`gpu-cuda` 比で線形 FP16 分（8B 級で約 15 GiB 相当）を節約**できる（代わりに **`token_embd`** は FP16 のまま）。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
