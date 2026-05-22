@@ -4,6 +4,55 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 04:53:10
+
+**`qwen3-8b/cpu-blas/`** — **IQ2_S / IQ3_S の AVX2 整数内積**、**RoPE キャッシュ**、**prefill LM head スキップ**、**greedy argmax 専用パス**、**F16 埋め込み F16C**。
+
+#### IQ2_S / IQ3_S の AVX2 化
+
+- 従来 **`vec_dot_iq2_s_q8_K` / `vec_dot_iq3_s_q8_K`** を **`_generic`** に改名。**`#if defined(__AVX2__)`** で ggml 準拠の SIMD 版を追加（Q4_K / Q5_K と同列に **全量子化型が AVX2 対応**）。
+- **IQ2_S AVX2**:
+  - **`iq2s_grid`** を **`_mm256_set_epi64x`** で 4 組まとめて load（**`qs`/`qh`** から index 合成）。
+  - **`signs`** は **`k_mask1`/`k_mask2`** + **`shuffle_epi8`** で 8 lane に展開 → **`cmpeq` + `xor`/`sub`** で Q8 符号反転（**`q8s = sub(xor(s2, q8), s2)`**）。
+  - **`maddubs_epi16(q2, q8s)`** → **`madd_epi16(scale, ·)`** → **`sumi1/sumi2`**。ブロックごと **`fmadd(d, sumi, accumf)`**。**`*out = 0.125f * hsum_float_8(accumf)`**。
+  - **4-bit scale** は **`scales[8]`** を **`memcpy` + bit unpack** → **`cvtepi8_epi16`** → **`get_scale_shuffle_k4`**。
+- **IQ3_S AVX2**:
+  - grid index を **`sllv_epi32`** + **`iq3s_grid[ix]` gather**（16 index を **`storeu` → set_epi32`**）。
+  - signs 処理は IQ2_S 同型。**scale** は **`2*ls+1`** を **`set1_epi16`**。
+  - **`*out = hsum_float_8(accumf)`**（IQ2 の 0.125 係数なし）。
+
+#### RoPE cos/sin キャッシュ
+
+- **`Model.rope_cr` / `Model.rope_ci`**: **`[max_seq × head_dim/2]`** float（起動時 **`init_rope_cache`** で **`cosf/sinf(pos·freq)`** を一括計算。**`freq = 1/rope_theta^(2i/head_dim)`**）。
+- **`apply_rope`** は **`powf/cosf/sinf` を毎ヘッド・毎ペアで呼ばず**、**`rope_cr[pos]` / `rope_ci[pos]`** を参照。Qwen3-VL-8B（**`max_seq=512`**, **`head_dim=128`**）で **~256 KiB**（cr+ci）。
+- **`main`** で **`load_weights` 後に `init_rope_cache`**、終了時 **`free_rope_cache`**。
+
+#### `forward` の LM head モード（`lm_mode`）
+
+- **`enum { FWD_NO_LM, FWD_LM_FULL, FWD_LM_ARGMAX }`**。**`forward(m, token, pos, lm_mode)`**。
+- **`generate`** が **`pos` と `temp` から選択:
+  - **`pos < n_prompt - 1`**（prefill 中・最終プロンプト token 以外）: **`FWD_NO_LM`** — **`output_norm` + LM head をスキップ**（teacher forcing で次 token 既知のため logits 不要）。
+  - **`pos >= n_prompt - 1` かつ `temp <= 0`**（greedy）: **`FWD_LM_ARGMAX`** — **`mm_argmax_row`** のみ。
+  - **それ以外**（サンプリング）: **`FWD_LM_FULL`** — 従来どおり **`mm(logits, ...)`** + **`sample_token`**。
+
+#### `mm_argmax_row`（greedy 専用）
+
+- **全 vocab 行の logits ベクトル `s->logits[vocab_size]` を materialize しない**。OpenMP で行 **`i`** ごとに dot を計算し **thread-local max** → **`critical`** で global max 更新。
+- **量子化 LM head**: **`quantize_row_q8_K(x, q8, dim)`** 1 回 → 各行 **`vec_dot_row_q8_K`**（AVX2 IQ2_S 等が効く）。
+- **F32**: **`cblas_sdot`** 行ごと。**F16**: スカラー内積ループ。
+- 結果は **`State.argmax_tok`**。**`sample_token` は呼ばず `next = argmax_tok`**。
+
+#### F16 埋め込み lookup（`emb_lookup`）
+
+- **`DT_F16`** かつ **`__AVX2__ && __F16C__`**: **`_mm_loadu_si128` + `_mm256_cvtph_ps`** で 8 要素ずつ FP16→F32（単スレッド。token 1 回あたり **`dim=4096` → 512 SIMD iter**）。
+- 非 F16C または非 AVX2: 従来 **OpenMP 行並列 `host_f16f32`**。
+
+#### ドキュメント
+
+**`doc/design.md`**: 上記を **「`cpu-blas`：Q8_K 活性化 GEMV」** 節・**CPU forward**・**実行時挙動**・**State/Model**・バリアント表に反映。IQ2_M gain 表を **AVX2 IQ2/IQ3 dot あり**に更新。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 04:34:38
 
 **`qwen3-8b/cpu-blas/`** — 量子化 GEMV の **AVX2 最適化**と **層内 Q8_K 量子化共有**。
