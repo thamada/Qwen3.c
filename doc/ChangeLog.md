@@ -4,6 +4,16 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 01:50:43
+
+**`qwen3-8b/cpu/`** — **`cpu-blas`** と同形式の **Prefill progress bar** と prefill / decode スループット要約を stderr に出力。
+
+- **`main.c`**: **`prefill_progress_update`** / **`prefill_progress_done`** / **`decode_progress_done`** / **`throughput_summary`** を追加（**`cpu-blas/main.c`**・**`gpu-cuda/main.c`** と同形式）。プロンプト区間は **1 トークンずつ forward** しながら **`Prefill [====...]`** バー（幅 40）を `\r` で更新。終了時の tok/s 一行表示を **prefill / decode / total** の stderr 要約に置き換え。
+
+**`doc/design.md`**: **`cpu`** のバリアント表・ディレクトリ表・実行時挙動を上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 01:46:44
 
 **`qwen3-8b/cpu-blas/`** — **Prefill progress bar** と prefill / decode スループット要約を stderr に出力。
