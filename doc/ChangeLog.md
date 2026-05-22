@@ -4,6 +4,21 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-22 18:35:51
+
+**CUTLASS v4.5.0 へ更新・ビルド警告整理**（**`gpu-cuda-nvfp4`**）:
+
+- **`CUTLASS_TAG`**: **`v3.9.0`** → **`v4.5.0`**。CUDA 13 非推奨ベクトル型（**`long4`** 等）警告は CUTLASS 側で解消。**`-Wno-deprecated-declarations`** を削除。
+- **`BLACKWELL_NVCCFLAGS`**: v4.5.0 の **`sm100_static_tile_scheduler.hpp`** 由来 nvcc #20012 用に **`-Xcudafe --diag_suppress=esa_on_defaulted_function_ignored`** を追加（CUTLASS 公式 **`compiler.py`** と同オプション）。Makefile コメントに背景・参考 URL を記載。
+- **`cutlass` ターゲット**: **`third_party/cutlass`** の clone タグが **`CUTLASS_TAG`** と不一致なら再 clone（旧 v3.9.0 からの自動アップグレード）。
+- **`fp4_gemm.cu`**: 未使用変数 **`num_row_tiles`** を削除。
+
+**`README.md`**・**`README.en.md`**: CUTLASS **v4.5.0** 利用・非推奨型警告解消を明記。**`-Wno-deprecated-declarations`** の記述を削除。
+
+**`doc/design.md`**: **`CUTLASS_TAG`** 変数表・**`BLACKWELL_NVCCFLAGS`** 説明・NVFP4 ビルド注意・**`third_party/cutlass`** 行を上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-22 18:09:40
 
 **`qwen3-8b/gpu-cuda-nvfp4/Makefile`**:

@@ -54,7 +54,7 @@
 | `qwen3-8b/gpu-cuda-nvfp4/fp4_gemm.cu` / `fp4_gemm.h` | CUTLASS **NVFP4** GEMM（M≥128）とデバイス側 **FP4 GEMV**（**`fp4_gemv_cached`**、バッチ版）。 |
 | `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_qwen3.h` | ホスト FP16 → NVFP4 キャッシュ（**`fp4_qwen3_weight_from_f16_host`**）、F32 活性の **`fp4_qwen3_mm`**（M に応じて GEMV / GEMM）。 |
 | `qwen3-8b/gpu-cuda-nvfp4/fp4_verify.cu` | **`make fp4-test`** 用の CUTLASS GEMM 単体検証（推論バイナリには未リンク）。 |
-| `qwen3-8b/gpu-cuda-nvfp4/third_party/cutlass/` | **`make cutlass` / `make blackwell`** で clone される CUTLASS。リポジトリ同梱ではない。 |
+| `qwen3-8b/gpu-cuda-nvfp4/third_party/cutlass/` | **`make cutlass` / `make blackwell`** で clone される CUTLASS **v4.5.0**（**`CUTLASS_TAG`**）。リポジトリ同梱ではない。タグ不一致時は **`make cutlass`** が再 clone する。 |
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **`xdna2/main.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
 | `qwen3-8b/Makefile` | **`model`**（**`gguf.txt`** の URL を **`wget`** で取得し **`$(MODEL).sha256sum`** で検証。失敗時は破損ファイルを削除）、**`build.<サブディレクトリ名>` / `run.<サブディレクトリ名>`**（例: **`build.cpu`**・**`build.gpu-rocm`**）、**`clean` / `gen-xdna-kernels`** を **`cpu/`** ほか各サブディレクトリの **`Makefile`** に委譲。 |
@@ -184,7 +184,8 @@ make run.polarquant MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 | `NVCC` | CUDA コンパイラ | `$(CUDA_HOME)/bin/nvcc` |
 | `CUDA_GENCODE` | `-gencode` 引数（**`gpu-cuda`** の **`kernels.cu`**、および **`gpu-cuda-nvfp4`** の PolarQuant 無し時） | **`gpu-cuda`**: `arch=compute_86,code=compute_86`。**`gpu-cuda-nvfp4`**: `arch=compute_120a,code=sm_120a` |
 | `BLACKWELL_GENCODE` | **`gpu-cuda-nvfp4`** の **`fp4_*`** オブジェクト用 `-gencode` | `arch=compute_120a,code=sm_120a` |
-| `BLACKWELL_NVCCFLAGS` | **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** / **`fp4-test`** 用 | **`-std=c++17`**（CUTLASS 必須）+ **`BLACKWELL_GENCODE`** 固定（NVFP4 MMA 必須）。ホスト側 **`-Wno-deprecated-declarations`** で CUTLASS **`platform.h`** の CUDA 13 非推奨警告を抑制 |
+| `CUTLASS_TAG` | **`third_party/cutlass`** の clone タグ（**`gpu-cuda-nvfp4/Makefile`**） | **`v4.5.0`** |
+| `BLACKWELL_NVCCFLAGS` | **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** / **`fp4-test`** 用 | **`-std=c++17`**（CUTLASS 必須）+ **`BLACKWELL_GENCODE`** 固定（NVFP4 MMA 必須）。**`-Xcudafe --diag_suppress=esa_on_defaulted_function_ignored`**（CUTLASS v4.5.0 の **`sm100_static_tile_scheduler.hpp`** 由来 nvcc #20012 用。CUTLASS 公式ビルドと同オプション。詳細は **`gpu-cuda-nvfp4/Makefile`** コメント参照） |
 | `FP4_GEMM_OBJ` / `FP4_QWEN3_OBJ` | NVFP4 オブジェクト名（**`gpu-cuda-nvfp4`** のみ） | **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** |
 | `SRC_DIR` | 共有ソース参照（**`gpu-cuda-nvfp4/Makefile`**） | `../gpu-cuda` |
 | `MODEL` | GGUF パス（各 CUDA ディレクトリからの相対） | `../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf` |
@@ -511,7 +512,10 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 - **`MAIN_OBJ`**（**`main.pq$(BONSAI_POLARQUANT).o`**）も **`BONSAI_FP4=1`** でコンパイル（**`gpu-cuda-nvfp4/Makefile`**）。ソースは **`$(SRC_DIR)/main.c`**。
 - **`kernels.fabr$(FA_BR).pq$(BONSAI_POLARQUANT).o`** で PolarQuant / FA_BR 変更時の stale `.o` を防止。ソースは **`$(SRC_DIR)/kernels.cu`**。
-- **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** は **`CUDA_GENCODE`** とは独立し、常に **`BLACKWELL_NVCCFLAGS`**（**`-std=c++17`** + **`arch=compute_120a,code=sm_120a`**）でビルドする。CUTLASS NVFP4 は **C++17 必須**。CUDA 13 では CUTLASS 由来の **`-Wdeprecated-declarations`**（**`long4`** 等）が出るため、**`-Wno-deprecated-declarations`** で抑制する（**`third_party/cutlass`** は当リポジトリ側では改変しない）。CUTLASS NVFP4 の sm_120 MMA を **`compute_86` PTX** だけに載せると実行時 abort する。
+- **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** は **`CUDA_GENCODE`** とは独立し、常に **`BLACKWELL_NVCCFLAGS`**（**`-std=c++17`** + **`arch=compute_120a,code=sm_120a`**）でビルドする。CUTLASS NVFP4 は **C++17 必須**。CUTLASS NVFP4 の sm_120 MMA を **`compute_86` PTX** だけに載せると実行時 abort する。
+- **CUTLASS バージョン**: **`CUTLASS_TAG=v4.5.0`**（旧 **`v3.9.0`** から更新）。初回またはタグ変更後は **`make cutlass`**（**`third_party/cutlass`** が無い／タグ不一致なら clone／再 clone）。
+- **CUDA 13 非推奨ベクトル型（`long4` 等）**: v4.5.0 の **`platform.h`** で CUTLASS 側が解消済み。旧版で必要だった **`-Wno-deprecated-declarations`** は不要。
+- **nvcc 警告 #20012**（**`= default` コンストラクタ + `__device__`/`__host__`**）: v4.5.0 の **`sm100_static_tile_scheduler.hpp`** が CUTLASS 側コードとして発する。**`third_party/cutlass`** は当リポジトリ側では改変しない。CUTLASS 公式 nvcc ビルド（**`python/cutlass_cppgen/backend/compiler.py`**）と同じ **`-Xcudafe --diag_suppress=esa_on_defaulted_function_ignored`** を **`BLACKWELL_NVCCFLAGS`** に付ける。背景・参考 URL は **`gpu-cuda-nvfp4/Makefile`** コメントに記載。
 - 検証: **`cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test`**（**`fp4_verify.cu`** — square / wk / wq_M256 の 3 ケース、ratio &lt; 0.45 で PASS。**Blackwell GPU 必須**）。
 
 ## 補足：CUDA PolarQuant-R（`build.polarquant`）実装メモ
