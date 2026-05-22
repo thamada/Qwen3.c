@@ -35,9 +35,9 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 
 | 実行方法 | 使うファイル | 作られる実行ファイル | 向いている用途 |
 |---|---|---|---|
-| CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
+| CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす。**Prefill progress bar** とスループット要約を stderr に出力 |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
-| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV（IQ2_S / IQ3_S / Q4_K / Q5_K）は活性 Q8_K 化 + ggml 準拠の整数内積（no per-row float[256] dequant） |
+| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は **Q8_K 活性化 + 全型 AVX2 整数内積**（層内 Q8 共有）。**RoPE キャッシュ**、prefill 中 **LM head スキップ**、greedy 時 **`mm_argmax_row`**。**F16 埋め込み F16C**。stderr に **Prefill progress bar** |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
 | CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。集約 `Makefile` 外 |
 | CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。集約 `Makefile` 外 |
@@ -147,13 +147,15 @@ sudo apt install -y libgomp1
 
 ### OpenBLAS 版（`cpu-blas`）を使う場合
 
-**OpenBLAS**（`libopenblas-dev` 等）と OpenMP ランタイムが必要です。`pkg-config openblas` が使える環境では Makefile が自動で include / link フラグを拾います。
+**OpenBLAS**（`libopenblas-dev` 等）と OpenMP ランタイムが必要です。`pkg-config openblas` が使える環境では Makefile が自動で include / link フラグを拾います。パッケージ導入は **`cpu-blas/Makefile`** の **`make openblas`** でも行えます（`libopenblas-dev` / `libgomp1` を apt 導入）。
 
 ```bash
 sudo apt install -y libopenblas-dev libgomp1
+# または
+cd qwen3-8b/cpu-blas && make openblas
 ```
 
-ヘッダが標準パスに無い場合（Debian/Ubuntu の pthread ビルド等）は、ビルド時に `CPPFLAGS` で指定します。
+ヘッダが標準パスに無い場合（Debian/Ubuntu の pthread ビルド等）は、ビルド時に `CPPFLAGS` で指定します。`cblas.h` 未検出時は Makefile が **`make openblas`** と **`CPPFLAGS`** 例を表示します。
 
 ```bash
 cd qwen3-8b/cpu-blas
@@ -282,6 +284,8 @@ ls -lh cpu/qwen3-cpu
 
 ### 実行
 
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます。
+
 ```bash
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で短く自己紹介してください。" -n 16
 ```
@@ -330,7 +334,9 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 
 ## CPU OpenMP + OpenBLAS 版
 
-`cpu-multicore` と同じデコーダ・同じ GGUF を読み、**F32 行列積（`cblas_sgemv`）** と **Attention の K/V 合成**を OpenBLAS に任せます。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は、入力を **Q8_K** に量子化（**`quantize_row_q8_K`**）したうえで **ggml-cpu/quants.c** 準拠の **`vec_dot_*_q8_K`** 整数内積を使います（`cpu-multicore` のような per-row float[256] dequantization は行わない）。出力行の OpenMP 並列は維持します。
+`cpu-multicore` と同じデコーダ・同じ GGUF を読み、**F32 行列積（`cblas_sgemv`）** と **Attention の K/V 合成**を OpenBLAS に任せます。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は、入力を **Q8_K** に量子化（**`quantize_row_q8_K`**）したうえで **ggml-cpu/quants.c** 準拠の **`vec_dot_*_q8_K`** 整数内積を使います（`cpu-multicore` のような per-row float[256] dequantization は行わない）。**Attention / FFN 内で同一活性ベクトルを共有する GEMV では Q8 量子化を 1 回にまとめる**（層内 Q8 共有）。**`__AVX2__`** 時は IQ2_S / IQ3_S / Q4_K / Q5_K の dot と Q8 量子化を SIMD 化（**`-march=native`** 既定）。
+
+そのほか CPU 向けの最適化として、**RoPE cos/sin キャッシュ**（起動時に `[max_seq × head_dim/2]` を一括計算）、prefill 中（最終プロンプト token 以外）の **LM head スキップ**（**`FWD_NO_LM`**）、**`-t 0`（greedy）** 時の **`mm_argmax_row`**（全 vocab logits を確保しない）、**F16 埋め込み**の **F16C+AVX2** SIMD 変換があります。プロンプト区間は stderr に **Prefill progress bar**（`Prefill [====...]`、幅 40）と prefill / decode / total のスループット要約を出力します。
 
 ### ビルド
 
@@ -342,6 +348,8 @@ make build.cpu-blas
 成功すると **`cpu-blas/qwen3-cpu-blas`** ができます（`cpu-blas/` 直下で `make build` でも可）。
 
 ### 実行
+
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます。
 
 ```bash
 OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
@@ -654,7 +662,7 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-速度が必要なら AMD GPU では `./gpu-rocm/qwen3-rocm`、NVIDIA GPU では `gpu-cuda/qwen3-gpu-cuda`（FP16）または `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`（Blackwell NVFP4）を使ってください。CPU のみの場合は **`cpu-blas/qwen3-cpu-blas`**（OpenBLAS + Q8_K 量子化 GEMV）の方が **`cpu-multicore`** より速くなることが多いです。
+速度が必要なら AMD GPU では `./gpu-rocm/qwen3-rocm`、NVIDIA GPU では `gpu-cuda/qwen3-gpu-cuda`（FP16）または `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`（Blackwell NVFP4）を使ってください。CPU のみの場合は **`cpu-blas/qwen3-cpu-blas`**（OpenBLAS + Q8_K 量子化 GEMV + AVX2 dot + 層内 Q8 共有 + RoPE キャッシュ + prefill LM スキップ + greedy argmax）の方が **`cpu-multicore`** より速くなることが多いです。**greedy（`-t 0`）** では decode の LM head がさらに軽くなります。
 
 ### `cpu-blas` のビルドが失敗する／`cblas.h` が見つからない
 
@@ -754,7 +762,7 @@ make build.gpu-rocm GPU_ARCH=gfx1100
    OpenMP による並列化箇所を見る。
 
 5. `qwen3-8b/cpu-blas/main.c`  
-   OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。量子化 GEMV は Q8_K 活性化 + `vec_dot_*_q8_K` 整数内積。
+   OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。量子化 GEMV は Q8_K 活性化 + 全型 AVX2 整数内積（層内 Q8 共有）。RoPE キャッシュ、**`lm_mode`**（prefill LM スキップ / greedy **`mm_argmax_row`**）、F16 emb F16C。詳細は **`doc/design.md`** の **「`cpu-blas`：Q8_K 活性化 GEMV」** 節。
 
 6. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
