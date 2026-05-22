@@ -759,13 +759,15 @@ Suggested order:
 
 ## Advanced features (multi-turn chat and Thinking mode)
 
-The Qwen3 family (and reasoning-oriented lines such as QwQ, comparable in spirit to DeepSeek-style models) assumes richer **chat templates** and **inference modes** than a single `-p "..."` CLI prompt. This repository reproduces only the **minimal decoder forward + sampling path** in C. The following advanced features are **not implemented** today; keep the notes below in mind when using or extending the code.
+The Qwen3 family (including reasoning lines such as QwQ) assumes **ChatML templates** and **Thinking mode** beyond a single `-p "..."` prompt. This repository implements only **decoder forward + sampling** in C; the advanced features below are **not implemented**. Keep the gap from official behavior in mind when using or extending the code.
+
+General template background: [Qwen3 official blog](https://qwenlm.github.io/blog/qwen3/), [The 4 Things Qwen-3’s Chat Template Teaches Us (Hugging Face Blog)](https://huggingface.co/blog/qwen-3-chat-template-deep-dive), [Qwen/Qwen3-8B model card](https://huggingface.co/Qwen/Qwen3-8B).
 
 ### Multi-turn dialogue
 
-Official Qwen3 stacks expect **multi-turn ChatML history**—system / user / assistant rounds appended in order—with prior context carried via KV cache or re-prefill. Agent flows (tool calling) also assume **past assistant turns, tool results, and reasoning blocks** are fed into the next turn.
+**Official behavior** — Append system / user / assistant turns in ChatML order and carry context via KV cache or re-prefill. In function calling, past assistant turns, tool results, and (when needed) reasoning regions are passed to the next turn.
 
-Each `main.c` implements **`chat_encode` as a fixed single turn only**:
+**This repo today** — Each `main.c` implements **`chat_encode` as a fixed single turn only**:
 
 ```text
 <|im_start|>system … <|im_end|>
@@ -773,19 +775,38 @@ Each `main.c` implements **`chat_encode` as a fixed single turn only**:
 <|im_start|>assistant\n
 ```
 
-There is **no CLI for prior user/assistant rounds** and **no conversation state across process invocations**. To approximate multi-turn behavior you must either (1) hand-build ChatML history into `-p`, (2) extend `chat_encode` to accept a turn list, or (3) reuse KV from a previous run (today every run prefills from scratch). History longer than `-l` (`max_seq`) needs truncation or summarization.
+There is no CLI for prior turns and **no conversation state across process invocations** (every run prefills from scratch). To approximate multi-turn behavior:
+
+1. Hand-build ChatML history and pass it via `-p`
+2. Extend `chat_encode` to accept a turn list
+3. Reuse KV from a previous run (not supported today)
+
+History longer than `-l` (`max_seq`) needs truncation or summarization.
+
+**References (technical details)**
+
+- [Transformers — Chat templating](https://huggingface.co/docs/transformers/main/en/chat_templating) — `messages` to ChatML, `apply_chat_template`
+- [Function Calling (Qwen docs)](https://qwen.readthedocs.io/en/latest/framework/function_call.html) — Hermes-style format, chaining assistant / tool roles
+- [Core concepts — Tool Calling (Qwen)](https://qwen.readthedocs.io/en/latest/getting_started/concepts.html) — multi-turn / multi-step tool calling template example
 
 ### Thinking mode (reasoning before the final answer)
 
-Qwen3 **hybrid thinking** (similar in goal to DeepSeek-R1 / QwQ “think then answer”) is toggled in official stacks via APIs or Hugging Face `apply_chat_template(..., enable_thinking=True/False)`. When enabled, the assistant prefix may include a **thinking block** (`tokenizer.chat_template` inserts a reasoning region bounded by model-specific special tokens) before the final answer. When disabled, templates often insert an **empty thinking block** to steer the model toward direct answers. In multi-turn chat, **`/think` and `/no_think`** appended to user messages provide a **per-turn soft switch** (latest instruction wins).
+**Official behavior** — Qwen3 **hybrid thinking** (DeepSeek-R1 / QwQ-style “think then answer”) is toggled via **hard switch** (`apply_chat_template(..., enable_thinking=True/False)` or API `enable_thinking`) and **soft switch** (`/think` / `/no_think` appended to user messages; latest instruction wins in multi-turn). When enabled, a **thinking block** (a reasoning region inserted by the template) precedes the final answer. When disabled, an **empty thinking block** steers the model toward direct answers. These markers are tokenized as normal text, unlike ChatML special tokens such as `<|im_start|>`.
 
-This repository does **not**:
+**This repo today** — It does **not**:
 
 - Control generation prompts equivalent to **`enable_thinking`** (e.g. empty thinking block before assistant generation)
-- **Separate or hide** thinking vs final answer in output (`print_tok` prints non-ChatML specials to stdout as-is)
+- **Separate or hide** thinking vs final answer (`print_tok` suppresses only ChatML special IDs; reasoning text goes to stdout as-is)
 - Implement API-style extras such as **`thinking_budget`** or dedicated reasoning streams
 
-Running thinking-capable GGUF weights as-is may **dump raw reasoning text to the terminal** or **degrade quality** if the prompt does not match the official template. Correct Thinking support requires **`chat_encode` / generation-loop changes** aligned with the GGUF `tokenizer.chat_template` metadata and **parsing/filtering of thinking regions** on output.
+Running thinking-capable GGUF weights as-is may **mix reasoning text into the terminal** or **degrade quality** on template mismatch. Correct support requires **`chat_encode` / generation-loop changes** aligned with GGUF `tokenizer.chat_template` metadata and **parsing of thinking regions** on output.
+
+**References (technical details)**
+
+- [Quickstart — Thinking & Non-Thinking Mode (Qwen)](https://qwen.readthedocs.io/en/stable/getting_started/quickstart.html) — hard / soft switch, `thinking_budget`, recommended sampling
+- [Transformers inference guide (Qwen)](https://qwen.readthedocs.io/en/latest/inference/transformers.html) — toggling thinking, parsing `reasoning_content`
+- [Thinking (Qwen Cloud)](https://docs.qwencloud.com/developer-guides/text-generation/thinking) — API `enable_thinking` / `thinking_budget` / `reasoning_content`
+- [vLLM deployment (Qwen)](https://qwen.readthedocs.io/en/latest/deployment/vllm.html) — `chat_template_kwargs.enable_thinking`, reasoning parser
 
 ### Where this repo stands (summary)
 
@@ -798,7 +819,7 @@ Running thinking-capable GGUF weights as-is may **dump raw reasoning text to the
 | `/think` / `/no_think` | Yes (hybrid models) | No (not interpreted) |
 | Filtered thinking display | Yes (API / UI) | No |
 
-For **understanding one-shot text generation** in C, this repo is sufficient. For **ChatGPT / Qwen API–class multi-turn chat or Thinking UI**, extend the code or use vLLM, llama.cpp, Transformers, etc. Background: [Qwen3 blog](https://qwenlm.github.io/blog/qwen3/) and Hugging Face articles on the Qwen3 chat template.
+This repo is sufficient as a **one-shot text generation** reference. For **ChatGPT / Qwen API–class multi-turn chat or Thinking UI**, extend the code or use existing runtimes such as vLLM, llama.cpp, or Transformers.
 
 ## Out of scope
 
