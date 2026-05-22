@@ -198,10 +198,6 @@ __device__ __forceinline__ int compute_sf_index(int r, int k_block, int rows, in
     int k1 = k_block % 4;
     int k2 = k_block / 4;
 
-    // Number of row tiles and k tiles
-    int num_row_tiles = rows / 128;
-    // int num_k_tiles = nsb / 4;  // nsb = K/16, each tile covers 4 scale blocks
-
     // Atom filtered size = 32*4 * 4 = 512? No...
     // The atom shape ((32,4),(16,4)), stride ((16,4),(0,1))
     // Filtered (remove zeros): shape ((32,4),(4,)), stride ((16,4),(1,))

@@ -37,13 +37,15 @@ BLACKWELL_FA_BR     ?= 32
 CUTLASS_DIR ?= third_party/cutlass
 CUTLASS_TAG ?= v3.9.0
 
-FP4_CXXFLAGS = -std=c++17 --expt-relaxed-constexpr \
-               -I$(CUTLASS_DIR)/include \
+FP4_CXXFLAGS = -I$(CUTLASS_DIR)/include \
                -I$(CUTLASS_DIR)/tools/util/include \
                -DCUTLASS_ARCH_MMA_SM120_SUPPORTED
 
-# NVFP4 GEMM オブジェクトは sm_120a 固定 gencode
-BLACKWELL_NVCCFLAGS = -O3 -std=c++14 -Xcompiler -Wall,-Wextra,-Wno-unused-parameter \
+# NVFP4 GEMM オブジェクトは sm_120a 固定 gencode（CUTLASS は C++17 必須）
+# CUTLASS 由来の非推奨警告: CUDA 13 で long4 等のベクトル型が非推奨になり、
+# third_party/cutlass/include/cutlass/platform/platform.h が -Wdeprecated-declarations
+# を発する。当リポジトリ側で修正できないため -Wno-deprecated-declarations で抑制する。
+BLACKWELL_NVCCFLAGS = -O3 -std=c++17 -Xcompiler -Wall,-Wextra,-Wno-unused-parameter,-Wno-deprecated-declarations \
                       -use_fast_math --expt-relaxed-constexpr \
                       -gencode $(BLACKWELL_GENCODE)
 

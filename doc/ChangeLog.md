@@ -4,6 +4,17 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-22 18:09:40
+
+**`qwen3-8b/gpu-cuda-nvfp4/Makefile`**:
+
+- **`BLACKWELL_NVCCFLAGS`**: **`-std=c++14`** → **`-std=c++17`**（CUTLASS NVFP4 は C++17 必須）。**`FP4_CXXFLAGS`** から重複していた **`-std=c++17`** を除去。
+- **`-Wno-deprecated-declarations`**: CUDA 13 で CUTLASS **`platform.h`** が **`long4`** 等の非推奨ベクトル型により **`-Wdeprecated-declarations`** を発するため、当リポジトリ側で修正できない警告を抑制。
+
+**`doc/design.md`**: **`BLACKWELL_NVCCFLAGS`** 変数表・NVFP4 実装メモのビルド注意を上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-22 17:55:46
 
 **CUDA ディレクトリ分割** — NVFP4 なし **`qwen3-8b/gpu-cuda/`** と NVFP4 専用 **`qwen3-8b/gpu-cuda-nvfp4/`** に分離。

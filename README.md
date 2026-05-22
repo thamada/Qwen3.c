@@ -159,7 +159,7 @@ rocminfo | grep -m 1 gfx
 NVIDIA GPU と **CUDA Toolkit**（`nvcc`・`libcudart`）が必要です。集約 `qwen3-8b/Makefile` には CUDA ターゲットは無く、次の2ディレクトリで単体ビルドします。
 
 - **`qwen3-8b/gpu-cuda/`** — FP16 線形層（汎用 NVIDIA GPU）
-- **`qwen3-8b/gpu-cuda-nvfp4/`** — NVFP4 線形層（Blackwell / RTX 50 系、CUDA 13 + CUTLASS）
+- **`qwen3-8b/gpu-cuda-nvfp4/`** — NVFP4 線形層（Blackwell / RTX 50 系、**CUDA 13** + CUTLASS）。初回は **`make cutlass`** で **`third_party/cutlass`** を取得。**`fp4_*` オブジェクトは C++17 でビルド**（CUTLASS 要件）。apt **`nvidia-cuda-toolkit`（CUDA 11）** と CUDA 13 は併存させない（**`make blackwell`** が 11.x を除去して 13 を入れる）。
 
 確認例:
 
@@ -180,7 +180,7 @@ nvidia-smi
 | PolarQuant ラウンドトリップ検証 | 各ディレクトリで `make pq-test` |
 | CUTLASS NVFP4 GEMM 単体検証 | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fp4-test`（**Blackwell / sm_120a 必須**） |
 
-FP16 ビルド（`gpu-cuda`）の既定は PTX（`compute_86`）。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。NVFP4 ビルド（`gpu-cuda-nvfp4`）の既定は **`sm_120a`** です。
+FP16 ビルド（`gpu-cuda`）の既定は PTX（`compute_86`）。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。NVFP4 ビルド（`gpu-cuda-nvfp4`）の既定は **`sm_120a`** です。**`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** は **`BLACKWELL_NVCCFLAGS`**（**`-std=c++17`** + **`sm_120a` 固定**）でコンパイルします。CUDA 13 では CUTLASS 由来の非推奨警告が出るため、Makefile で **`-Wno-deprecated-declarations`** を付けています（**`third_party/cutlass`** は当リポジトリ側では改変しません）。
 
 ## モデルファイルを置く
 
@@ -358,7 +358,7 @@ NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` に�
 | **`gpu-cuda-nvfp4`** | H2D 時に線形層を **NVFP4 キャッシュのみ** VRAM へ。**`token_embd`** のみ FP16 | **`fp4_qwen3_mm`** — decode / 短 Prefill は **FP4 GEMV**、長 Prefill は CUTLASS GEMM |
 | **`gpu-cuda-nvfp4`** + **`build.polarquant`** | 線形は NVFP4 のみ（上と同じ） | 線形は FP4 GEMV/GEMM。KV は PolarQuant-R |
 
-**`gpu-cuda-nvfp4`** は CUTLASS **NVFP4** を使い、**CUDA 13 + sm_120 系 GPU**（Blackwell / RTX 50 系等）向けです。**PolarQuant-R** は [arxiv:2502.02617](https://arxiv.org/abs/2502.02617) に基づく KV 圧縮で、**`head_dim=128` 固定**（Qwen3-VL-8B 向け）。F32 KV 比 **約 8×** の VRAM 削減（36 layer × 512 seq で ~144 MiB → ~18 MiB 概算）。NVFP4 + PolarQuant 同時では線形 FP16 分（8B 級で約 15 GiB 相当）と KV F32 分の両方を削減できます。
+**`gpu-cuda-nvfp4`** は CUTLASS **NVFP4** を使い、**CUDA 13 + sm_120 系 GPU**（Blackwell / RTX 50 系等）向けです。**`fp4_gemm.cu`** / **`fp4_qwen3.cu`** は **C++17** 必須（CUTLASS）。**PolarQuant-R** は [arxiv:2502.02617](https://arxiv.org/abs/2502.02617) に基づく KV 圧縮で、**`head_dim=128` 固定**（Qwen3-VL-8B 向け）。F32 KV 比 **約 8×** の VRAM 削減（36 layer × 512 seq で ~144 MiB → ~18 MiB 概算）。NVFP4 + PolarQuant 同時では線形 FP16 分（8B 級で約 15 GiB 相当）と KV F32 分の両方を削減できます。
 
 ### ビルド・実行（FP16・汎用 GPU）
 
@@ -441,7 +441,7 @@ NVFP4 版:
   -n 64
 ```
 
-CUTLASS NVFP4 GEMM の単体確認（任意）: `cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test`（**`fp4_verify.cu`**。**Blackwell / sm_120a 向け**。RTX 50 系等）。詳細は `doc/design.md` の CUDA 節を参照してください。
+CUTLASS NVFP4 GEMM の単体確認（任意）: `cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test`（**`fp4_verify.cu`**。**Blackwell / sm_120a 向け**、RTX 50 系等。**`fp4_gemm.sm120a.o`** は **C++17 + `sm_120a` 固定**）。詳細は `doc/design.md` の CUDA 節を参照してください。
 
 ## AMD Ryzen AI XDNA2 NPU 版
 
@@ -619,7 +619,15 @@ PTX のみのビルドで極端に遅い場合は、実機の `sm_XX` を `CUDA_
 
 ### NVFP4 ビルドが失敗する／`NVFP4 quantize failed`
 
-**`gpu-cuda-nvfp4`** で **`sm_120a`** 向けビルドか、CUDA 13 + **`make cutlass`** 済みかを確認してください。汎用 GPU では **`gpu-cuda`** で **`make build`**（FP16）を使います。
+**`gpu-cuda-nvfp4`** で **`sm_120a`** 向けビルドか、CUDA 13 + **`make cutlass`** 済みかを確認してください。汎用 GPU では **`gpu-cuda`** で **`make build`**（FP16）を使います。apt **CUDA 11** と **CUDA 13** が混在している場合は **`make blackwell`** で整理するか、手動で 11.x を除去してください。
+
+### `make fp4-test` が FAIL する／`Arch conditional MMA instruction... Aborting`
+
+**`fp4_gemm`** を **`compute_86` PTX** のみでビルドした古い **`fp4_gemm.o`** を使っている可能性があります。**`gpu-cuda-nvfp4`** で **`make clean`** → **`make fp4-test`** を再実行してください（**`fp4_gemm.sm120a.o`** は **`sm_120a` + C++17** 固定）。**Blackwell GPU 必須**です。
+
+### NVFP4 で decode が極端に遅い
+
+古いバイナリが M=1 を CUTLASS M=128 パディング経路に落としている場合があります。最新 **`fp4_gemv_cached`** 入り **`gpu-cuda-nvfp4`** ビルドか確認し、起動ログに **`GEMM M>=128, GEMV decode`** が出ることを確認してください。
 
 ### `gpu-cuda-nvfp4` の PolarQuant ビルドが遅い／`Killed`（OOM）
 
@@ -694,7 +702,7 @@ make build.gpu-rocm GPU_ARCH=gfx1100
    CUDA FP16 版の Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。
 
 7. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
-   Blackwell NVFP4 版。H2D 時 NVFP4 ロード、**`fp4_gemv_cached`**（decode）と **`fp4_qwen3_mm`**（GEMM/GEMV 分岐）。共有ソースは **`../gpu-cuda/`** を参照。
+   Blackwell NVFP4 版。H2D 時 NVFP4 ロード、**`fp4_gemv_cached`**（decode）と **`fp4_qwen3_mm`**（GEMM/GEMV 分岐）。**`fp4_*` は C++17 + `sm_120a` 固定**（CUTLASS）。共有ソースは **`../gpu-cuda/`** を参照。
 
 8. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
