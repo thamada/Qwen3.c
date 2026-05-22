@@ -1238,7 +1238,7 @@ static void dequant_tensor_all_f32(Model *m, const TensorInfo *ti, float *dst) {
 /*
  * GEMV 重み W: 論理形状は n_out 行 × n_in 列（main-omp の mm(o,x,w,n_in,n_out) と同じ）。
  * GGUF が [n_out,n_in] のときは行単位デコード可能。[n_in,n_out] のときは論理行 r が
- * full[r*n_in ..) に連続して並ぶのでフルデ量子化してから詰める。
+ * full[r*n_in ..) に連続して並ぶので full dequant してから詰める。
  */
 static void bfpx_convert_weight_2d(Model *m, TensorInfo *ti, int n_out, int n_in,
                                    const char *tensor_name, BfpxMat *out) {

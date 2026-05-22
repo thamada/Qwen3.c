@@ -4,6 +4,19 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 01:29:29
+
+**`qwen3-8b/cpu-blas/`** — 量子化 GEMV を **Q8_K 活性化 + 整数内積**に変更。
+
+- **`main.c`**: 量子化 GEMV（IQ2_S / IQ3_S / Q4_K / Q5_K）で、per-row **float[256] dequant** を廃止。**`quantize_row_q8_K`** で活性を Q8_K 化し、**`vec_dot_*_q8_K`**（**ggml-cpu/quants.c** / **llama.cpp** の **`ggml_vec_dot_*_q8_K`** 準拠）で重み行と整数内積。**`State.q8`**（**`hidden_dim / QK_K`** 分）を追加。出力行の OpenMP 並列（**`mm_quant_rows`**）は維持。
+- **`Makefile`**: **`CFLAGS`** に **`-march=native`** を追加。
+
+**`doc/design.md`**: **`cpu-blas`** のバリアント表・実行時挙動・量子化と行列積・制約を上記に追随。
+
+**`README.md`**・**`README.en.md`**: 実行経路表・OpenBLAS 節・CPU OpenMP + OpenBLAS 節・トラブルシュート・実装を読む順序を上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-22 23:48:05
 
 **CPU OpenMP + OpenBLAS 版（`cpu-blas`）** を追加。
@@ -329,7 +342,7 @@
 
 ## 2026-05-14 01:09:19
 
-**`qwen3-8b/main-xdna2-bfpx.c`** を追加（出力バイナリ **`qwen3-xdna2-bfpx`**、`make build.xdna2.bfpx`）。`main-xdna2.c` と同じ **amdxdna DRM ioctl + チャンク BF16 GEMV（`ERT_START_NPU`）** 経路を使うが、線形重みは GGUF mmap を長時間載せず、ロード時に **ブロック浮動小数点（各ブロックに BF16 スケール + int8 係数、`BFPU_BLK=64`）** に変換してホストに保持する。RMSNorm 等の小さいテンソルは従来どおり F32 をヒーブに複製。論理形状は **`main-omp.c` の `mm(o,x,w,n_in,n_out)`** と整合させ、`GGUF` が **`[n_in,n_out]`** と並んでいるテンソル（例: **`ffn_down`**）は転置レイアウトとしてフルデ量子化してから行単位でエンコードする。**`token_embd.weight` / `output.weight`** も同じ **`bfpx_convert_weight_2d`** で `[dim,vocab]` / IQ 時のストライド布局を吸収。
+**`qwen3-8b/main-xdna2-bfpx.c`** を追加（出力バイナリ **`qwen3-xdna2-bfpx`**、`make build.xdna2.bfpx`）。`main-xdna2.c` と同じ **amdxdna DRM ioctl + チャンク BF16 GEMV（`ERT_START_NPU`）** 経路を使うが、線形重みは GGUF mmap を長時間載せず、ロード時に **ブロック浮動小数点（各ブロックに BF16 スケール + int8 係数、`BFPU_BLK=64`）** に変換してホストに保持する。RMSNorm 等の小さいテンソルは従来どおり F32 をヒーブに複製。論理形状は **`main-omp.c` の `mm(o,x,w,n_in,n_out)`** と整合させ、`GGUF` が **`[n_in,n_out]`** と並んでいるテンソル（例: **`ffn_down`**）は転置レイアウトとして full dequant してから行単位でエンコードする。**`token_embd.weight` / `output.weight`** も同じ **`bfpx_convert_weight_2d`** で `[dim,vocab]` / IQ 時のストライド布局を吸収。
 
 ### 実装ハイライト
 

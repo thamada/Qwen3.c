@@ -5,7 +5,7 @@
 
 CC      ?= cc
 # -ffast-math は IQ2_S/IQ3_S 量子化内積・RMSNorm で数値が崩れ推論が壊れるため使わない
-CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter -fopenmp
+CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter -fopenmp -march=native
 LDFLAGS ?= -fopenmp -lopenblas -lm
 
 MODEL   ?= ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
