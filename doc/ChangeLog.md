@@ -4,6 +4,46 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 05:08:32
+
+**`qwen3-8b/cpu-blas/`** — **埋め込み F32 キャッシュ**、**LM head top-k サンプリング**（**`FWD_LM_TOPK`**）、**F16 dot SIMD**、**OpenMP / argmax 集約の改善**。
+
+#### 埋め込み F32 キャッシュ（`Weights.embd_f32`）
+
+- **`token_embd.weight`** が **F32 以外**（IQ2_S / F16 等）のとき、起動時 **`build_embd_f32_cache`** で **`[vocab_size × dim]`** float を **1 回だけ**展開して **`Weights.embd_f32`** に保持。
+- **`load_weights` 直後**（**`init_tokenizer` 前**）に OpenMP **`for id in 0..vocab-1`** で各行 **`emb_lookup`**。stderr に **GiB サイズ**と **構築秒数**を出力。
+- Qwen3-VL-8B（**`vocab≈152k`**, **`dim=4096`**）では **~2.3 GiB**。F32 埋め込みの場合は mmap をそのまま **`memcpy`** し追加確保なし。
+- **`forward`** は **`emb_lookup_cached`**: キャッシュ or F32 mmap から **`memcpy(o, row, dim×4)`**（token 1 回あたり **~16 KiB**）。推論中の **量子化/F16 逐次デ量子化を排除**。
+- 終了時 **`free_weight_ptrs`** で **`embd_f32`** を解放。
+
+#### LM head top-k（`FWD_LM_TOPK` / `LM_TOPK=4096`）
+
+- **`enum`** に **`FWD_LM_TOPK = 3`** を追加。**`State.lm_topk`**（**`LmTop { float v; int i; }`** × **`LM_TOPK`**）、**`State.lm_topk_n`**。
+- **`generate`** の **`lm_mode` 選択**（**`pos >= n_prompt-1`** 時）:
+  - **`temp <= 0`**: **`FWD_LM_ARGMAX`**（従来）
+  - **`topp < 0.999f`**: **`FWD_LM_TOPK`** — nucleus 等 **top-p 有効**時
+  - **それ以外**（**`topp >= 0.999f`**）: **`FWD_LM_FULL`** — 全 vocab **`mm(logits)`**
+- **`mm_logits_topk`**: **`quantize_row_q8_K(x, q8, dim)`** 1 回 → OpenMP 行 **`i`** ごと **`vec_dot_row_q8_K`** → **スレッド局所 min-heap**（**`topk_push` / `topk_siftdown`**、最大 **`kmax=4096`** 件）→ **`topk_merge`** で global top-k。**`s->logits[vocab]` への書き込みなし**。
+- **`sample_token_topk`**: top-k 件（**`≤4096`**）のみ **`/temp` → softmax → top-p / 多項サンプル**（**`sample_token`** と同型ロジック、配列は **`LM_TOPK`** 固定）。
+- **制約**: 現状 **量子化 LM head**（IQ2_S 等）のみ。**top-4096 外の token はサンプル空間に入らない**近似（速度とメモリのトレードオフ）。F32/F16 output 重みは未対応（**`exit`**）。
+
+#### `mm_argmax_row` の集約改善
+
+- **`#pragma omp critical`** を廃止。**スレッド数 `nth` 分の `tv[]` / `ti[]`** に thread-local max を書き、**逐次 merge** で global argmax（ロック競合削減）。
+- **F16 行**: 新設 **`dot_f16_row`**（**AVX2+F16C** 時 **8 要素 `fmadd`**）を使用。
+
+#### F16 内積 SIMD（`dot_f16_row`）
+
+- **`mm_f16`**: 行ループを **`dot_f16_row`** に委譲。**`schedule(static, 512)`**。
+- **`mm_quant_dot_rows`**: 同 **`schedule(static, 512)`**。
+- **F16C 非対応 / 非 AVX2**: スカラー **`host_f16f32`** フォールバック。
+
+#### ドキュメント
+
+**`doc/design.md`**: 埋め込みキャッシュ・**`FWD_LM_TOPK`**・**`mm_logits_topk` / `sample_token_topk`**・**`dot_f16_row`**・**`lm_mode` 分岐表**・IQ2_M gain 表・スコープ外（top-k 近似）を更新。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 04:53:10
 
 **`qwen3-8b/cpu-blas/`** — **IQ2_S / IQ3_S の AVX2 整数内積**、**RoPE キャッシュ**、**prefill LM head スキップ**、**greedy argmax 専用パス**、**F16 埋め込み F16C**。
