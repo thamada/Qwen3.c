@@ -19,13 +19,36 @@ ifneq ($(strip $(OPENBLAS_LIBS)),)
   LDFLAGS += $(OPENBLAS_LIBS)
 endif
 
-.PHONY: build run clean
+.PHONY: build run clean openblas
 
 build:
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o qwen3-cpu-blas main.c $(LDFLAGS)
+	@echo "$(CC) $(CPPFLAGS) $(CFLAGS) -o qwen3-cpu-blas main.c $(LDFLAGS)"
+	@out=$$($(CC) $(CPPFLAGS) $(CFLAGS) -o qwen3-cpu-blas main.c $(LDFLAGS) 2>&1); rc=$$?; \
+	if [ $$rc -ne 0 ]; then \
+		echo "$$out"; \
+		if echo "$$out" | grep -qE 'fatal error:.*cblas\.h|fatal error:.*openblas/cblas\.h|cblas\.h: No such file|openblas/cblas\.h: No such file'; then \
+			echo ""; \
+			echo "Error: OpenBLAS development headers not found (cblas.h)."; \
+			echo ""; \
+			echo "Install OpenBLAS with:"; \
+			echo "  make openblas"; \
+			echo ""; \
+			echo "If headers are already installed but in a non-standard path (Debian/Ubuntu pthread build), try:"; \
+			echo "  make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread"; \
+			echo ""; \
+		fi; \
+		exit $$rc; \
+	fi
 
 run: build
 	./qwen3-cpu-blas "$(MODEL)" -p "$(PROMPT)"
+
+# Debian/Ubuntu 等: libopenblas-dev + OpenMP ランタイム
+openblas:
+	@if [ "$$(id -u)" -ne 0 ]; then SUDO=sudo; else SUDO=; fi; \
+	echo "=== Installing OpenBLAS (libopenblas-dev) and OpenMP runtime (libgomp1) ==="; \
+	$$SUDO apt-get update; \
+	$$SUDO apt-get install -y libopenblas-dev libgomp1
 
 clean:
 	rm -f qwen3-cpu-blas
