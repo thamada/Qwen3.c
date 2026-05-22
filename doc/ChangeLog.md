@@ -4,6 +4,16 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 01:46:44
+
+**`qwen3-8b/cpu-blas/`** — **Prefill progress bar** と prefill / decode スループット要約を stderr に出力。
+
+- **`main.c`**: Bonsai.c（**`bonsai-8b/cpu-blas/main.c`**）および **`gpu-cuda/main.c`** と同形式の **`prefill_progress_update`** / **`prefill_progress_done`** / **`decode_progress_done`** / **`throughput_summary`** を追加。プロンプト区間は **1 トークンずつ forward** しながら **`Prefill [====...]`** バー（幅 40）を `\r` で更新。prefill 完了時・decode 完了時に tok/s を表示し、終了時に **prefill / decode / total** のスループット一覧を stderr に出す。
+
+**`doc/design.md`**: **`cpu-blas`** のバリアント表・ディレクトリ表・実行時挙動を上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 01:29:29
 
 **`qwen3-8b/cpu-blas/`** — 量子化 GEMV を **Q8_K 活性化 + 整数内積**に変更。
