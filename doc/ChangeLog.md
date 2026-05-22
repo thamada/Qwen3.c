@@ -4,6 +4,12 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 02:21:36
+
+**ドキュメント**: マルチターン対話・Thinking モードの **対応状況と配慮**を **`README.md`**・**`README.en.md`**・**`doc/design.md`** に追記（公式 Qwen3 の `enable_thinking` / `/think` / `/no_think`、1 ターン固定 `chat_encode`、thinking 生出力の注意、`is_special` の範囲）。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 01:50:43
 
 **`qwen3-8b/cpu/`** — **`cpu-blas`** と同形式の **Prefill progress bar** と prefill / decode スループット要約を stderr に出力。
