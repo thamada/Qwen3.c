@@ -27,7 +27,7 @@
 |--------|----------|------|
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**にデ量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
-| `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は活性 **Q8_K** 化（**`quantize_row_q8_K`**）後、**`vec_dot_*_q8_K`** で **ggml-cpu/quants.c** 準拠の整数内積（no per-row float[256] dequant）。出力行は OpenMP 並列。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。**`openblas_set_num_threads(1)`** で OpenBLAS 側は 1 スレッド固定（並列度は **`OMP_NUM_THREADS`**）。**`-ffast-math`** は IQ 量子化で数値が崩れるため Makefile では無効。**`-march=native`** 既定。 |
+| `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は活性 **Q8_K** 化（**`quantize_row_q8_K`**）後、**`vec_dot_*_q8_K`** で **ggml-cpu/quants.c** 準拠の整数内積（no per-row float[256] dequant）。**Attention の wq/wk/wv** と **FFN の gate/up** は同一活性に対し **Q8_K 量子化を層内 1 回のみ**（**`mm(..., q8_ready)`**）。**`__AVX2__`** 時は **`quantize_row_q8_K`** と Q4_K / Q5_K の **`vec_dot_*_q8_K`** を AVX2 実装（非 AVX2 はスカラー参照実装）。出力行は OpenMP 並列。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。**`openblas_set_num_threads(1)`** で OpenBLAS 側は 1 スレッド固定（並列度は **`OMP_NUM_THREADS`**）。**`-ffast-math`** は IQ 量子化で数値が崩れるため Makefile では無効。**`-march=native`** 既定。 |
 | `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Flash 系デコード注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等を含む。**`make build.gpu-rocm` の既定 AMD GPU エントリ**。 |
 | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA（FP16）** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。全線形 **FP16 VRAM**（ROCm 同趣旨）。任意で **`build.polarquant`**: KV キャッシュ **PolarQuant-R**（64 B/head、F32 比 ~8×）。サンプリング **logits D2H**。集約 Makefile 外。 |
 | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | **NVIDIA CUDA（NVFP4）** | 上記と同じ Prefill / Decode / Flash Attention。線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**、**`BONSAI_FP4=1`** 固定）、**`token_embd`** は **FP16**、norm は **F32**。線形は **`fp4_qwen3_mm`**（M=1→**FP4 GEMV**、M≥128→CUTLASS GEMM）。任意で **`build.polarquant`**: NVFP4 線形 + PolarQuant-R KV（Blackwell 向け最大 VRAM 節約）。要 **CUDA 13 + CUTLASS + sm_120 系 GPU**。集約 Makefile 外。 |
@@ -44,8 +44,8 @@
 | `README.en.md` | 同上（英語）。 |
 | `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。**Prefill progress bar**（**`prefill_progress_*`**）と prefill / decode スループット要約を stderr に出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、`qwen3-8b/Makefile` の **`make build.cpu-multicore`** と当ディレクトリ単体 **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
-| `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS 推論。**F32 GEMV** と Attention 集約を **`cblas_sgemv`** に委譲。量子化 GEMV は **Q8_K 活性化 + `vec_dot_*_q8_K` 整数内積**（IQ2_S / IQ3_S / Q4_K / Q5_K）。**`State.q8`** で活性バッファを保持。**Prefill progress bar**（**`prefill_progress_*`**）と prefill / decode スループット要約を stderr に出力。**`pkg-config openblas`** で link。ヘッダが非標準パスなら **`CPPFLAGS`** で指定（**`cpu-blas/Makefile`** コメント参照）。 |
-| `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。 |
+| `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS 推論。**F32 GEMV** と Attention 集約を **`cblas_sgemv`** に委譲。量子化 GEMV は **Q8_K 活性化 + `vec_dot_*_q8_K`**（実装詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**）。**Prefill progress bar** と prefill / decode スループット要約を stderr に出力。**`pkg-config openblas`** で link。 |
+| `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（FP16 線形層）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
 | `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。既定 **`make build` / `make run`**（FP16・PTX 既定）。**`build.polarquant`** / **`run.polarquant`**（**`BONSAI_POLARQUANT=1`**）、**`pq-test`**。**`KERNELS_OBJ`** / **`MAIN_OBJ`** は **`BONSAI_POLARQUANT`/`FA_BR` 別名で stale `.o` 回避。NVFP4 関連は含まない。 |
@@ -152,7 +152,7 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp path/to/model.gguf -p "Hi" -n 8
 **OpenBLAS**（`libopenblas-dev` 等）と OpenMP ランタイムが必要。**`pkg-config openblas`** が使える環境では **`cpu-blas/Makefile`** が include / link フラグを自動取得する。ヘッダが標準パスに無い場合（Debian/Ubuntu の pthread ビルド等）は **`CPPFLAGS`** で指定する。
 
 ```bash
-sudo apt install -y libopenblas-dev libgomp1
+cd qwen3-8b/cpu-blas && make openblas   # libopenblas-dev / libgomp1 を apt 導入
 cd qwen3-8b
 make build.cpu-blas
 OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas path/to/model.gguf -p "Hi" -n 8
@@ -249,7 +249,7 @@ make build.xdna2-bfp16
 
 ## 実行時の挙動
 
-**CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロックデ量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積（**`mm_f32`**）と Attention の K 内積・V 合成を **`cblas_sgemv`** に集約。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は入力を **`quantize_row_q8_K`** で Q8_K 化し、**`vec_dot_*_q8_K`** で重み行と整数内積（no per-row float[256] dequant）。出力行の OpenMP 並列は **`cpu-multicore`** と同様。プロンプト区間は **1 トークンずつ teacher forcing**（CUDA 版の Prefill バッチとは異なる）。**`qwen3-cpu`** / **`qwen3-cpu-blas`** はその逐次 prefill 中に stderr へ **Prefill progress bar**（**`Prefill [====...]`**、幅 40、`\r` 更新）を表示し、prefill / decode 完了時および終了時に **tok/s 要約**（**`--- throughput ---`**）を stderr に出す。
+**CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロックデ量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積（**`mm_f32`**）と Attention の K 内積・V 合成を **`cblas_sgemv`** に集約。量子化 GEMV は **Q8_K 活性化 + 整数内積**（**層内 Q8 共有**・**AVX2** 詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」** 参照）。プロンプト区間は **1 トークンずつ teacher forcing**（CUDA 版の Prefill バッチとは異なる）。**`qwen3-cpu`** / **`qwen3-cpu-blas`** は stderr に **Prefill progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **tok/s 要約**を出力。
 
 **ROCm（`qwen3-rocm`）**: ロード時に F16 重みを VRAM に配置。各ステップは **埋め込み〜全レイヤー〜LM ヘッド**を GPU 上で実行。教師強制区間では LM ヘッドを省略可能。**`0 < top-p < 1`** の nucleus は実装上 **logits 全語彙を D2H** して CPU で処理する場合がある（実装コメント参照）。それ以外は GPU で argmax / softmax＋多項サンプル等。
 
@@ -300,7 +300,7 @@ make build.xdna2-bfp16
 
 `Tok` は語彙文字列、語彙長、BPE score、特殊トークン ID、ハッシュ表、byte fallback 用 token を持つ。`<|im_start|>` と `<|im_end|>` は ChatML 用に語彙から探索し、見つかった場合は `im_start` / `im_end` として保存する。
 
-`State` は forward 中の一時バッファを持つ。主なものは hidden state `x`、RMSNorm 後や射影後に使う `xb` / `xb2`、FFN の `hb` / `hb2`、attention の `q` / `k` / `v`、logits、KV cache である。CPU / ROCm / CUDA **`gpu-cuda`（FP16）** では **`kc` / `vc`**（float32、**`n_layers * max_seq * kv_dim`** 要素 × Key/Value）。**`cpu-blas`** では量子化 GEMV 用に **`q8`**（**`BlockQ8_K`**、**`hidden_dim / QK_K`** ブロック分の活性 Q8_K バッファ）を追加で確保する。CUDA **`build.polarquant`**（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**）では **`kc_pq` / `vc_pq`**（**`PQBlock`** 配列、**`n_layers * max_seq * n_kv_heads * PQ_BYTES_HEAD`**）に置き換える。
+`State` は forward 中の一時バッファを持つ。主なものは hidden state `x`、RMSNorm 後や射影後に使う `xb` / `xb2`、FFN の `hb` / `hb2`、attention の `q` / `k` / `v`、logits、KV cache である。CPU / ROCm / CUDA **`gpu-cuda`（FP16）** では **`kc` / `vc`**（float32、**`n_layers * max_seq * kv_dim`** 要素 × Key/Value）。**`cpu-blas`** では量子化 GEMV 用に **`q8`**（**`BlockQ8_K`**、**`hidden_dim / QK_K`** ブロック分。**Qwen3-VL-8B なら 56 ブロック**。Attention/gate/up の **`n=dim`** と down の **`n=hidden_dim`** の両方に対応）を追加で確保する。層内共有・AVX2 の詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」** を参照。CUDA **`build.polarquant`**（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**）では **`kc_pq` / `vc_pq`**（**`PQBlock`** 配列、**`n_layers * max_seq * n_kv_heads * PQ_BYTES_HEAD`**）に置き換える。
 
 ### GGUF パーサー
 
@@ -337,7 +337,213 @@ Tokenizer は `tokenizer.ggml.tokens`、`tokenizer.ggml.scores`、`tokenizer.ggm
 
 CPU 版（**`cpu`** / **`cpu-multicore`**）は重み全体を float に展開しない。`mm_quant_rows` が出力行ごとに量子化 row を走査し、row 内の各 256 要素 block を stack 上の `float blk[QK_K]` に復元して、入力ベクトルとの内積に足し込む。これによりメモリ使用量は抑えられるが、同じ重みを毎 token で復元するため速度は遅い。
 
-**`cpu-blas`** は F32 テンソルに対する **`mm_f32`** を OpenMP 行帯分割 + **`cblas_sgemv`** に置き換え、Attention もヘッドごとに K/V 合成を BLAS 化する。量子化 GEMV（**`mm_quant_rows`**）は入力 **`x`** を **`quantize_row_q8_K`** で **`State.q8`** に Q8_K 化したうえで、重み行ごとに **`vec_dot_iq2_s_q8_K`** / **`vec_dot_iq3_s_q8_K`** / **`vec_dot_q4_K_q8_K`** / **`vec_dot_q5_K_q8_K`**（**ggml-cpu/quants.c** 準拠）で整数内積する。weight row を float[256] に dequant しないため **`cpu-multicore`** より高速化しやすい。出力行の OpenMP 並列は維持する。
+**`cpu-blas`** は F32 テンソルに対する **`mm_f32`** を OpenMP 行帯分割 + **`cblas_sgemv`** に置き換え、Attention もヘッドごとに K/V 合成を BLAS 化する。量子化 GEMV は **Q8_K 活性化 + ggml 準拠整数内積**（詳細は次節 **「`cpu-blas`：Q8_K 活性化 GEMV」**）。weight row を float[256] に dequant しないため **`cpu-multicore`** より高速化しやすい。出力行の OpenMP 並列は維持する。
+
+#### `cpu-blas`：Q8_K 活性化 GEMV（層内共有・AVX2）
+
+**`cpu-blas/main.c`** の量子化 GEMV（IQ2_S / IQ3_S / Q4_K / Q5_K）は、llama.cpp / ggml と同様 **「活性 float ベクトルを Q8_K に量子化 → 重みスーパーブロックと整数内積」** で計算する。per-row **`float[256]` 全復号**は行わない。
+
+##### 3 経路の比較（なぜ `cpu-blas` か）
+
+| 経路 | 量子化 GEMV のやり方 | 主なボトルネック |
+|------|---------------------|------------------|
+| **`cpu` / `cpu-multicore`** | 重み行ごとに **256 要素 block を stack 上 `float blk[256]` に dequant** → float 内積 | 毎 GEMV・毎行で **dequant 再実行**（帯域 bound） |
+| **`cpu-blas`（本節）** | 活性 **1 回 Q8_K 化**（層内共有で削減）→ **`vec_dot_*_q8_K` 整数内積** | IQ2_S dot はスカラー。quantize + OpenMP 行並列 |
+| **`gpu-rocm` / `gpu-cuda`** | ロード時 **全線形 F16 VRAM 展開** → GPU GEMV | VRAM 使用量（8B 級で数 GiB 級） |
+
+`cpu-blas` は **mmap 上の量子化 GGUF をそのまま参照**しつつ、F32 経路（norm 以外の F32 テンソル）と Attention を **OpenBLAS** に寄せ、量子化 GEMV だけを **ggml Q8_K 経路**に置き換える。**GPU ほどの速度は出ない**が、**`cpu-multicore` より dequant コストを大幅に削れる**中間解である。
+
+##### 活性 `BlockQ8_K` と重みブロック
+
+**活性 `BlockQ8_K`**（ggml **`block_q8_K`** 準拠、**`sizeof ≈ 272 B`**）:
+
+| フィールド | 意味 |
+|-----------|------|
+| **`float d`** | スーパーブロック scale（**`d = 1/iscale`**。**`iscale = -127/maxv`**。**`maxv`** は 256 要素中の **符号付き**最大値） |
+| **`int8_t qs[256]`** | QK_K=256 の量子化係数。**`qs[j] ≈ round(iscale · x[j])`**（**127 キャップ**） |
+| **`int16_t bsums[16]`** | **`qs[k*16 .. k*16+15]`** の 16 要素和（Q4_K / Q5_K の **dmin × mins** 補正で使用） |
+
+**量子化の数式**（ブロック **`b`**、入力 **`x[0..255]`**）:
+
+```text
+maxv  = argmax_{j} x[j]   （符号付き。abs 最大の要素そのもの）
+iscale = -127 / maxv
+qs[j]  = clamp(round(iscale * x[j]), ..., 127)
+d      = 1 / iscale
+bsums[k] = Σ_{j=0}^{15} qs[k*16 + j]
+```
+
+近似復元 **`x̂[j] ≈ d * qs[j]`**。ggml の Q8_K 活性化は **対称 int8**（**−127..127** だが実装は **0..127 側に clamp**）で、後段の **Q4_K / Q5_K dot** が **`d · Σ(scale·q_weight·q8)`** 形式に落ちる。
+
+**重み側スーパーブロック**（GGML packed layout、`#pragma pack(1)`）:
+
+| 型 | サイズ | 主なフィールド |
+|----|--------|----------------|
+| **`BlockQ4_K`** | 144 B | **`d`/`dmin` FP16**, **`scales[12]`**（6-bit packed）, **`qs[128]`**（4-bit nibble） |
+| **`BlockQ5_K`** | 176 B | 上記 + **`qh[32]`**（第 5 bit） |
+| **`BlockIQ2_S`** | 82 B | **`d` FP16**, grid lookup + signs + 4-bit scales |
+| **`BlockIQ3_S`** | 110 B | IQ2 系 + **`signs[32]`**, 64 要素ペア scale |
+
+**`row_bytes_quant(type, n)`** = **`(n / QK_K) * sizeof(Block*)`**。GEMV **`y = W·x`**（**`W`** は **`[d, n]`** 行 major、mmap 上）では出力 **`i`** の **`y[i] = dot(row_i, x)`** を **`vec_dot_row_q8_K(n, row_i, type, q8_blocks)`** で求める。
+
+##### `State.q8` とバッファ寿命
+
+- **確保**: **`calloc(hidden_dim / QK_K, sizeof(BlockQ8_K))`**。Qwen3-VL-8B（**`dim=4096`**, **`hidden_dim=14336`**）では **56 ブロック ≈ 15 KiB**。
+- **使用パターン**:
+  - **Attention / gate/up**（**`n=dim`**）: 先頭 **16 ブロック**のみ書き込み。
+  - **down**（**`n=hidden_dim`**）: **56 ブロック全体**を上書き（SwiGLU 後 **`hb`** を quantize）。
+  - **wo / output**: **`n=dim`** で都度上書き。
+- **層跨ぎ・token 跨ぎの再利用なし**: 各 **`forward(token, pos)`** 内で内容は都度更新される。**KV キャッシュ（`kc`/`vc`）は float32 のまま**（Q8 化しない）。
+
+##### API（旧 `mm_quant_rows` からの分離）
+
+旧 **`mm_quant_rows(o, x, w, n, d, type, q8)`** は **quantize + dot を不可分**にしていたため、同一 **`x`** に対する quantize 重複を **`forward` 側で削れなかった**。
+
+| 関数 | 役割 |
+|------|------|
+| **`mm(o, x, w, n, d, type, q8, q8_ready)`** | 型分岐。量子化型かつ **`q8_ready=0`** のとき **`quantize_row_q8_K(x, q8, n)`** → **`mm_quant_dot_rows`**。**`q8_ready=1`** なら quantize 省略 |
+| **`mm_quant_dot_rows(..., const q8)`** | OpenMP で **`i=0..d-1`**: **`o[i] = vec_dot_row_q8_K(n, row_i, type, q8)`** |
+| **`vec_dot_row_q8_K`** | **`switch(type)`** → **`vec_dot_iq2_s_q8_K`** / **`vec_dot_iq3_s_q8_K`** / **`vec_dot_q4_K_q8_K`** / **`vec_dot_q5_K_q8_K`** |
+| **`is_q8_mm_type(type)`** | Q4_K / Q5_K / IQ2_S / IQ3_S のみ真 |
+
+**`n % QK_K != 0`** の量子化 GEMV は **`mm` 内で exit**（Qwen3-VL-8B の **`dim`/`hidden_dim` は 256 の倍数）。
+
+##### 層内 Q8_K 量子化共有（`forward` 制御）
+
+```text
+rmsnorm → xb
+q8_att = is_q8_mm_type(wq_t[l])
+if (q8_att) quantize_row_q8_K(xb → q8, n=dim)    // 層内 1 回
+mm(q/k/v, xb, ..., q8, q8_att)                   // 3 GEMV で Q8 読み取り共有
+... OpenBLAS attention (cblas_sgemv × 2 × n_heads) ...
+mm(xb2, xb, wo, ..., q8, 0)                      // attn 出力で xb の意味が変わる → 都度 quantize
+
+rmsnorm → xb
+q8_ffn = is_q8_mm_type(gate_t[l])
+if (q8_ffn) quantize_row_q8_K(xb → q8, n=dim)
+mm(gate/up, xb, ..., q8, q8_ffn)
+SwiGLU: hb[i] = silu(hb[i]) * hb2[i]
+mm(xb, hb, down, n=hidden, ..., q8, 0)           // 入力 hb・長さ hidden → 都度 quantize（56 ブロック）
+...
+rmsnorm → x
+mm(logits, x, out, n=dim, d=vocab, ..., q8, 0)  // LM head（vocab 行並列 OpenMP）
+```
+
+| 呼び出し | 入力 **`x`** | **`n`** | 共有 | 判定キー / 備考 |
+|---|---|---|---|---|
+| **wq / wk / wv** | attn RMSNorm 後 **`xb`** | **`dim`** | ○ **1× quantize** | **`wq_t[l]`** のみ。wk/wv 型は見ない |
+| **wo** | attn 出力 **`xb`** | **`dim`** | × | attention 計算で **`xb` が上書き**される |
+| **gate / up** | ffn RMSNorm 後 **`xb`** | **`dim`** | ○ **1× quantize** | **`gate_t[l]`** のみ |
+| **down** | SwiGLU 後 **`hb`** | **`hidden_dim`** | × | 活性ベクトルが **`xb` → `hb` に変更** |
+| **output** | 最終 **`x`** | **`dim`** | × | LM head |
+
+**quantize 回数（量子化 GEMV 全テンソル・理想ケース）**:
+
+| | 旧 `mm_quant_rows` | 新（層内共有） |
+|---|---|---|
+| wq/wk/wv | 3 | **1** |
+| wo | 1 | 1 |
+| gate/up | 2 | **1** |
+| down | 1 | 1 |
+| **層計** | **7** | **4** |
+| **28 層/token 削減** | — | **~112 回** |
+
+**エッジケース**: **`wq` が F16・`wk` が Q4_K** 等では **`q8_att=0`**。**`mm(wq)`** は F16 経路、**`mm(wk/wv)`** は **それぞれ内部で quantize**（旧挙動）。IQ2_M GGUF では wq/wk/wv/gate/up が同型 IQ2_S のため通常は **`q8_att=q8_ffn=1`**。
+
+**OpenMP 安全性**: **`quantize_row_q8_K`** は **単スレッド**（`forward` 本体も逐次）。**`mm_quant_dot_rows`** の parallel 領域は **quantize 完了後**に **`const q8`** を読むだけ → **data race なし**。**`openblas_set_num_threads(1)`** により OpenBLAS 内部並列と OpenMP の **二重並列化を回避**（並列度は **`OMP_NUM_THREADS`**）。
+
+##### 整数内積：`vec_dot_*_q8_K`（型別）
+
+**共通**: 入力長 **`n`** は **`nb = n/QK_K`** スーパーブロックに分割。**`q8`** と重み row のブロック **`i`** を対応させ **`sumf += ...`**。**1 出力要素 = 1 重み行 dot**。
+
+**IQ2_S — `vec_dot_iq2_s_q8_K`**（スカラー、grid 参照）:
+
+- 32 要素サブブロック **`ib32`** ごとに **4-bit scale `ls1/ls2`**、**`iq2s_grid[1024]`** から 8 要素 grid を引き、**`signs`** ビットで符号反転。
+- **`sumi += q8[j] * grid[j] * (±1)`** を scale で重み付け。**最終 `*out = 0.125f * sumf`**（ggml 準拠の定数係数）。
+- **分岐・間接参照が多く AVX2 化対象外**。IQ2_M では **dot 本体の速度より quantize 削減**が効く。
+
+**IQ3_S — `vec_dot_iq3_s_q8_K`**（スカラー）:
+
+- 64 要素ペアごとに **`iq3s_grid`** + **`signs`**。2 つの 32 要素 half を **`ls1`/`ls2`** で別 scale。
+- **`*out = sumf`**（IQ2 とは係数が異なる）。
+
+**Q4_K — `vec_dot_q4_K_q8_K`**（AVX2 / generic）:
+
+- **1 スーパーブロックの数学**:
+
+```text
+d    = y.d * f16(x.d)
+dmin = -y.d * f16(x.dmin)
+dot += d * Σ_j (scale_j * Σ_k q4_{j,k} * q8_k)  -  dmin * Σ_m (min_m * bsum_m)
+```
+
+- **`scales[12]`** は 6-bit packed。**`kmask1=0x3f3f3f3f`**, **`kmask2=0x0f0f0f0f`**, **`kmask3=0x03030303`** で **4×uint32** に展開（ggml **`ggml_vec_dot_q4_K_q8_K`** と同一ビット操作）。
+- **generic**: **`aux8[256]`** に nibble を **全面展開**してから 8 要素 **`aux16=q8·a`** ループ。**スタック ~300 B+/呼び出し**、命令数多。
+- **AVX2**: nibble **オンザフライ**（**`and 0xF` / `srli 4`**）。**64 要素 ×4 サブループ**で **`_mm256_maddubs_epi16(q4,q8)`** → **`_mm256_madd_epi16(scale,·)`** → **`sumi`（int32）**。**`aux8` 不要**。
+
+**Q5_K — `vec_dot_q5_K_q8_K`**（AVX2 / generic）:
+
+- Q4_K に **`qh[32]`**（第 5 bit）を加え **`q5 = (q5l & 0xF) + ((qh_bit) << 4)`** 相当を復元。
+- **AVX2**: **`hmask`** を lane ごとに 1 bit shift しながら **`q5h`** を取り出し **`add_epi8`**。**64 要素を `q5_0`/`q5_1` × `q8_0`/`q8_1` の 2 組**で処理。
+- **dmin 項**: Q4_K は **`acc_m`**（**`__m128`** fmadd）、Q5_K は **`summs`** スカラー（**`hadd_epi32` チェーン**）。
+
+##### AVX2 — `quantize_row_q8_K`（参照: **`quantize_row_q8_K_ref`**）
+
+**`#if defined(__AVX2__)`** でコンパイル時分岐。**`-march=native`** 既定。
+
+**ブロックループ**（**`i = 0 .. nb-1`**）:
+
+1. **abs-max 走査**: **`j += 8`** で **`__m256 load` → `andnot(-0.0f, ·)`**（絶対値）。**`maxv`（符号付き）** 更新は **スカラー** — ggml は **abs 最大位置の符号付き値**を scale 基準にするため、**`_mm256_max_ps` だけでは不十分**。
+2. **ゼロブロック**: **`d=0`**, **`memset qs/bsums`**。
+3. **量子化**: **`j += 32`**（4×**`__m256`**）— **`× iscale` → `_mm256_round_ps(NEAREST)` → `_mm256_cvtps_epi32` → `_mm256_min_epi32(127)` → `packs_epi32`×2 → `packs_epi16` → `_mm256_permutevar8x32_epi32(0,4,1,5,2,6,3,7)` → store**。
+4. **`bsums`**: **16 要素ずつスカラー sum**（AVX 化なし。dot 側が参照）。
+5. **`y[i].d = 1/iscale`**。
+
+**ref との差**: ref は **`nearest_int`（`lrintf`）**、AVX2 は **`round_ps`**。いずれも **127 キャップ**。**非 AVX2 CPU** は **`#else`** で ref に委譲。
+
+##### AVX2 共通ユーティリティ
+
+| 関数 | 役割 |
+|------|------|
+| **`hsum_float_8(__m256)`** | 8 lane float の水平和（**`extractf128` → add → movehl → movehdup → addss**） |
+| **`get_scale_shuffle_k4(i)`** | **256 B `k_shuffle[]`** から **`__m256i`** load。**Q4/Q5 の 6-bit scale** を **`_mm256_shuffle_epi8`** で 32 byte lane に複製 |
+| **`MM256_SET_M128I(a,b)`** | 128-bit scale を 256-bit に複製（**`_mm256_insertf128`**） |
+
+**SIMD 対象は 3 関数のみ**（quantize, Q4_K dot, Q5_K dot）。IQ2/IQ3 dot、bsums 計算、signed-max 決定はスカラー。
+
+##### OpenBLAS との分担（同一 `forward` 内）
+
+| 処理 | 実装 |
+|------|------|
+| **F32 重み GEMV** | **`mm_f32`**: OpenMP 行分割 + **`cblas_sgemv(NoTrans)`** |
+| **F16 重み GEMV** | **`mm_f16`**: OpenMP 行ループ（host F16→F32 変換しながら内積） |
+| **量子化 GEMV** | 本節の **Q8_K + `vec_dot_*`** |
+| **Attention K 内積** | ヘッド **`h`**: **`cblas_sgemv`**（**`(pos+1) × head_dim`** × **`qh`**）— 旧 CPU 版の pos ループを **1 BLAS 呼び出し**に |
+| **Attention V 合成** | **`softmax(att_h)`** 後 **`cblas_sgemv(Trans)`** で value 重み付き和 |
+| **OpenBLAS スレッド** | **`openblas_set_num_threads(1)`** 固定 |
+
+##### IQ2_M モデルでの gain の内訳
+
+Qwen3-VL-8B **IQ2_M** では **大部分の線形が IQ2_S**。
+
+| 最適化 | IQ2_S 重みへの効果 |
+|--------|-------------------|
+| **層内 Q8 共有** | **大**（quantize 3→1 / 2→1） |
+| **Q8_K 整数 dot（従来から）** | **`cpu-multicore` の dequant 比で既に有利** |
+| **AVX2 dot** | **なし**（スカラーのまま） |
+| **AVX2 quantize** | **あり**（全量子化 GEMV で活性 quantize に効く） |
+
+Q4_K / Q5_K が混在するテンソルでは **AVX2 dot** も有効。
+
+##### スコープ外（明示）
+
+- **IQ2/IQ3 整数内積**の SIMD 化
+- **token `emb_lookup`**: 量子化 embedding 行は **従来どおり block-wise `dequant_one_block_to`**（Q8 経路ではない）
+- **層跨ぎ / token 跨ぎ Q8 再利用**
+- **KV キャッシュ**の量子化
+- **`-ffast-math`**（IQ / Q8_K / RMSNorm の数値崩れ。Makefile 無効）
+
+変更履歴の詳細な経緯は **`doc/ChangeLog.md`**（**2026-05-23 04:34:38**）を参照。
 
 ROCm 版および CUDA **`gpu-cuda`（FP16）** はロード時に一度だけホスト上で量子化 tensor を F32 に復元し、F16 staging 経由で **全線形を FP16 VRAM** に載せる。norm は F32 のまま GPU。実行時 GEMV は FP16 カーネル（ROCm: `mm_f16_gemv_kernel`、CUDA: 同名相当）。
 
@@ -384,7 +590,27 @@ Qwen3 ファミリー（QwQ 等の reasoning 系を含む）では、公式ス�
 
 ### CPU forward
 
-CPU 版の forward は、すべて `float` の activation buffer 上で逐次実行する。重みは GGUF mmap 上の raw tensor を参照し、dtype に応じて `mm_f32`、`mm_f16`、`mm_quant_rows` に分岐する。
+**`cpu`** / **`cpu-multicore`** の forward は、すべて `float` の activation buffer 上で逐次実行する。重みは GGUF mmap 上の raw tensor を参照し、dtype に応じて **`mm_f32`**、**`mm_f16`**、**`mm_quant_rows`**（ブロック dequant + 内積）に分岐する。
+
+**`cpu-blas`** は上記と同一のレイヤー順序だが、F32 行列積と Attention を OpenBLAS に委譲し、量子化 GEMV は **「`cpu-blas`：Q8_K 活性化 GEMV」** の **`mm(..., q8_ready)`** / **`mm_quant_dot_rows`** 経路を使う（**`mm_quant_rows` は使用しない**）。
+
+**`cpu-blas` レイヤー内の GEMV / BLAS 呼び出し順**（層 **`l`**、量子化 GEMV 全テンソル想定）:
+
+1. **`rmsnorm(x → xb)`** — スカラー/OpenMP（他 CPU 版同様）。
+2. **`q8_att`** 判定 → 必要なら **`quantize_row_q8_K(xb → q8)`**（**1 回**）。
+3. **`mm(q)`**, **`mm(k)`**, **`mm(v)`** — 量子化型なら **`q8_ready=1`** で **共有 Q8** を参照。**`d=dim` / `kv_dim`** 行の OpenMP 行並列 dot。
+4. **`rmsnorm_head_inplace(q/k)`**, **`apply_rope`**, **KV cache 書込** — スカラー/OpenMP。
+5. **Attention** — 各 head **`cblas_sgemv`**（K 内積）→ **`softmax`** → **`cblas_sgemv`**（V 合成）。**`openblas_set_num_threads(1)`** 下で OpenMP が **`n_heads`** 並列。
+6. **`mm(xb2, xb, wo, q8_ready=0)`** — attn 出力 **`xb`** を入力に **都度 quantize**。
+7. **残差 `x += xb2`**。
+8. **`rmsnorm(x → xb)`** → **`q8_ffn`** → gate/up **共有 quantize** → **`mm(gate/up)`**。
+9. **SwiGLU** — **`expf`/`sigmoid` 相当**の要素演算（OpenMP）。
+10. **`mm(xb, hb, down, n=hidden, q8_ready=0)`** — **56 ブロック quantize** + **`d=dim`** 行 dot。
+11. **残差 `x += xb`**。
+
+生成ループ末尾: **`rmsnorm` → `mm(logits, x, out, vocab, q8_ready=0)`**。
+
+**埋め込み `emb_lookup`**: 量子化 token 行は **Q8 経路を使わず** **`dequant_one_block_to`** で **`x`** に float 展開（推論中の最初の **`x`** 構築のみ）。
 
 1 token の処理は次の順序である。
 
@@ -444,7 +670,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 ## 制約・既知の制限
 
-- **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え量子化 GEMV を **Q8_K + 整数内積**に置き換えるため **`cpu-multicore` より速くなることが多い**。**`-ffast-math`** を付けると IQ / Q8_K 量子化で出力が壊れる。**`-march=native`** は移植性より当該 CPU 向け最適化を優先する。
+- **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え量子化 GEMV を **Q8_K + 整数内積**（層内 Q8 共有・AVX2 最適化）に置き換えるため **`cpu-multicore` より速くなることが多い**。**`-ffast-math`** を付けると IQ / Q8_K 量子化で出力が壊れる。**`-march=native`** は移植性より当該 CPU 向け最適化（AVX2 等）を優先する。
 - **ROCm 版**: AMD GPU・ROCm・`hipcc`、`GPU_ARCH` と実機 ISA の一致が必要。
 - **CUDA 版（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。集約 Makefile 未統合。**汎用 GPU** は **`gpu-cuda`**（PTX 可）。**Blackwell NVFP4** は **`gpu-cuda-nvfp4`**（**CUDA 13**・CUTLASS・**`sm_120a`**）。**`build.polarquant`** は KV のみ PolarQuant-R（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**、任意 GPU 可／NVFP4 併用可）。**`gpu-cuda-nvfp4/third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。**`gpu-cuda-nvfp4`** では線形重みは NVFP4 のみ VRAM に載り、**`gpu-cuda` 比で線形 FP16 分（8B 級で約 15 GiB 相当）を節約**できる（代わりに **`token_embd`** は FP16 のまま）。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
@@ -507,7 +733,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | **`pq-test` FAIL** | コードブック未初期化・GPU 非対応 | **`make pq-test`** の **`max_abs_err` / `rel`** を確認（閾値 rel ≤ 0.35） |
 | mmap 失敗 | パス・権限 | `MODEL` を確認 |
 | CPU が極端に遅い | IQ デ量子化コスト | **`cpu-blas`** を試す、ROCm 版の利用、`-n` を小さく |
-| **`cpu-blas` ビルド失敗 / `cblas.h` not found** | OpenBLAS 開発パッケージ未導入・ヘッダ非標準パス | **`libopenblas-dev`** をインストール。**`CPPFLAGS=-I/.../openblas-pthread`** 等（**`cpu-blas/Makefile`** コメント参照） |
+| **`cpu-blas` ビルド失敗 / `cblas.h` not found** | OpenBLAS 開発パッケージ未導入・ヘッダ非標準パス | **`cd cpu-blas && make openblas`** または **`libopenblas-dev`** を手動インストール。**`CPPFLAGS=-I/.../openblas-pthread`** 等（**`cpu-blas/Makefile`** コメント・ビルド失敗時メッセージ参照） |
 | **`cpu-blas` 出力が意味不明（同じ文字の連打等）** | **`-ffast-math`** による IQ 量子化の数値崩れ | リポジトリ同梱 **`cpu-blas/Makefile`** は **`-ffast-math` 無効**。手元で CFLAGS 上書きしている場合は外す |
 | `/dev/accel/accel0` を開けない | `render` グループ未参加 / `amdxdna` 未ロード | `sudo usermod -aG render "$USER"`、`lsmod \| grep amdxdna` を確認 |
 | XDNA2 で速度が出ない／NPU が効いていない | `XDNA_GEMV_DIR` 未設定、形状欠け、DRM 不可、`XDNA_FORCE_CPU` 等 | 起動時の **`=== XDNA GEMV / NPU ctrlcode status ===`** で各形状の `MISS` を確認。**`./xdna2/qwen3-xdna2 model.gguf --xdna-status`** で軽量診断。推論後の **NPU GEMV / CPU GEMV** カウントが **CPU のみ**なら NPU 経路は実行されていない |

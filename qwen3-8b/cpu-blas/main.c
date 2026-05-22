@@ -10,6 +10,8 @@
  *   - Attention: ヘッド毎に K 内積・V 合成を cblas_sgemv に集約（(pos+1) 回のループ → 1 回）。
  *   - 量子化 GEMV（IQ2_S / IQ3_S / Q4_K / Q5_K）: 活性化を Q8_K 化し、
  *     llama.cpp (ggml_vec_dot_*_q8_K) 準拠の整数内積（no per-row full dequant）。
+ *   - 層内 Q8_K 量子化共有（wq/wk/wv、gate/up で 1 回のみ quantize）。
+ *   - AVX2: quantize_row_q8_K、vec_dot_q4_K_q8_K、vec_dot_q5_K_q8_K。
  *
  * Build: `make build` → `qwen3-cpu-blas`。
  * スレッド数: OMP_NUM_THREADS（OpenBLAS 側は実行時に 1 スレッド固定）。
@@ -35,6 +37,33 @@
 
 /* OpenBLAS のスレッド数制御。cblas.h が公開しない実装もあるため extern 宣言で対処。 */
 extern void openblas_set_num_threads(int num_threads);
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
+
+static inline float hsum_float_8(__m256 x) {
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+
+static inline __m256i get_scale_shuffle_k4(int i) {
+    static const uint8_t k_shuffle[256] = {
+        0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+        2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+        4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,
+        6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+        8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,
+        10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,
+        12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,
+        14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15
+    };
+    return _mm256_loadu_si256((const __m256i *)k_shuffle + i);
+}
+#endif
 
 #define GGUF_MAGIC      0x46554747u
 #define QK_K            256
@@ -625,7 +654,7 @@ static int nearest_int(float fval) {
     return (int)lrintf(fval);
 }
 
-static void quantize_row_q8_K(const float *x, BlockQ8_K *y, int k) {
+static void quantize_row_q8_K_ref(const float *x, BlockQ8_K *y, int k) {
     const int nb = k / QK_K;
     for (int i = 0; i < nb; i++) {
         float maxv = 0.0f;
@@ -658,6 +687,72 @@ static void quantize_row_q8_K(const float *x, BlockQ8_K *y, int k) {
         x += QK_K;
     }
 }
+
+#if defined(__AVX2__)
+static void quantize_row_q8_K(const float *x, BlockQ8_K *y, int k) {
+    const int nb = k / QK_K;
+    const __m256 signBit = _mm256_set1_ps(-0.0f);
+    for (int i = 0; i < nb; i++) {
+        const float *bx = x + (size_t)i * QK_K;
+        float maxv = 0.0f;
+        float amax = 0.0f;
+        for (int j = 0; j < QK_K; j += 8) {
+            __m256 v = _mm256_loadu_ps(bx + j);
+            __m256 av = _mm256_andnot_ps(signBit, v);
+            for (int l = 0; l < 8; l++) {
+                float a = ((float *)&av)[l];
+                if (a > amax) {
+                    amax = a;
+                    maxv = ((float *)&v)[l];
+                }
+            }
+        }
+        if (!amax) {
+            y[i].d = 0.0f;
+            memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, QK_K / 16 * sizeof(int16_t));
+            continue;
+        }
+        const float iscale = -127.0f / maxv;
+        const __m256 mul = _mm256_set1_ps(iscale);
+        int8_t *qs = y[i].qs;
+        for (int j = 0; j < QK_K; j += 32) {
+            __m256 v0 = _mm256_mul_ps(_mm256_loadu_ps(bx + j + 0), mul);
+            __m256 v1 = _mm256_mul_ps(_mm256_loadu_ps(bx + j + 8), mul);
+            __m256 v2 = _mm256_mul_ps(_mm256_loadu_ps(bx + j + 16), mul);
+            __m256 v3 = _mm256_mul_ps(_mm256_loadu_ps(bx + j + 24), mul);
+            v0 = _mm256_round_ps(v0, _MM_ROUND_NEAREST);
+            v1 = _mm256_round_ps(v1, _MM_ROUND_NEAREST);
+            v2 = _mm256_round_ps(v2, _MM_ROUND_NEAREST);
+            v3 = _mm256_round_ps(v3, _MM_ROUND_NEAREST);
+            __m256i i0 = _mm256_cvtps_epi32(v0);
+            __m256i i1 = _mm256_cvtps_epi32(v1);
+            __m256i i2 = _mm256_cvtps_epi32(v2);
+            __m256i i3 = _mm256_cvtps_epi32(v3);
+            const __m256i cap127 = _mm256_set1_epi32(127);
+            i0 = _mm256_min_epi32(i0, cap127);
+            i1 = _mm256_min_epi32(i1, cap127);
+            i2 = _mm256_min_epi32(i2, cap127);
+            i3 = _mm256_min_epi32(i3, cap127);
+            i0 = _mm256_packs_epi32(i0, i1);
+            i2 = _mm256_packs_epi32(i2, i3);
+            i0 = _mm256_packs_epi16(i0, i2);
+            i0 = _mm256_permutevar8x32_epi32(i0, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256((__m256i *)(qs + j), i0);
+        }
+        for (int j = 0; j < QK_K / 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
+            y[i].bsums[j] = (int16_t)sum;
+        }
+        y[i].d = 1.0f / iscale;
+    }
+}
+#else
+static void quantize_row_q8_K(const float *x, BlockQ8_K *y, int k) {
+    quantize_row_q8_K_ref(x, y, k);
+}
+#endif
 
 static void vec_dot_iq2_s_q8_K(int n, const BlockIQ2_S *x, const BlockQ8_K *y, float *out) {
     const int nb = n / QK_K;
@@ -739,7 +834,7 @@ static void vec_dot_iq3_s_q8_K(int n, const BlockIQ3_S *x, const BlockQ8_K *y, f
     *out = sumf;
 }
 
-static void vec_dot_q4_K_q8_K(int n, const BlockQ4_K *x, const BlockQ8_K *y, float *out) {
+static void vec_dot_q4_K_q8_K_generic(int n, const BlockQ4_K *x, const BlockQ8_K *y, float *out) {
     const int nb = n / QK_K;
     static const uint32_t kmask1 = 0x3f3f3f3f;
     static const uint32_t kmask2 = 0x0f0f0f0f;
@@ -801,7 +896,7 @@ static void vec_dot_q4_K_q8_K(int n, const BlockQ4_K *x, const BlockQ8_K *y, flo
     *out = sumf;
 }
 
-static void vec_dot_q5_K_q8_K(int n, const BlockQ5_K *x, const BlockQ8_K *y, float *out) {
+static void vec_dot_q5_K_q8_K_generic(int n, const BlockQ5_K *x, const BlockQ8_K *y, float *out) {
     const int nb = n / QK_K;
     static const uint32_t kmask1 = 0x3f3f3f3f;
     static const uint32_t kmask2 = 0x0f0f0f0f;
@@ -866,6 +961,134 @@ static void vec_dot_q5_K_q8_K(int n, const BlockQ5_K *x, const BlockQ8_K *y, flo
     for (int l = 0; l < 8; ++l) sumf += sums[l];
     *out = sumf;
 }
+
+#if defined(__AVX2__)
+static void vec_dot_q4_K_q8_K(int n, const BlockQ4_K *x, const BlockQ8_K *y, float *out) {
+    const int nb = n / QK_K;
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    uint32_t utmp[4];
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d * host_f16f32(x[i].d);
+        const float dmin = -y[i].d * host_f16f32(x[i].dmin);
+
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i *)y[i].bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = MM256_SET_M128I(sc128, sc128);
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K / 64; ++j) {
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 0));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i *)q4); q4 += 32;
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+            const __m256i q8l = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+            p16l = _mm256_madd_epi16(scale_l, p16l);
+            const __m256i q8h = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+            p16h = _mm256_madd_epi16(scale_h, p16h);
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+    *out = hsum_float_8(acc) + _mm_cvtss_f32(acc_m);
+}
+
+static void vec_dot_q5_K_q8_K(int n, const BlockQ5_K *x, const BlockQ8_K *y, float *out) {
+    const int nb = n / QK_K;
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    uint32_t utmp[4];
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m128i mzero = _mm_setzero_si128();
+    const __m256i mone = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+    float summs = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t *q5 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const float d = y[i].d * host_f16f32(x[i].d);
+        const float dmin = -y[i].d * host_f16f32(x[i].dmin);
+
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i *)y[i].bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+        const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
+        summs += dmin * (float)_mm_extract_epi32(hsum, 0);
+
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = MM256_SET_M128I(sc128, sc128);
+        const __m256i hbits = _mm256_loadu_si256((const __m256i *)x[i].qh);
+        __m256i hmask = mone;
+        __m256i sumi = _mm256_setzero_si256();
+        int bit = 0;
+
+        for (int j = 0; j < QK_K / 64; ++j) {
+            const __m256i scale_0 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 0));
+            const __m256i scale_1 = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2 * j + 1));
+            const __m256i q5bits = _mm256_loadu_si256((const __m256i *)q5); q5 += 32;
+            const __m256i q5l_0 = _mm256_and_si256(q5bits, m4);
+            const __m256i q5h_0 = _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+            const __m256i q5_0 = _mm256_add_epi8(q5l_0, q5h_0);
+            hmask = _mm256_slli_epi16(hmask, 1);
+            const __m256i q5l_1 = _mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4);
+            const __m256i q5h_1 = _mm256_slli_epi16(_mm256_srli_epi16(_mm256_and_si256(hbits, hmask), bit++), 4);
+            const __m256i q5_1 = _mm256_add_epi8(q5l_1, q5h_1);
+            hmask = _mm256_slli_epi16(hmask, 1);
+            const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            __m256i p16_0 = _mm256_maddubs_epi16(q5_0, q8_0);
+            __m256i p16_1 = _mm256_maddubs_epi16(q5_1, q8_1);
+            p16_0 = _mm256_madd_epi16(scale_0, p16_0);
+            p16_1 = _mm256_madd_epi16(scale_1, p16_1);
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+    *out = hsum_float_8(acc) + summs;
+}
+#else
+static void vec_dot_q4_K_q8_K(int n, const BlockQ4_K *x, const BlockQ8_K *y, float *out) {
+    vec_dot_q4_K_q8_K_generic(n, x, y, out);
+}
+static void vec_dot_q5_K_q8_K(int n, const BlockQ5_K *x, const BlockQ8_K *y, float *out) {
+    vec_dot_q5_K_q8_K_generic(n, x, y, out);
+}
+#endif
 
 static float vec_dot_row_q8_K(int n, const void *row, int type, const BlockQ8_K *q8) {
     float val = 0.0f;
@@ -1524,12 +1747,7 @@ static void mm_f16(float *o, const float *x, const uint16_t *w, int n, int d) {
     }
 }
 
-static void mm_quant_rows(float *o, const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
-    if (n % QK_K) {
-        fprintf(stderr, "mm_quant_rows: n=%d not multiple of QK_K\n", n);
-        exit(1);
-    }
-    quantize_row_q8_K(x, q8, n);
+static void mm_quant_dot_rows(float *o, const void *w, int n, int d, int type, const BlockQ8_K *q8) {
     size_t row_sz = row_bytes_quant(type, n);
     const uint8_t *wb = (const uint8_t *)w;
     #pragma omp parallel for schedule(static)
@@ -1539,12 +1757,21 @@ static void mm_quant_rows(float *o, const float *x, const void *w, int n, int d,
     }
 }
 
-static void mm(float *o, const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
+static int is_q8_mm_type(int type) {
+    return type == DT_Q4_K || type == DT_Q5_K || type == DT_IQ2_S || type == DT_IQ3_S;
+}
+
+static void mm(float *o, const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8, int q8_ready) {
     switch (type) {
     case DT_F32: mm_f32(o, x, (const float *)w, n, d); break;
     case DT_F16: mm_f16(o, x, (const uint16_t *)w, n, d); break;
     case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S:
-        mm_quant_rows(o, x, w, n, d, type, q8);
+        if (n % QK_K) {
+            fprintf(stderr, "mm: n=%d not multiple of QK_K\n", n);
+            exit(1);
+        }
+        if (!q8_ready) quantize_row_q8_K(x, q8, n);
+        mm_quant_dot_rows(o, w, n, d, type, q8);
         break;
     default:
         fprintf(stderr, "Unsupported tensor type %d in matmul\n", type);
@@ -1620,9 +1847,11 @@ static void forward(Model *m, int token, int pos) {
     for (int l = 0; l < c->n_layers; l++) {
         rmsnorm(s->xb, s->x, w->norm_att[l], dim, c->norm_eps);
 
-        mm(s->q, s->xb, w->wq[l], dim, dim,    w->wq_t[l], s->q8);
-        mm(s->k, s->xb, w->wk[l], dim, kv_dim, w->wk_t[l], s->q8);
-        mm(s->v, s->xb, w->wv[l], dim, kv_dim, w->wv_t[l], s->q8);
+        int q8_att = is_q8_mm_type(w->wq_t[l]);
+        if (q8_att) quantize_row_q8_K(s->xb, s->q8, dim);
+        mm(s->q, s->xb, w->wq[l], dim, dim,    w->wq_t[l], s->q8, q8_att);
+        mm(s->k, s->xb, w->wk[l], dim, kv_dim, w->wk_t[l], s->q8, q8_att);
+        mm(s->v, s->xb, w->wv[l], dim, kv_dim, w->wv_t[l], s->q8, q8_att);
 
         rmsnorm_head_inplace(s->q, w->q_norm[l], n_heads, hd, c->norm_eps);
         rmsnorm_head_inplace(s->k, w->k_norm[l], n_kv, hd, c->norm_eps);
@@ -1663,14 +1892,16 @@ static void forward(Model *m, int token, int pos) {
                         0.0f, oh, 1);
         }
 
-        mm(s->xb2, s->xb, w->wo[l], dim, dim, w->wo_t[l], s->q8);
+        mm(s->xb2, s->xb, w->wo[l], dim, dim, w->wo_t[l], s->q8, 0);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
         rmsnorm(s->xb, s->x, w->norm_ffn[l], dim, c->norm_eps);
 
-        mm(s->hb,  s->xb, w->gate[l], dim, hidden, w->gate_t[l], s->q8);
-        mm(s->hb2, s->xb, w->up[l],   dim, hidden, w->up_t[l], s->q8);
+        int q8_ffn = is_q8_mm_type(w->gate_t[l]);
+        if (q8_ffn) quantize_row_q8_K(s->xb, s->q8, dim);
+        mm(s->hb,  s->xb, w->gate[l], dim, hidden, w->gate_t[l], s->q8, q8_ffn);
+        mm(s->hb2, s->xb, w->up[l],   dim, hidden, w->up_t[l],   s->q8, q8_ffn);
 
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < hidden; i++) {
@@ -1679,13 +1910,13 @@ static void forward(Model *m, int token, int pos) {
             s->hb[i] = val * s->hb2[i];
         }
 
-        mm(s->xb, s->hb, w->down[l], hidden, dim, w->down_t[l], s->q8);
+        mm(s->xb, s->hb, w->down[l], hidden, dim, w->down_t[l], s->q8, 0);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
     rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
-    mm(s->logits, s->x, w->out, dim, c->vocab_size, w->out_t, s->q8);
+    mm(s->logits, s->x, w->out, dim, c->vocab_size, w->out_t, s->q8, 0);
 }
 
 static float rng_f32(uint64_t *state) {
