@@ -6,7 +6,7 @@
 
 ### リポジトリの目的とスコープ
 
-本リポジトリは、**Qwen3 系（Qwen3-VL-8B-Instruct）** の **GGUF** 形式モデルを、**単一または少数の C／HIP／CUDA ソースファイル**からビルド可能な形で **推論（テキスト生成）**するエンジンである。**PyTorch・TensorFlow・JAX・ONNX Runtime など、機械学習向けのユーザランドライブラリ／ランタイムにはリンクしない。** コアは **標準 C と `libm`**。AMD GPU 版は **ROCm/HIP**（コンパイラ・ランタイムでありニューラルネット用の高レベルフレームワークではない）、NVIDIA GPU 版は **CUDA Toolkit / `nvcc`**（同様に低レベル）、CPU 並列は **OpenMP**（**`cpu-multicore`**）または **OpenMP + OpenBLAS**（**`cpu-blas`** — BLAS は F32 GEMV / Attention 集約。量子化 GEMV は **Q8_K 活性化 + ggml 準拠の整数内積**）、XDNA2 NPU 版は **`amdxdna` DRM ioctl（UAPI）** を直接利用する。Python ランタイムや `torch` に依存する層は置かない。**GGUF の読み取り・トークナイズ・Transformer フォワード・サンプリング**を一連のコードパスとして理解・改変しやすくすることを目的とする。学習・ファインチューニング・バッチ推論の最適化はスコープ外であり、主に **対話形式のインタラクティブ生成**（プロンプト＋続きの生成）を想定する。
+本リポジトリは、**Qwen3 系（Qwen3-VL-8B-Instruct）** の **GGUF** 形式モデルを、**単一または少数の C／HIP／CUDA ソースファイル**からビルド可能な形で **推論（テキスト生成）**するエンジンである。**PyTorch・TensorFlow・JAX・ONNX Runtime など、機械学習向けのユーザランドライブラリ／ランタイムにはリンクしない。** コアは **標準 C と `libm`**。AMD GPU 版は **ROCm/HIP**（コンパイラ・ランタイムでありニューラルネット用の高レベルフレームワークではない）、NVIDIA GPU 版は **CUDA Toolkit / `nvcc`**（同様に低レベル）、CPU 並列は **OpenMP**（**`cpu-multicore`**）または **OpenMP + OpenBLAS**（**`cpu-blas`** — BLAS は F32 GEMV / Attention 集約。量子化 GEMV は **Q8_K 活性化 + ggml 準拠の整数内積**）、XDNA2 NPU 版は **`amdxdna` DRM ioctl（UAPI）** を直接利用する。Python ランタイムや `torch` に依存する層は置かない。**GGUF の読み取り・トークナイズ・Transformer フォワード・サンプリング**を一連のコードパスとして理解・改変しやすくすることを目的とする。学習・ファインチューニング・バッチ推論の最適化はスコープ外であり、主に **単発プロンプトからのテキスト生成**（`-p` + ChatML 1 ターン）を想定する。**マルチターン対話・Thinking モード**は Qwen3 ファミリーで重要だが本リポジトリでは未対応（**「高度な機能（マルチターン・Thinking）」** 参照）。
 
 #### ライブラリ非依存とその意義
 
@@ -357,7 +357,26 @@ You are a helpful assistant.<|im_end|>
 <|im_start|>assistant
 ```
 
-出力時は特殊トークンを表示せず、GPT-2 byte fallback の Unicode codepoint 表現を raw byte に戻して端末へ書き出す。
+出力時は特殊トークンを表示せず、GPT-2 byte fallback の Unicode codepoint 表現を raw byte に戻して端末へ書き出す。**Thinking ブロックの開始／終了トークンは `is_special` に含めておらず**、thinking 対応モデルでは reasoning 文字列がそのまま stdout に出る可能性がある（詳細は **「高度な機能（マルチターン・Thinking）」**）。
+
+## 高度な機能（マルチターン・Thinking）
+
+Qwen3 ファミリー（QwQ 等の reasoning 系、DeepSeek-R1 に近い thinking 構成を含む）では、公式スタックは **マルチターン ChatML** と **Thinking モード**（`enable_thinking`、`/think` / `/no_think`、thinking ブロック）を前提とする。本リポジトリは **1 ターン固定の `chat_encode`** と **1 プロセス 1 推論**のみを実装し、次は **スコープ外**である。
+
+| 機能 | Qwen3 ファミリー（公式） | 本リポジトリ |
+|---|---|---|
+| ChatML 1 ターン | ○ | ○ |
+| マルチターン履歴 | ○ | × |
+| プロセス間 KV / 会話状態 | ○（FW 側） | × |
+| Thinking オン／オフ | ○ | × |
+| `/think`・`/no_think` | ○ | × |
+| thinking ブロックの分離表示 | ○ | × |
+
+**マルチターン**: 各 `main.c` の `chat_encode` は system + **1 回の user**（`-p`）+ assistant 開始のみ。過去ターンを CLI で渡す経路はなく、KV を次実行に引き継ぐ API もない。履歴が必要なら ChatML を手で組み立てて `-p` に載せるか、`chat_encode` と生成ループを拡張する。
+
+**Thinking**: `enable_thinking` 相当の **assistant 直前プロンプト制御**、生成出力の **reasoning と最終回答の分離**（`print_tok` は ChatML 特殊 ID のみ抑制）、**`thinking_budget`** 等は未実装。thinking 対応 GGUF ではテンプレート不一致や reasoning 生出力が起きうる。拡張時は GGUF の **`tokenizer.chat_template`**（Jinja）に追随し、thinking 区間の encode／decode を追加する。
+
+利用者向けの平易な説明は **`README.md`** / **`README.en.md`** の **「高度な機能（マルチターン対話・Thinking モード）について」** を参照。
 
 ### CPU forward
 
@@ -426,6 +445,8 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 - **CUDA 版（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。集約 Makefile 未統合。**汎用 GPU** は **`gpu-cuda`**（PTX 可）。**Blackwell NVFP4** は **`gpu-cuda-nvfp4`**（**CUDA 13**・CUTLASS・**`sm_120a`**）。**`build.polarquant`** は KV のみ PolarQuant-R（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**、任意 GPU 可／NVFP4 併用可）。**`gpu-cuda-nvfp4/third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。**`gpu-cuda-nvfp4`** では線形重みは NVFP4 のみ VRAM に載り、**`gpu-cuda` 比で線形 FP16 分（8B 級で約 15 GiB 相当）を節約**できる（代わりに **`token_embd`** は FP16 のまま）。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
 - **テキストのみ**: Vision・マルチモーダル入力は未対応。
+- **マルチターン対話**: 組み込み CLI・履歴管理・KV 再利用・公式 chat template の完全再現は未対応（**「高度な機能（マルチターン・Thinking）」** 参照）。
+- **Thinking モード**: `enable_thinking` / `/think` / `/no_think` / thinking ブロック分離表示は未対応。
 - **コンテキスト長**: `-l` 既定 512。長くすると KV メモリ（CPU ヒープまたは VRAM）が増加する。
 - 実装は **参照・研究用**を想定し、商用 API や公式実装との **ビット一致・品質一致**は保証しない。
 
@@ -491,7 +512,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 ## 補足：ドキュメント間の役割
 
-- **`README.md`**: ビルド・実行・バリアント選択の手順、およびライブラリ非依存の方針とその意義の説明（日本語）。
+- **`README.md`**: ビルド・実行・バリアント選択の手順、ライブラリ非依存の方針とその意義、**マルチターン対話・Thinking モードの対応状況**（日本語）。
 - **`README.en.md`**: 上記と同等の内容（英語）。
 - **`qwen3-8b/xdna2/xdna-gemv/README.md`**: **`qwen3-8b/xdna2/xdna-gemv/`** 配下（**`kernels/`**・**`toolchain/`**・スタブ生成）への入口。
 - **`qwen3-8b/xdna2/xdna-gemv/kernels/README.md`**: XDNA2 の **ctrlcode**・GEMV 形状・スタブ／実機バイナリ・**`--xdna-status`** の入門。**GPU（ROCm/HIP）カーネルとの対比**（§3）もここで扱う。

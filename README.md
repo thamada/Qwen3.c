@@ -768,11 +768,56 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 9. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
 
+## 高度な機能（マルチターン対話・Thinking モード）について
+
+Qwen3 ファミリー（および DeepSeek 系の reasoning モデルに近い構成を持つ QwQ 等）では、単発の `-p "..."` よりもはるかにリッチな **対話テンプレート**と **推論モード**が公式スタックで想定されています。本リポジトリはそのうち **デコーダ forward とサンプリングの最小経路**だけを C で再現しており、次の高度機能については **現状未対応**です。利用・改造の際は次の配慮が必要です。
+
+### マルチターン（複数回の会話）
+
+公式の Qwen3 利用では、ChatML 形式で **system / user / assistant を複数ターン分並べた履歴**をプロンプトに載せ、前ターンまでの文脈を KV キャッシュまたは再 prefill で引き継ぎます。ツール呼び出し（function calling）を含むエージェント用途でも、**assistant の過去発話・tool 結果・reasoning ブロック**を次ターンに渡す設計が前提になります。
+
+本リポジトリの `chat_encode`（各 `main.c`）は **固定の 1 ターン**のみです。
+
+```text
+<|im_start|>system … <|im_end|>
+<|im_start|>user\n{ -p で渡した文字列 }<|im_end|>
+<|im_start|>assistant\n
+```
+
+過去の user / assistant ラウンドを CLI から渡す引数はなく、**プロセスをまたいだ会話状態の保持もありません**。マルチターン相当の挙動が必要な場合は、(1) 履歴文字列を自分で ChatML に組み立てて `-p` に渡す、(2) `chat_encode` を拡張してターン列を受け取る、(3) 生成済み KV を次推論に再利用する（現状は毎回ゼロから prefill）——といった **テンプレートと状態管理の実装**が別途必要です。`-l`（最大シーケンス長）を超える履歴は切り詰めまたは要約が必要になります。
+
+### Thinking モード（思考プロセスを伴う推論）
+
+Qwen3 の **ハイブリッド thinking**（DeepSeek-R1 / QwQ 系に近い「考えてから答える」モード）では、推論 API や Hugging Face の `apply_chat_template(..., enable_thinking=True/False)` で **思考のオン／オフ**を切り替えます。thinking 有効時は assistant 出力の先頭に **thinking ブロック**（`tokenizer.chat_template` が挿入する reasoning 区間。開始／終了はモデル固有の特殊トークン）が付き、内部推論を経てから最終回答が続きます。無効時は **空の thinking ブロック**をテンプレート側で挿入し、即答に近い経路に誘導します。マルチターンでは **`/think` / `/no_think`** を user メッセージ末尾に付けて **ターン単位で soft switch** する公式手順もあります（最新の指示が優先）。
+
+本リポジトリでは次を **行っていません**。
+
+- `enable_thinking` に相当する **生成プロンプト制御**（assistant 直前への空 thinking ブロック挿入等）
+- 生成結果から **thinking 部分と最終回答の分離・非表示**（`print_tok` は ChatML 特殊トークン以外をそのまま stdout へ出す）
+- **`thinking_budget`** や reasoning 専用ストリームなど、API 側の thinking 付帯パラメータ
+
+そのため、thinking 対応 GGUF をそのまま動かすと **思考ブロックの生テキストが端末に混ざる**、または **非 thinking 用テンプレートとずれて品質が落ちる**ことがあります。Thinking モードを正しく扱うには、公式 chat template（GGUF メタデータの `tokenizer.chat_template` 相当）に沿った **プロンプト組み立て**と、出力側の **thinking タグ解析**を `chat_encode` / 生成ループに追加する必要があります。
+
+### 本リポジトリの位置づけ（まとめ）
+
+| 機能 | Qwen3 ファミリー（公式想定） | 本リポジトリ（現状） |
+|---|---|---|
+| ChatML 1 ターン（system + user + assistant 開始） | ○ | ○（`-p` 固定 system 文付き） |
+| マルチターン履歴 | ○ | ×（手動で `-p` に ChatML を埋め込む必要） |
+| KV / 会話状態の保持 | ○（フレームワーク側） | ×（1 回の実行内のみ） |
+| Thinking オン／オフ | ○（`enable_thinking` 等） | × |
+| `/think`・`/no_think` | ○（ハイブリッドモデル） | ×（未解釈） |
+| 思考ブロックのフィルタ表示 | ○（API / UI） | × |
+
+参照実装として **テキスト 1 ターン生成**を追う用途には十分ですが、**ChatGPT / Qwen API と同等のマルチターン対話や Thinking UI** を期待する場合は、上記を拡張するか、vLLM・llama.cpp・Transformers 等の既存ランタイムを使う方が適しています。テンプレート仕様の背景は [Qwen3 公式ブログ](https://qwenlm.github.io/blog/qwen3/) や Hugging Face の Qwen3 chat template 解説が参考になります。
+
 ## このリポジトリで扱わないもの
 
 - 学習、ファインチューニング
 - バッチ推論の最適化
 - 画像入力
+- **マルチターン対話の組み込み CLI**（履歴管理・KV 再利用・公式 chat template の完全再現）
+- **Thinking モードの制御・思考ブロックの分離表示**（`enable_thinking` / `/think` / `/no_think` 等）
 - サーバ化、Web API 化
 - すべての GGUF 量子化形式への汎用対応
 - 公式実装との完全な数値一致保証

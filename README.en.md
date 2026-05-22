@@ -757,11 +757,56 @@ Suggested order:
 
 9. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
+## Advanced features (multi-turn chat and Thinking mode)
+
+The Qwen3 family (and reasoning-oriented lines such as QwQ, comparable in spirit to DeepSeek-style models) assumes richer **chat templates** and **inference modes** than a single `-p "..."` CLI prompt. This repository reproduces only the **minimal decoder forward + sampling path** in C. The following advanced features are **not implemented** today; keep the notes below in mind when using or extending the code.
+
+### Multi-turn dialogue
+
+Official Qwen3 stacks expect **multi-turn ChatML history**—system / user / assistant rounds appended in order—with prior context carried via KV cache or re-prefill. Agent flows (tool calling) also assume **past assistant turns, tool results, and reasoning blocks** are fed into the next turn.
+
+Each `main.c` implements **`chat_encode` as a fixed single turn only**:
+
+```text
+<|im_start|>system … <|im_end|>
+<|im_start|>user\n{ string passed via -p }<|im_end|>
+<|im_start|>assistant\n
+```
+
+There is **no CLI for prior user/assistant rounds** and **no conversation state across process invocations**. To approximate multi-turn behavior you must either (1) hand-build ChatML history into `-p`, (2) extend `chat_encode` to accept a turn list, or (3) reuse KV from a previous run (today every run prefills from scratch). History longer than `-l` (`max_seq`) needs truncation or summarization.
+
+### Thinking mode (reasoning before the final answer)
+
+Qwen3 **hybrid thinking** (similar in goal to DeepSeek-R1 / QwQ “think then answer”) is toggled in official stacks via APIs or Hugging Face `apply_chat_template(..., enable_thinking=True/False)`. When enabled, the assistant prefix may include a **thinking block** (`tokenizer.chat_template` inserts a reasoning region bounded by model-specific special tokens) before the final answer. When disabled, templates often insert an **empty thinking block** to steer the model toward direct answers. In multi-turn chat, **`/think` and `/no_think`** appended to user messages provide a **per-turn soft switch** (latest instruction wins).
+
+This repository does **not**:
+
+- Control generation prompts equivalent to **`enable_thinking`** (e.g. empty thinking block before assistant generation)
+- **Separate or hide** thinking vs final answer in output (`print_tok` prints non-ChatML specials to stdout as-is)
+- Implement API-style extras such as **`thinking_budget`** or dedicated reasoning streams
+
+Running thinking-capable GGUF weights as-is may **dump raw reasoning text to the terminal** or **degrade quality** if the prompt does not match the official template. Correct Thinking support requires **`chat_encode` / generation-loop changes** aligned with the GGUF `tokenizer.chat_template` metadata and **parsing/filtering of thinking regions** on output.
+
+### Where this repo stands (summary)
+
+| Feature | Qwen3 family (official) | This repo (today) |
+|---|---|---|
+| ChatML single turn (system + user + assistant start) | Yes | Yes (fixed system string + `-p`) |
+| Multi-turn history | Yes | No (manual ChatML in `-p` only) |
+| KV / session persistence | Yes (framework) | No (single run only) |
+| Thinking on/off | Yes (`enable_thinking`, etc.) | No |
+| `/think` / `/no_think` | Yes (hybrid models) | No (not interpreted) |
+| Filtered thinking display | Yes (API / UI) | No |
+
+For **understanding one-shot text generation** in C, this repo is sufficient. For **ChatGPT / Qwen API–class multi-turn chat or Thinking UI**, extend the code or use vLLM, llama.cpp, Transformers, etc. Background: [Qwen3 blog](https://qwenlm.github.io/blog/qwen3/) and Hugging Face articles on the Qwen3 chat template.
+
 ## Out of scope
 
 - Training / fine-tuning
 - Batch inference tuning
 - Image input
+- **Built-in multi-turn CLI** (history management, KV reuse, full official chat template)
+- **Thinking mode control and filtered reasoning display** (`enable_thinking`, `/think`, `/no_think`, etc.)
 - Server or Web API packaging
 - Universal support for every GGUF quantization
 - Guaranteed numerical match with official implementations
