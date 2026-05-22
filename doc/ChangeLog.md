@@ -4,6 +4,38 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 05:51:48
+
+**Git ブランチ `cpu-blas`** — **`cuda` ブランチよりスループットが高いため、コミット `8eec545` まで巻き戻し**。
+
+#### 背景
+
+- **`cuda`** ブランチは **`gpu-cuda`** 等の GPU 開発と **`qwen3-8b/cpu-blas/`** の改善を同一ラインで進めてきた。
+- **`8eec545`**（Merge pull request #16）以降、**`cuda`** 側に **`2166dc4`**（埋め込み F32 キャッシュ・**`FWD_LM_TOPK`**・F16 dot SIMD 等）と **`1a84da4`**（回帰修正）が追加された。
+- 同一環境・同一 GGUF（IQ2_M 等）・同一 **`OMP_NUM_THREADS`** で比較すると、**`cpu-blas` ブランチ（`8eec545`）の方が最新 `cuda` ブランチより prefill / decode スループットが高い**ことが確認された。
+
+#### 巻き戻し先
+
+- **ブランチ名**: **`cpu-blas`**
+- **HEAD**: **`8eec545cb30fd5dcd6d35b0251747d5d443aa655`**（**`2166dc4` / `1a84da4` は含まない**）
+- **含まれる主な `cpu-blas` 最適化**: 層内 Q8_K 共有、AVX2 量子化 GEMV（IQ2/IQ3 含む）、RoPE キャッシュ、**`lm_mode`**（prefill LM スキップ / greedy argmax / 全 vocab サンプリング）、F16 埋め込み F16C
+
+#### 巻き戻し理由（`cuda` が遅くなった要因）
+
+| 変更（`cuda` のみ） | 意図 | 実測での問題 |
+|---------------------|------|--------------|
+| **埋め込み F32 キャッシュ常時有効**（**`2166dc4`**） | 推論中の量子化/F16 dequant を **`memcpy`** に置換 | **~2.3 GiB** 常駐が **L3 を汚染**し matmul 全体が遅化。**`1a84da4`** で **`QWEN3_CPU_BLAS_EMBCACHE=1` オプトイン**に変更したが、**`8eec545` 比では依然遅い** |
+| **`FWD_LM_TOPK`（top-4096）**（**`2166dc4`**） | top-p 時の全 vocab logits 書き込み省略 | **151936 行 dot + min-heap + decode 毎 malloc/free** が重く **decode ~4% 低下**。**`1a84da4`** で削除 |
+| **`dot_f16_row` / `schedule(static,512)` / argmax 集約改善**（**`2166dc4`→`1a84da4` 維持**） | F16 GEMV・OpenMP 粒度・critical 削減 | **計測上 `8eec545` を上回らず**。`cpu-blas` ブランチでは採用しない |
+
+#### 方針
+
+- **`cpu-blas` ブランチ**: **`8eec545` 固定** — **`qwen3-cpu-blas` の最高スループット**を優先。GPU 開発の影響を受けない。
+- **`cuda` ブランチ**: GPU と **`cpu-blas` 実験**を継続（巻き戻し対象外）。
+- **ドキュメント**: **`doc/design.md`** に **「Git ブランチ（`cpu-blas` と `cuda`）と `cpu-blas` スループット」** 節を追加。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 04:53:10
 
 **`qwen3-8b/cpu-blas/`** — **IQ2_S / IQ3_S の AVX2 整数内積**、**RoPE キャッシュ**、**prefill LM head スキップ**、**greedy argmax 専用パス**、**F16 埋め込み F16C**。

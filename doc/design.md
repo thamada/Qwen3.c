@@ -115,6 +115,37 @@ OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas "$(MODEL)" -p "Hello" -n 4
 
 **CPU（IQ 混在 8B）**はブロック単位デ量子化のため **非常に遅くなり得る**。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え、量子化 GEMV を **Q8_K + 整数内積**に置き換えるため **`cpu-multicore` より速くなることが多い**が、実用スループットは **ROCm 版**（AMD GPU）または **`gpu-cuda` / `gpu-cuda-nvfp4`**（NVIDIA GPU）を優先する想定である。
 
+### Git ブランチ（`cpu-blas` と `cuda`）と `cpu-blas` スループット
+
+本リポジトリでは **`cuda`** ブランチ（GPU 向け **`gpu-cuda`** 等の開発ライン）と、**`cpu-blas`** ブランチ（**`qwen3-8b/cpu-blas/`** 専用ライン）が分かれている。**同一コミット上の `cpu-blas/main.c` を比較したとき、現時点では `cpu-blas` ブランチの方が `cuda` ブランチよりスループットが高い**（同一 GGUF・同一 `OMP_NUM_THREADS`・同一プロンプト長での計測。詳細な数値は **`doc/ChangeLog.md`** の巻き戻しエントリ参照）。
+
+| ブランチ | `cpu-blas/main.c` の位置づけ | 備考 |
+|----------|------------------------------|------|
+| **`cpu-blas`** | コミット **`8eec545`**（Merge pull request #16）で固定 | IQ2/IQ3 AVX2 dot・RoPE キャッシュ・**`lm_mode`**（**`FWD_NO_LM` / `FWD_LM_ARGMAX` / `FWD_LM_FULL`**）までを含む **スループット最優先**のスナップショット |
+| **`cuda`** | 上記に続く **`2166dc4`**・**`1a84da4`** を含む | GPU 開発と **`cpu-blas` 追加最適化**を同一ブランチで進めた結果 |
+
+**`cuda` ブランチが `cpu-blas` より遅くなった主因**（`8eec545` 以降の変更）:
+
+1. **`2166dc4` — 埋め込み F32 キャッシュの常時構築（~2.3 GiB）**  
+   非 F32 の **`token_embd.weight`** を起動時に **`vocab×dim` float** へ一括展開し、推論中は **`memcpy`** で lookup する案。**lookup 自体は軽い**が、**~2.3 GiB の常駐領域が L3 キャッシュを汚染**し、28 層×多数 GEMV の帯域 bound な **`cpu-blas` 全体が遅化**する（decode で数 % 低下）。**`1a84da4`** で **`QWEN3_CPU_BLAS_EMBCACHE=1` 時のみ**に変更したが、**`emb_lookup_cached` の分岐**等の残存コードは **`8eec545` の F16C 逐次 lookup より速くならない**。
+
+2. **`2166dc4` — LM head top-k（`FWD_LM_TOPK` / top-4096）**  
+   top-p 有効時に全 vocab への logits 書き込みを避け、**151936 行それぞれで dot + min-heap 更新**する経路。**decode 毎の heap 操作と `malloc`/`free`** が、省略した logits 書き込みより重く **decode ~4% 低下**。**`1a84da4`** で削除済みだが、**`cuda` 側 `cpu-blas` は `8eec545` より後のコミット履歴を引きずる**。
+
+3. **その他の変更（`2166dc4` 由来、`1a84da4` で一部維持）**  
+   **`dot_f16_row`**（F16 GEMV SIMD）、**`schedule(static, 512)`**、**`mm_argmax_row` の `#pragma omp critical` 廃止**等は **`cuda` ブランチに残っている**が、**計測上は `8eec545` ベースの `cpu-blas` ブランチを上回らない**（チャンクサイズ 512 が行数・スレッド数に対して負荷分散を悪化させるケース、argmax 集約の追加 scratch 等）。
+
+**`cpu-blas` ブランチを `8eec545` に巻き戻した理由**: 上記の「速度のための追加最適化」が **実測スループットでは逆効果**だったため、**`cpu-blas` 専用ブランチでは GPU 開発と切り離し、最速と確認された `8eec545` の `main.c` を維持する**方針とする。**`cuda` ブランチ**は引き続き GPU（**`gpu-cuda`** 等）と **`cpu-blas` 実験**を載せる。**CPU 推論で最高スループットが必要な場合は `cpu-blas` ブランチを checkout してビルドする**（変更履歴は **`doc/ChangeLog.md`**）。
+
+**`8eec545` 時点の `cpu-blas` が速い要因**（本書「`cpu-blas`：Q8_K 活性化 GEMV」節と対応）:
+
+- **層内 Q8_K 量子化共有** — wq/wk/wv・gate/up で quantize 重複を削減  
+- **全量子化型 AVX2 整数内積** — IQ2_S / IQ3_S 含む **`vec_dot_*_q8_K`**  
+- **RoPE cos/sin キャッシュ** — forward 中の **`powf`/`cosf`/`sinf`** 排除  
+- **prefill 中 LM head スキップ**（**`FWD_NO_LM`**）  
+- **greedy 時 `mm_argmax_row`**（**`FWD_LM_ARGMAX`**）— 全 vocab **`logits[]` 非確保**  
+- **F16 埋め込みの F16C+AVX2 逐次 lookup** — **大容量常駐キャッシュなし**（L3 汚染回避）
+
 ## ビルドと実行
 
 ### 共通（`qwen3-8b/Makefile`）
