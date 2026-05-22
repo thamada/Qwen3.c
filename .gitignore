@@ -12,10 +12,13 @@ qwen3-8b/cpu/qwen3-cpu
 qwen3-8b/cpu-multicore/qwen3-cpu-omp
 qwen3-8b/gpu-rocm/qwen3-rocm
 qwen3-8b/gpu-cuda/qwen3-gpu-cuda
-qwen3-8b/gpu-cuda/fp4_verify
 qwen3-8b/gpu-cuda/polarquant_verify
 qwen3-8b/gpu-cuda/*.o
-qwen3-8b/gpu-cuda/third_party/
+qwen3-8b/gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4
+qwen3-8b/gpu-cuda-nvfp4/fp4_verify
+qwen3-8b/gpu-cuda-nvfp4/polarquant_verify
+qwen3-8b/gpu-cuda-nvfp4/*.o
+qwen3-8b/gpu-cuda-nvfp4/third_party/
 qwen3-8b/xdna2/qwen3-xdna2
 qwen3-8b/xdna2-bfp16/qwen3-xdna2-bfpx
 # 誤って qwen3-8b/ 直下に生成された古いバイナリ（無視）

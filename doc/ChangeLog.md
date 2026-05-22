@@ -4,6 +4,20 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-22 17:55:46
+
+**CUDA ディレクトリ分割** — NVFP4 なし **`qwen3-8b/gpu-cuda/`** と NVFP4 専用 **`qwen3-8b/gpu-cuda-nvfp4/`** に分離。
+
+- **`gpu-cuda/`**: FP16 線形層のみ。**`make build` / `make run`** が既定。旧 **`build.no-fp4` / `run.no-fp4`** を廃止。**`fp4_*`**・**`third_party/cutlass`** を **`gpu-cuda-nvfp4/`** へ移動。
+- **`gpu-cuda-nvfp4/`**: **`BONSAI_FP4=1`** 固定。**`make build` / `make run`** が既定。共有ソース（**`main.c` / `kernels.cu` / `gpu.h` / `polarquant.*`**）は **`../gpu-cuda/`** を参照。出力 **`qwen3-gpu-cuda-nvfp4`**。旧 **`build.fp4` / `build.fp4.polarquant` / `run.fp4.polarquant`** は **`build` / `build.polarquant` / `run.polarquant`** に統合。
+- **`.gitignore`**: **`gpu-cuda-nvfp4/`** のビルド成果物を追加。
+
+**`README.md`**・**`README.en.md`**: 2 ディレクトリ構成・コマンド表・ビルド手順・トラブルシュートを更新。
+
+**`doc/design.md`**: バリアント表・ディレクトリ表・Make ターゲット表・CUDA 節・実行時挙動・NVFP4 / PolarQuant 実装メモ・トラブルシュートを上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-21 22:30:51
 
 **`qwen3-8b/gpu-cuda/`**:

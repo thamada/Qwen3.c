@@ -38,7 +38,8 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
-| CUDA GPU | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. **`build.no-fp4`**: all-linear FP16 VRAM. **`build.fp4`** (Blackwell): linear weights **NVFP4 only** at H2D. **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). **`build.fp4.polarquant`**: both (max VRAM savings on Blackwell). Embedding only in FP16 VRAM. Not in aggregate `Makefile` |
+| CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). Not in aggregate `Makefile` |
+| CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Not in aggregate `Makefile` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
@@ -67,14 +68,17 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     ├── gpu-rocm/
     │   ├── Makefile
     │   └── main.c
-    ├── gpu-cuda/
+    ├── gpu-cuda/                    (FP16 linear layers, no NVFP4)
     │   ├── Makefile
     │   ├── main.c
     │   ├── kernels.cu
     │   ├── gpu.h
-    │   ├── fp4_gemm.cu / fp4_qwen3.cu / fp4_verify.cu  (Blackwell FP4)
-    │   ├── polarquant.cu / polarquant_kernels.cuh / polarquant_verify.cu  (PolarQuant-R KV)
+    │   └── polarquant.cu / polarquant_kernels.cuh / polarquant_verify.cu  (PolarQuant-R KV)
+    ├── gpu-cuda-nvfp4/              (Blackwell NVFP4)
+    │   ├── Makefile
+    │   ├── fp4_gemm.cu / fp4_qwen3.cu / fp4_verify.cu
     │   └── third_party/cutlass/  (fetched via make cutlass)
+    │   (main.c / kernels.cu / gpu.h / polarquant.* reference ../gpu-cuda/)
     ├── xdna2/
     │   ├── Makefile
     │   ├── main.c
@@ -152,7 +156,10 @@ Pass the `gfx…` value from `rocminfo` as `GPU_ARCH` at build time.
 
 ### CUDA build
 
-You need an NVIDIA GPU and the **CUDA Toolkit** (`nvcc`, `libcudart`). There is **no** CUDA target in the aggregate `qwen3-8b/Makefile`; build under **`qwen3-8b/gpu-cuda/`**.
+You need an NVIDIA GPU and the **CUDA Toolkit** (`nvcc`, `libcudart`). There is **no** CUDA target in the aggregate `qwen3-8b/Makefile`; build in one of these directories:
+
+- **`qwen3-8b/gpu-cuda/`** — FP16 linear layers (general NVIDIA GPUs)
+- **`qwen3-8b/gpu-cuda-nvfp4/`** — NVFP4 linear layers (Blackwell / RTX 50, CUDA 13 + CUTLASS)
 
 Check:
 
@@ -163,17 +170,17 @@ nvidia-smi
 
 Put CUDA’s **`bin`** directory on **`PATH`** (linking can fail if only `/usr/local/bin/nvcc` is visible).
 
-| Use case | Command (`cd qwen3-8b/gpu-cuda`) |
-|----------|----------------------------------|
-| **FP16 only** (Ampere/Ada, PTX OK) | `make build.no-fp4` or `make run.no-fp4` |
-| **Blackwell NVFP4** (e.g. RTX 50) | `make build.fp4` / default `make run` (calls `build.fp4`) |
-| **PolarQuant-R KV cache** (any GPU, FP16 linear) | `make build.polarquant` |
-| **NVFP4 + PolarQuant combined** (Blackwell, max VRAM savings) | `make build.fp4.polarquant` / `make run.fp4.polarquant` |
-| Install CUDA 13 + full FP4 build | `make blackwell` (removes apt CUDA 11 → CUDA 13 → CUTLASS → `build.fp4`) |
-| PolarQuant round-trip verify | `make pq-test` |
-| CUTLASS NVFP4 GEMM unit verify | `make fp4-test` |
+| Use case | Command |
+|----------|---------|
+| **FP16 only** (Ampere/Ada, PTX OK) | `cd qwen3-8b/gpu-cuda` → `make build` / `make run` |
+| **PolarQuant-R KV cache** (FP16 linear, any GPU) | `cd qwen3-8b/gpu-cuda` → `make build.polarquant` / `make run.polarquant` |
+| **Blackwell NVFP4** (e.g. RTX 50) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make build` / `make run` |
+| **NVFP4 + PolarQuant combined** (Blackwell, max VRAM savings) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make build.polarquant` / `make run.polarquant` |
+| Install CUDA 13 + full NVFP4 build | `cd qwen3-8b/gpu-cuda-nvfp4` → `make blackwell` |
+| PolarQuant round-trip verify | `make pq-test` in either directory |
+| CUTLASS NVFP4 GEMM unit verify | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fp4-test` (**Blackwell / sm_120a required**) |
 
-FP16 builds default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. The **`gpu-cuda/Makefile` default target `run` invokes `build.fp4`**—on non-Blackwell GPUs use **`make run.no-fp4`** instead.
+FP16 builds (`gpu-cuda`) default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. NVFP4 builds (`gpu-cuda-nvfp4`) default to **`sm_120a`**.
 
 ## Obtain the model file
 
@@ -208,6 +215,7 @@ qwen3-8b/
 ├── cpu-multicore/ …
 ├── gpu-rocm/ …
 ├── gpu-cuda/ …
+├── gpu-cuda-nvfp4/ …
 ├── xdna2/ …
 ├── xdna2-bfp16/ …
 └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
@@ -343,28 +351,29 @@ make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
 
 ## CUDA GPU (NVIDIA)
 
-For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build under **`gpu-cuda/`**. Prompts run as a **prefill batch**; generation is **one-token decode**; attention uses **Flash Attention** (GQA).
+For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build under **`gpu-cuda/`** (FP16) or **`gpu-cuda-nvfp4/`** (NVFP4) depending on your GPU. Prompts run as a **prefill batch**; generation is **one-token decode**; attention uses **Flash Attention** (GQA).
 
-| Build | Weights at load | Linear / KV at runtime |
-|-------|-----------------|------------------------|
-| **`build.no-fp4`** | CPU dequant → **FP16** → VRAM (ROCm-like) | FP16 GEMV kernels; KV in **F32** |
-| **`build.fp4`** (Blackwell) | H2D: linear tensors → **NVFP4 cache only**; **`token_embd`** only in FP16 | **`fp4_qwen3_mm`** — decode / short prefill via **FP4 GEMV**; long prefill via CUTLASS GEMM |
-| **`build.polarquant`** | Linear weights stay FP16 (like `build.no-fp4`) | KV in **PolarQuant-R** (64 B/head); tile-wise F32 decode during attention |
-| **`build.fp4.polarquant`** (Blackwell) | Same as **`build.fp4`** (NVFP4 cache only) | FP4 GEMV/GEMM for linear; same PolarQuant-R KV as **`build.polarquant`** |
+| Directory | Weights at load | Linear / KV at runtime |
+|-----------|-----------------|------------------------|
+| **`gpu-cuda`** | CPU dequant → **FP16** → VRAM (ROCm-like) | FP16 GEMV kernels; KV in **F32** (default) |
+| **`gpu-cuda`** + **`build.polarquant`** | Linear weights stay FP16 (same as above) | KV in **PolarQuant-R** (64 B/head); tile-wise F32 decode during attention |
+| **`gpu-cuda-nvfp4`** | H2D: linear tensors → **NVFP4 cache only**; **`token_embd`** only in FP16 | **`fp4_qwen3_mm`** — decode / short prefill via **FP4 GEMV**; long prefill via CUTLASS GEMM |
+| **`gpu-cuda-nvfp4`** + **`build.polarquant`** | Same as above (NVFP4 only) | FP4 GEMV/GEMM for linear; PolarQuant-R KV |
 
-**`build.fp4`** targets **Blackwell (sm_120)** with CUTLASS **NVFP4**. On Ampere/Ada and older, use **`build.no-fp4` / `make run.no-fp4`** only. **PolarQuant-R** ([arxiv:2502.02617](https://arxiv.org/abs/2502.02617)) compresses the KV cache; **`head_dim=128` required** (Qwen3-VL-8B). Roughly **~8×** less KV VRAM vs F32 (~144 MiB → ~18 MiB for 36 layers × 512 seq). **`build.fp4.polarquant`** saves both linear FP16 (~15 GiB class for 8B) and F32 KV.
+**`gpu-cuda-nvfp4`** uses CUTLASS **NVFP4** and targets **CUDA 13 + sm_120-class GPUs** (Blackwell / RTX 50). **PolarQuant-R** ([arxiv:2502.02617](https://arxiv.org/abs/2502.02617)) compresses the KV cache; **`head_dim=128` required** (Qwen3-VL-8B). Roughly **~8×** less KV VRAM vs F32 (~144 MiB → ~18 MiB for 36 layers × 512 seq). NVFP4 + PolarQuant combined saves both linear FP16 (~15 GiB class for 8B) and F32 KV.
 
-### Build (FP16 only, general GPUs)
+### Build and run (FP16, general GPUs)
 
 ```bash
 cd qwen3-8b/gpu-cuda
-make build.no-fp4
+make build
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
 Produces **`qwen3-gpu-cuda`**. Example with a specific architecture:
 
 ```bash
-make build.no-fp4 CUDA_GENCODE=arch=compute_89,code=sm_89
+make build CUDA_GENCODE=arch=compute_89,code=sm_89
 ```
 
 ### Build and run (Blackwell + NVFP4)
@@ -372,21 +381,20 @@ make build.no-fp4 CUDA_GENCODE=arch=compute_89,code=sm_89
 If CUDA 13 and CUTLASS are not set up yet (needs root-like privileges):
 
 ```bash
-cd qwen3-8b/gpu-cuda
+cd qwen3-8b/gpu-cuda-nvfp4
 make blackwell
 ```
 
 If CUDA 13 is already installed:
 
 ```bash
+cd qwen3-8b/gpu-cuda-nvfp4
 make cutlass          # clone third_party/cutlass (first time)
-make build.fp4        # sm_120a + BONSAI_FP4=1 + FA_BR=32
+make build            # sm_120a + BONSAI_FP4=1 + FA_BR=32
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-At startup you should see **`Uploading weights to device (dequant -> NVFP4 linear layers)...`** and **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`** when the FP4 path is active.
-
-**Note:** the **`gpu-cuda/Makefile` default target is `run` → `build.fp4`**. On non-Blackwell GPUs use **`make run.no-fp4`**.
+Produces **`qwen3-gpu-cuda-nvfp4`**. At startup you should see **`Uploading weights to device (dequant -> NVFP4 linear layers)...`** and **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`** when the FP4 path is active.
 
 ### Build (PolarQuant-R KV cache)
 
@@ -405,10 +413,10 @@ At startup you should see **`PolarQuant-R: KV cache enabled (head_dim=128, 64 by
 Compress linear weights with NVFP4 and the KV cache with PolarQuant-R. Requires **CUDA 13 + CUTLASS + sm_120-class GPU**.
 
 ```bash
-cd qwen3-8b/gpu-cuda
+cd qwen3-8b/gpu-cuda-nvfp4
 make cutlass                 # first time only
-make build.fp4.polarquant    # BONSAI_FP4=1 + BONSAI_POLARQUANT=1
-make run.fp4.polarquant MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+make build.polarquant
+make run.polarquant MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
 At startup you should see **all** of the following:
@@ -417,14 +425,9 @@ At startup you should see **all** of the following:
 - **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`**
 - **`PolarQuant-R: KV cache enabled (head_dim=128, 64 bytes/head, ~8.00x vs F32)`**
 
-Equivalent low-level Makefile invocation:
-
-```bash
-make build BONSAI_FP4=1 BONSAI_POLARQUANT=1 \
-  CUDA_GENCODE=arch=compute_120a,code=sm_120a FA_BR=32
-```
-
 ### Run (binary directly)
+
+FP16 build:
 
 ```bash
 ./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
@@ -432,13 +435,15 @@ make build BONSAI_FP4=1 BONSAI_POLARQUANT=1 \
   -n 64
 ```
 
-After an FP16-only build:
+NVFP4 build:
 
 ```bash
-make run.no-fp4 MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Short explanation in English."
+./qwen3-gpu-cuda-nvfp4 ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+  -p "Explain what CUDA is for beginners." \
+  -n 64
 ```
 
-Optional CUTLASS NVFP4 GEMM smoke test: `make fp4-test` (builds and runs **`fp4_verify.cu`**). See `doc/design.md` (CUDA section).
+Optional CUTLASS NVFP4 GEMM smoke test: `cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test` (builds and runs **`fp4_verify.cu`**, **Blackwell / sm_120a**). See `doc/design.md` (CUDA section).
 
 ## AMD Ryzen AI XDNA2 NPU
 
@@ -570,10 +575,11 @@ Typical files removed:
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
 
-**CUDA** artifacts (`gpu-cuda/qwen3-gpu-cuda`, etc.) are **not** removed by aggregate `make clean`. To clean them:
+**CUDA** artifacts (`gpu-cuda/qwen3-gpu-cuda`, `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`, etc.) are **not** removed by aggregate `make clean`. To clean them:
 
 ```bash
 cd qwen3-8b/gpu-cuda && make clean
+cd qwen3-8b/gpu-cuda-nvfp4 && make clean
 ```
 
 `make clean` does **not** delete the GGUF model.
@@ -602,11 +608,11 @@ Expected for 8B on CPU alone. Try `-n 1` or `-n 4`:
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs or `gpu-cuda/qwen3-gpu-cuda` on NVIDIA GPUs.
+For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs, `gpu-cuda/qwen3-gpu-cuda` (FP16) or `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` (Blackwell NVFP4) on NVIDIA GPUs.
 
 ### `nvcc` not found / `nvlink` errors
 
-Ensure CUDA `bin` is on `PATH` or set `CUDA_HOME` in `gpu-cuda/Makefile`.
+Ensure CUDA `bin` is on `PATH` or set `CUDA_HOME` in each directory’s `Makefile`.
 
 ```bash
 export PATH=/usr/local/cuda/bin:$PATH
@@ -615,17 +621,17 @@ nvcc --version
 
 If a PTX-only build is very slow, rebuild with `CUDA_GENCODE=arch=compute_XX,code=sm_XX` for your GPU.
 
-### `build.fp4` fails / `NVFP4 quantize failed`
+### NVFP4 build fails / `NVFP4 quantize failed`
 
-Confirm **`sm_120a`** build, CUDA 13, and **`make cutlass`**. On non-Blackwell GPUs use **`make build.no-fp4`**.
+In **`gpu-cuda-nvfp4`**, confirm **`sm_120a`** build, CUDA 13, and **`make cutlass`**. On general GPUs use **`gpu-cuda`** with **`make build`** (FP16).
 
-### `build.fp4.polarquant` build is slow / `Killed` (OOM)
+### `gpu-cuda-nvfp4` PolarQuant build is slow / `Killed` (OOM)
 
-Compiling **`kernels.cu`** with **`sm_120a` + FP4 + PolarQuant** uses a lot of RAM. You may see **`Error 137`**. Try adding swap, disabling parallel builds, or running **`make cutlass`** then **`make build.fp4.polarquant`** again.
+Compiling **`kernels.cu`** with **`sm_120a` + FP4 + PolarQuant** uses a lot of RAM. You may see **`Error 137`**. Try adding swap, disabling parallel builds, or running **`make cutlass`** then **`make build.polarquant`** again.
 
 ### PolarQuant not active
 
-If **`PolarQuant-R: KV cache enabled`** is missing at startup, confirm you built with **`build.polarquant`** or **`build.fp4.polarquant`**. PolarQuant is disabled when **`head_dim ≠ 128`**.
+If **`PolarQuant-R: KV cache enabled`** is missing at startup, confirm you built with **`build.polarquant`** (`gpu-cuda` or `gpu-cuda-nvfp4`). PolarQuant is disabled when **`head_dim ≠ 128`**.
 
 ### `hipcc` not found
 
@@ -676,9 +682,13 @@ Suggested order:
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
 5. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
-6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `polarquant.cu`  
-   CUDA prefill/decode, Flash Attention. **`build.no-fp4`**: FP16 GEMV. **`build.fp4`**: H2D NVFP4 load, **`fp4_gemv_cached`** (decode), **`fp4_qwen3_mm`** (GEMM/GEMV routing). **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode). **`build.fp4.polarquant`**: both NVFP4 linear and PolarQuant-R KV.
-7. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
+6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
+   CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).
+
+7. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
+   Blackwell NVFP4 build. H2D NVFP4 load, **`fp4_gemv_cached`** (decode), **`fp4_qwen3_mm`** (GEMM/GEMV routing). Shared sources live under **`../gpu-cuda/`**.
+
+8. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope
 
