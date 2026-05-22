@@ -357,11 +357,11 @@ You are a helpful assistant.<|im_end|>
 <|im_start|>assistant
 ```
 
-出力時は特殊トークンを表示せず、GPT-2 byte fallback の Unicode codepoint 表現を raw byte に戻して端末へ書き出す。**Thinking ブロックの開始／終了トークンは `is_special` に含めておらず**、thinking 対応モデルでは reasoning 文字列がそのまま stdout に出る可能性がある（詳細は **「高度な機能（マルチターン・Thinking）」**）。
+出力時は特殊トークンを表示せず、GPT-2 byte fallback の Unicode codepoint 表現を raw byte に戻して端末へ書き出す。**Thinking ブロック内の文字列は `is_special` 対象外**（ChatML 特殊 ID とは別に通常テキストとしてトークン化）のため、thinking 対応モデルでは reasoning テキストがそのまま stdout に出る可能性がある（詳細は **「高度な機能（マルチターン・Thinking）」**）。
 
 ## 高度な機能（マルチターン・Thinking）
 
-Qwen3 ファミリー（QwQ 等の reasoning 系、DeepSeek-R1 に近い thinking 構成を含む）では、公式スタックは **マルチターン ChatML** と **Thinking モード**（`enable_thinking`、`/think` / `/no_think`、thinking ブロック）を前提とする。本リポジトリは **1 ターン固定の `chat_encode`** と **1 プロセス 1 推論**のみを実装し、次は **スコープ外**である。
+Qwen3 ファミリー（QwQ 等の reasoning 系を含む）では、公式スタックは **マルチターン ChatML** と **Thinking モード**（`enable_thinking`、`/think` / `/no_think`、thinking ブロック）を前提とする。本リポジトリは **1 ターン固定の `chat_encode`** と **1 プロセス 1 推論**のみを実装し、次は **スコープ外**である。
 
 | 機能 | Qwen3 ファミリー（公式） | 本リポジトリ |
 |---|---|---|
@@ -372,11 +372,15 @@ Qwen3 ファミリー（QwQ 等の reasoning 系、DeepSeek-R1 に近い thinkin
 | `/think`・`/no_think` | ○ | × |
 | thinking ブロックの分離表示 | ○ | × |
 
-**マルチターン**: 各 `main.c` の `chat_encode` は system + **1 回の user**（`-p`）+ assistant 開始のみ。過去ターンを CLI で渡す経路はなく、KV を次実行に引き継ぐ API もない。履歴が必要なら ChatML を手で組み立てて `-p` に載せるか、`chat_encode` と生成ループを拡張する。
+**マルチターン（公式）** — ChatML で system / user / assistant をターン順に並べ、KV キャッシュまたは再 prefill で文脈を引き継ぐ。function calling では、過去の assistant 発話・tool 結果・（必要に応じた）reasoning 区間も次ターンへ渡す。
 
-**Thinking**: `enable_thinking` 相当の **assistant 直前プロンプト制御**、生成出力の **reasoning と最終回答の分離**（`print_tok` は ChatML 特殊 ID のみ抑制）、**`thinking_budget`** 等は未実装。thinking 対応 GGUF ではテンプレート不一致や reasoning 生出力が起きうる。拡張時は GGUF の **`tokenizer.chat_template`**（Jinja）に追随し、thinking 区間の encode／decode を追加する。
+**マルチターン（本リポジトリ）** — 各 `main.c` の `chat_encode` は system + **1 回の user**（`-p`）+ assistant 開始のみ。過去ターンを CLI で渡す経路はなく、KV を次実行に引き継ぐ API もない（prefill は毎回ゼロから）。マルチターンに近づけるには、(1) ChatML を手で組み立てて `-p` に載せる、(2) `chat_encode` を拡張する、(3) KV 再利用（未対応）。`-l` を超える履歴は切り詰めまたは要約が必要。
 
-利用者向けの平易な説明は **`README.md`** / **`README.en.md`** の **「高度な機能（マルチターン対話・Thinking モード）について」** を参照。
+**Thinking（公式）** — **hard switch**（`enable_thinking` / `apply_chat_template`）と **soft switch**（`/think` / `/no_think`）で thinking オン／オフ。thinking ブロック（テンプレートが挿入する reasoning 区間）は ChatML 特殊トークン（`<|im_start|>` 等）とは別に、通常テキストとしてトークン化される。
+
+**Thinking（本リポジトリ）** — `enable_thinking` 相当の **assistant 直前プロンプト制御**、生成出力の **reasoning と最終回答の分離**（`print_tok` は ChatML 特殊 ID のみ抑制）、**`thinking_budget`** 等は未実装。thinking 対応 GGUF ではテンプレート不一致や reasoning 生出力が起きうる。拡張時は GGUF の **`tokenizer.chat_template`**（Jinja）に追随し、thinking 区間の encode／decode を追加する。
+
+**技術参考（外部）** — テンプレート背景・ChatML / function calling・Thinking モードの公式解説 URL 一覧は **`README.md`** / **`README.en.md`** の **「高度な機能（マルチターン対話・Thinking モード）について」** を参照（Transformers chat templating、Qwen Function Calling / Quickstart / Transformers 推論 / vLLM、Qwen Cloud Thinking、Hugging Face モデルカード・ブログ等）。
 
 ### CPU forward
 
@@ -512,8 +516,8 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 ## 補足：ドキュメント間の役割
 
-- **`README.md`**: ビルド・実行・バリアント選択の手順、ライブラリ非依存の方針とその意義、**マルチターン対話・Thinking モードの対応状況**（日本語）。
-- **`README.en.md`**: 上記と同等の内容（英語）。
+- **`README.md`**: ビルド・実行・バリアント選択の手順、ライブラリ非依存の方針とその意義、**マルチターン対話・Thinking モードの対応状況と技術参考 URL**（日本語）。
+- **`README.en.md`**: 上記と同等の内容（英語）。**公式仕様 vs 本リポジトリ**の対比と外部参考リンクは **「Advanced features (multi-turn chat and Thinking mode)」** に集約。
 - **`qwen3-8b/xdna2/xdna-gemv/README.md`**: **`qwen3-8b/xdna2/xdna-gemv/`** 配下（**`kernels/`**・**`toolchain/`**・スタブ生成）への入口。
 - **`qwen3-8b/xdna2/xdna-gemv/kernels/README.md`**: XDNA2 の **ctrlcode**・GEMV 形状・スタブ／実機バイナリ・**`--xdna-status`** の入門。**GPU（ROCm/HIP）カーネルとの対比**（§3）もここで扱う。
 - **`qwen3-8b/xdna2/xdna-gemv/toolchain/README.md`**: **mlir-aie / IRON / Peano / `aiecc`** に沿った **NPU 用 `bf16-gemv-*.bin` 自前生成**の手引き（コマンド列と注意点）。**`qwen3-xdna2` は ioctl のみで XRT 非依存**であること、IRON／mlir-aie の公式サンプルが取る **XRT 検証パス**、および Linux カーネル文書 **AMD NPU** における **`ctrlcode`** の整理を冒頭で対照するための参照になっている。**東京科学大学（2026年現在の名称。旧・東京工業大学）ACRi** ルームの日本語チュートリアル（外部リンク）も紹介される。本文は日本語（です・ます調）。
