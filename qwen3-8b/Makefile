@@ -8,6 +8,7 @@ PROMPT  ?= Hello, how are you?
 	all \
 	build.cpu run.cpu \
 	build.cpu-multicore run.cpu-multicore \
+	build.cpu-blas run.cpu-blas \
 	build.gpu-rocm run.gpu-rocm \
 	build.xdna2 run.xdna2 \
 	build.xdna2-bfp16 run.xdna2-bfp16 \
@@ -68,6 +69,14 @@ run.cpu-multicore: build.cpu-multicore
 	./cpu-multicore/qwen3-cpu-omp "$(MODEL)" -p "$(PROMPT)"
 
 # -----------------------------------------------------------------------------
+# CPU + OpenMP + OpenBLAS（cpu-blas/main.c）
+build.cpu-blas:
+	cd cpu-blas && make build
+
+run.cpu-blas: build.cpu-blas
+	./cpu-blas/qwen3-cpu-blas "$(MODEL)" -p "$(PROMPT)"
+
+# -----------------------------------------------------------------------------
 # AMD Radeon GPU（gpu-rocm/main.c）
 # HIPCC が無い環境ではビルドを省略（gpu-rocm/Makefile の既定パスと一致させること）
 ROCM     ?= /opt/rocm
@@ -106,10 +115,10 @@ run.xdna2-bfp16: build.xdna2-bfp16
 
 # -----------------------------------------------------------------------------
 # 全バリアントをビルド
-all: build.cpu build.cpu-multicore build.gpu-rocm build.xdna2 build.xdna2-bfp16
+all: build.cpu build.cpu-multicore build.cpu-blas build.gpu-rocm build.xdna2 build.xdna2-bfp16
 
 # -----------------------------------------------------------------------------
 clean:
-	for d in cpu cpu-multicore gpu-rocm xdna2 xdna2-bfp16; do \
+	for d in cpu cpu-multicore cpu-blas gpu-rocm xdna2 xdna2-bfp16; do \
 		(cd $$d && make clean); \
 	done

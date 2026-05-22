@@ -4,7 +4,7 @@
 
 本リポジトリは、**ライブラリに依存せず、単一の C言語ソースから Qwen3系モデルを直接動かす推論実装**です。
 
-**PyTorch・TensorFlow・JAX・ONNX Runtime など、機械学習向けのユーザランドライブラリ／ランタイムは一切リンクしていません。** 推論は **標準Cと `libm`** を中心に、`qwen3-8b/` 内の単一ソースで完結します。AMD GPU 版は **ROCm/HIP**（`hipcc`）、NVIDIA GPU 版は **CUDA Toolkit**（`nvcc`）、CPU 並列は **OpenMP**、XDNA2 NPU 版は **Linux カーネルの `amdxdna` DRM ioctl（UAPI）** を直接叩く構成であり、Pythonランタイムや `torch` に依存するレイヤはありません。
+**PyTorch・TensorFlow・JAX・ONNX Runtime など、機械学習向けのユーザランドライブラリ／ランタイムは一切リンクしていません。** 推論は **標準Cと `libm`** を中心に、`qwen3-8b/` 内の単一ソースで完結します。AMD GPU 版は **ROCm/HIP**（`hipcc`）、NVIDIA GPU 版は **CUDA Toolkit**（`nvcc`）、CPU 並列は **OpenMP**（`cpu-multicore`）または **OpenMP + OpenBLAS**（`cpu-blas`）、XDNA2 NPU 版は **Linux カーネルの `amdxdna` DRM ioctl（UAPI）** を直接叩く構成であり、Pythonランタイムや `torch` に依存するレイヤはありません。
 
 ROCm/HIP および CUDA はいずれも **GPU 向けのコンパイラ・ランタイム** であり、**ニューラルネット用の高レベルフレームワークではありません**（ここからさらに自作の HIP / CUDA カーネルとホストコードで Transformer を組み立てています）。
 
@@ -25,7 +25,7 @@ ROCm/HIP および CUDA はいずれも **GPU 向けのコンパイラ・ラン�
 
 ---
 
-Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さな推論実装です。実行経路は **CPU／OpenMP／ROCm HIP（AMD GPU）／CUDA（NVIDIA GPU）／AMD Ryzen AI XDNA2 NPU（`amdxdna` DRM ioctl の直叩き）**と選べます。
+Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さな推論実装です。実行経路は **CPU／OpenMP／OpenMP+OpenBLAS／ROCm HIP（AMD GPU）／CUDA（NVIDIA GPU）／AMD Ryzen AI XDNA2 NPU（`amdxdna` DRM ioctl の直叩き）**と選べます。
 
 このリポジトリは **Qwen3-VL-8B-Instruct のテキストデコーダ**を対象にしています。画像入力や Vision エンコーダは扱わず、プロンプト文字列を入力してテキストを生成する用途に絞っています。
 
@@ -37,6 +37,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 |---|---|---|---|
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
+| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は OpenMP 行並列（`cpu-multicore` 同等） |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
 | CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。集約 `Makefile` 外 |
 | CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。集約 `Makefile` 外 |
@@ -63,6 +64,9 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     │   ├── Makefile
     │   └── main.c
     ├── cpu-multicore/
+    │   ├── Makefile
+    │   └── main.c
+    ├── cpu-blas/
     │   ├── Makefile
     │   └── main.c
     ├── gpu-rocm/
@@ -141,6 +145,23 @@ GCC なら通常 `-fopenmp` でビルドできます。環境によっては Ope
 sudo apt install -y libgomp1
 ```
 
+### OpenBLAS 版（`cpu-blas`）を使う場合
+
+**OpenBLAS**（`libopenblas-dev` 等）と OpenMP ランタイムが必要です。`pkg-config openblas` が使える環境では Makefile が自動で include / link フラグを拾います。
+
+```bash
+sudo apt install -y libopenblas-dev libgomp1
+```
+
+ヘッダが標準パスに無い場合（Debian/Ubuntu の pthread ビルド等）は、ビルド時に `CPPFLAGS` で指定します。
+
+```bash
+cd qwen3-8b/cpu-blas
+make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
+```
+
+実行時は **`OMP_NUM_THREADS`** で CPU 並列度を調整します。OpenBLAS 側は **`openblas_set_num_threads(1)`** で 1 スレッド固定（OpenMP との二重並列化を避ける）です。**`-ffast-math` は IQ2_S / IQ3_S 量子化で数値が崩れるため Makefile では無効**にしています。
+
 ### ROCm/HIP 版を使う場合
 
 AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。
@@ -213,6 +234,7 @@ qwen3-8b/
 ├── Makefile
 ├── cpu/ … （`main.c` → `cpu/qwen3-cpu`）
 ├── cpu-multicore/ …
+├── cpu-blas/ …
 ├── gpu-rocm/ …
 ├── gpu-cuda/ …
 ├── gpu-cuda-nvfp4/ …
@@ -305,6 +327,33 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 ```
 
 速くなるかどうかは CPU のコア数、メモリ帯域、モデルの量子化形式に依存します。
+
+## CPU OpenMP + OpenBLAS 版
+
+`cpu-multicore` と同じデコーダ・同じ GGUF を読み、**F32 行列積（`cblas_sgemv`）** と **Attention の K/V 合成**を OpenBLAS に任せます。IQ2_S / IQ3_S 等の量子化 GEMV は `cpu-multicore` と同様の OpenMP 行並列です。
+
+### ビルド
+
+```bash
+cd qwen3-8b
+make build.cpu-blas
+```
+
+成功すると **`cpu-blas/qwen3-cpu-blas`** ができます（`cpu-blas/` 直下で `make build` でも可）。
+
+### 実行
+
+```bash
+OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+  -p "Hello, how are you?" \
+  -n 32
+```
+
+集約 `Makefile` の `run.cpu-blas` を使う場合:
+
+```bash
+make run.cpu-blas PROMPT="Hello, how are you?"
+```
 
 ## ROCm/HIP GPU 版
 
@@ -567,6 +616,7 @@ make clean
 
 - `cpu/qwen3-cpu`
 - `cpu-multicore/qwen3-cpu-omp`
+- `cpu-blas/qwen3-cpu-blas`
 - `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
@@ -604,7 +654,15 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-速度が必要なら AMD GPU では `./gpu-rocm/qwen3-rocm`、NVIDIA GPU では `gpu-cuda/qwen3-gpu-cuda`（FP16）または `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`（Blackwell NVFP4）を使ってください。
+速度が必要なら AMD GPU では `./gpu-rocm/qwen3-rocm`、NVIDIA GPU では `gpu-cuda/qwen3-gpu-cuda`（FP16）または `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`（Blackwell NVFP4）を使ってください。CPU のみの場合は **`cpu-blas/qwen3-cpu-blas`**（OpenBLAS あり）の方が **`cpu-multicore`** より速くなることがあります。
+
+### `cpu-blas` のビルドが失敗する／`cblas.h` が見つからない
+
+OpenBLAS 開発パッケージを入れ、必要なら `CPPFLAGS` でヘッダパスを指定してください（上記「OpenBLAS 版を使う場合」参照）。
+
+### `cpu-blas` の出力が意味不明（同じ文字の連打など）
+
+**`-ffast-math`** を付けてビルドすると IQ2_S / IQ3_S 量子化内積で数値が崩れます。リポジトリ同梱の `cpu-blas/Makefile` では無効化済みです。手元で CFLAGS を上書きしている場合は外してください。
 
 ### `nvcc` が見つからない／`nvlink` エラー
 
@@ -695,16 +753,19 @@ make build.gpu-rocm GPU_ARCH=gfx1100
 4. `qwen3-8b/cpu-multicore/main.c`  
    OpenMP による並列化箇所を見る。
 
-5. `qwen3-8b/gpu-rocm/main.c`  
+5. `qwen3-8b/cpu-blas/main.c`  
+   OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。
+
+6. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。
 
-6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
+7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 版の Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。
 
-7. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
+8. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
    Blackwell NVFP4 版。H2D 時 NVFP4 ロード、**`fp4_gemv_cached`**（decode）と **`fp4_qwen3_mm`**（GEMM/GEMV 分岐）。**`fp4_*` は C++17 + `sm_120a` 固定**（CUTLASS）。共有ソースは **`../gpu-cuda/`** を参照。
 
-8. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
+9. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。
 
 ## このリポジトリで扱わないもの

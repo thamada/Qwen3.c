@@ -4,6 +4,21 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-22 23:48:05
+
+**CPU OpenMP + OpenBLAS 版（`cpu-blas`）** を追加。
+
+- **`qwen3-8b/cpu-blas/main.c`**: **`cpu-multicore`** と同一デコーダ。**F32 GEMV**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に集約。IQ2_S / IQ3_S 等の量子化 GEMV は **`cpu-multicore`** 同等の OpenMP 行並列。**`openblas_set_num_threads(1)`** で OpenBLAS 側は 1 スレッド固定（並列度は **`OMP_NUM_THREADS`**）。**`-ffast-math`** は IQ 量子化で数値が崩れるため Makefile では無効。
+- **`qwen3-8b/cpu-blas/Makefile`**: **`pkg-config openblas`** で include / link を自動取得。ヘッダが非標準パスの場合は **`CPPFLAGS`** で指定（Debian/Ubuntu の pthread ビルド例をコメント記載）。
+- **`qwen3-8b/Makefile`**: **`build.cpu-blas` / `run.cpu-blas`** を追加。**`all`**・**`clean`** の対象ディレクトリに **`cpu-blas`** を含める。
+- **`.gitignore`**: **`cpu-blas/qwen3-cpu-blas`** を追加。
+
+**`README.md`**・**`README.en.md`**: 実行経路表・ディレクトリツリー・前提パッケージ・ビルド／実行・トラブルシュート・「実装を読みたい人へ」を更新。
+
+**`doc/design.md`**: バリアント表・ディレクトリ表・Make ターゲット表・ビルド例・実行時挙動・量子化と行列積・トラブルシュートを上記に追随。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-22 18:35:51
 
 **CUTLASS v4.5.0 へ更新・ビルド警告整理**（**`gpu-cuda-nvfp4`**）:

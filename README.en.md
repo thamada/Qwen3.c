@@ -2,7 +2,7 @@
 
 This repository is an **inference implementation** that runs **Qwen3-family models** directly from **a single C source**, **without relying on external libraries**.
 
-**This project does not link userland ML libraries or runtimes such as PyTorch, TensorFlow, JAX, or ONNX Runtime.** Inference is built around **standard C and `libm`**, with one or a few sources under `qwen3-8b/`. The AMD GPU build uses **ROCm/HIP** (`hipcc`), the NVIDIA GPU build uses the **CUDA Toolkit** (`nvcc`), CPU parallelism uses **OpenMP**, and the XDNA2 NPU build talks to the **Linux kernel `amdxdna` DRM ioctl (UAPI)** directly—there is no dependency on a Python runtime or `torch`.
+**This project does not link userland ML libraries or runtimes such as PyTorch, TensorFlow, JAX, or ONNX Runtime.** Inference is built around **standard C and `libm`**, with one or a few sources under `qwen3-8b/`. The AMD GPU build uses **ROCm/HIP** (`hipcc`), the NVIDIA GPU build uses the **CUDA Toolkit** (`nvcc`), CPU parallelism uses **OpenMP** (`cpu-multicore`) or **OpenMP + OpenBLAS** (`cpu-blas`), and the XDNA2 NPU build talks to the **Linux kernel `amdxdna` DRM ioctl (UAPI)** directly—there is no dependency on a Python runtime or `torch`.
 
 ROCm/HIP and CUDA are **GPU compilers and runtimes**, not high-level neural network frameworks (this repo builds the Transformer from custom HIP / CUDA kernels and host code).
 
@@ -23,7 +23,7 @@ So this is **not** aimed at maximum performance or full feature parity. The focu
 
 ---
 
-A small inference implementation that runs Qwen3-family GGUF models from **straightforward C sources** under `qwen3-8b/`. Paths include **CPU**, **OpenMP**, **ROCm/HIP on AMD GPUs**, **CUDA on NVIDIA GPUs**, and **AMD Ryzen AI XDNA2 NPU** (direct **`amdxdna` DRM ioctl** usage).
+A small inference implementation that runs Qwen3-family GGUF models from **straightforward C sources** under `qwen3-8b/`. Paths include **CPU**, **OpenMP**, **OpenMP + OpenBLAS**, **ROCm/HIP on AMD GPUs**, **CUDA on NVIDIA GPUs**, and **AMD Ryzen AI XDNA2 NPU** (direct **`amdxdna` DRM ioctl** usage).
 
 The scope is the **text decoder of Qwen3-VL-8B-Instruct**. Image input and the vision encoder are **out of scope**; use cases are prompt-in, text-out generation.
 
@@ -37,6 +37,7 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 |---|---|---|---|
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
+| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV stays OpenMP row-parallel (same as `cpu-multicore`) |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
 | CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). Not in aggregate `Makefile` |
 | CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Not in aggregate `Makefile` |
@@ -63,6 +64,9 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     │   ├── Makefile
     │   └── main.c
     ├── cpu-multicore/
+    │   ├── Makefile
+    │   └── main.c
+    ├── cpu-blas/
     │   ├── Makefile
     │   └── main.c
     ├── gpu-rocm/
@@ -141,6 +145,23 @@ GCC typically builds with `-fopenmp`. Some setups need the OpenMP runtime:
 sudo apt install -y libgomp1
 ```
 
+### OpenBLAS build (`cpu-blas`)
+
+You need **OpenBLAS** (e.g. `libopenblas-dev`) and the OpenMP runtime. When `pkg-config openblas` works, the Makefile picks up include/link flags automatically.
+
+```bash
+sudo apt install -y libopenblas-dev libgomp1
+```
+
+If headers are not on the default path (e.g. Debian/Ubuntu pthread build):
+
+```bash
+cd qwen3-8b/cpu-blas
+make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
+```
+
+At run time, set **`OMP_NUM_THREADS`** for CPU parallelism. OpenBLAS is fixed to **one thread** via **`openblas_set_num_threads(1)`** to avoid nested parallelism with OpenMP. **Do not use `-ffast-math`** for this build—it breaks IQ2_S / IQ3_S quantized dot products (disabled in the bundled Makefile).
+
 ### ROCm/HIP build
 
 You need an AMD GPU and ROCm. The `Makefile` assumes ROCm under `/opt/rocm` by default.
@@ -213,6 +234,7 @@ qwen3-8b/
 ├── Makefile
 ├── cpu/ … (`main.c` → `cpu/qwen3-cpu`)
 ├── cpu-multicore/ …
+├── cpu-blas/ …
 ├── gpu-rocm/ …
 ├── gpu-cuda/ …
 ├── gpu-cuda-nvfp4/ …
@@ -307,6 +329,33 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 ```
 
 Speedup depends on core count, memory bandwidth, and quantization.
+
+## CPU OpenMP + OpenBLAS
+
+Same decoder and GGUF as **`cpu-multicore`**, but **F32 matmul** (`cblas_sgemv`) and **attention K/V combine** go through OpenBLAS. IQ2_S / IQ3_S quantized GEMV stays OpenMP row-parallel like **`cpu-multicore`**.
+
+### Build
+
+```bash
+cd qwen3-8b
+make build.cpu-blas
+```
+
+Produces **`cpu-blas/qwen3-cpu-blas`** (or `make build` inside `cpu-blas/`).
+
+### Run
+
+```bash
+OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+  -p "Hello, how are you?" \
+  -n 32
+```
+
+Via aggregate Makefile:
+
+```bash
+make run.cpu-blas PROMPT="Hello, how are you?"
+```
 
 ## ROCm/HIP GPU
 
@@ -571,6 +620,7 @@ Typical files removed:
 
 - `cpu/qwen3-cpu`
 - `cpu-multicore/qwen3-cpu-omp`
+- `cpu-blas/qwen3-cpu-blas`
 - `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
@@ -608,7 +658,15 @@ Expected for 8B on CPU alone. Try `-n 1` or `-n 4`:
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs, `gpu-cuda/qwen3-gpu-cuda` (FP16) or `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` (Blackwell NVFP4) on NVIDIA GPUs.
+For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs, `gpu-cuda/qwen3-gpu-cuda` (FP16) or `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` (Blackwell NVFP4) on NVIDIA GPUs. On CPU only, **`cpu-blas/qwen3-cpu-blas`** may outperform **`cpu-multicore`** when OpenBLAS is installed.
+
+### `cpu-blas` build fails / `cblas.h` not found
+
+Install OpenBLAS dev packages and set `CPPFLAGS` if needed (see **OpenBLAS build** under Requirements).
+
+### `cpu-blas` output is garbage (repeated characters, etc.)
+
+Building with **`-ffast-math`** breaks IQ2_S / IQ3_S quantized dots. The repo Makefile disables it—remove it if you override `CFLAGS`.
 
 ### `nvcc` not found / `nvlink` errors
 
@@ -689,14 +747,15 @@ Suggested order:
 2. `doc/design.md` — design, quantization, Qwen3 specifics.
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
-5. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
-6. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
+5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention.
+6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
+7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).
 
-7. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
+8. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
    Blackwell NVFP4 build. H2D NVFP4 load, **`fp4_gemv_cached`** (decode), **`fp4_qwen3_mm`** (GEMM/GEMV routing). **`fp4_*` uses C++17 + fixed `sm_120a`** (CUTLASS). Shared sources live under **`../gpu-cuda/`**.
 
-8. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
+9. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
 ## Out of scope
 
