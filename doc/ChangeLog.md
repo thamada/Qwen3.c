@@ -4,9 +4,37 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 05:43:17
+
+**`qwen3-8b/cpu-blas/`** — **2166dc4 のスループット回帰を修正**。`FWD_LM_TOPK` 削除、埋め込みキャッシュを **オプトイン** 化。**`8eec545` 比で decode ~+5〜8%**（`OMP_NUM_THREADS=8`、IQ2_M、`-n 32`）。
+
+#### 回帰の原因（2166dc4 → 本修正）
+
+- **`FWD_LM_TOPK`**: 151936 行すべてで min-heap 更新 + **decode 毎の malloc/free** が、全 vocab への logits 書き込みより重く **decode ~4% 低下**（~6.27 → ~6.03 tok/s）。
+- **埋め込み F32 キャッシュ常時有効（~2.3 GiB）**: L3 キャッシュ汚染で matmul 全体が遅化（単独でも decode ~2% 低下）。
+
+#### 本修正の内容
+
+- **`FWD_LM_TOPK` / `mm_logits_topk` / `sample_token_topk` を削除**。サンプリングは **`FWD_LM_FULL` + 全 vocab `sample_token`**（`8eec545` と同等の正確性）。
+- **埋め込みキャッシュ**: 環境変数 **`QWEN3_CPU_BLAS_EMBCACHE=1`**（または `y`/`Y`）のときのみ **`build_embd_f32_cache`**。既定は **F16C+AVX2 の逐次 lookup**（RAM 追加なし）。
+- **`mm_argmax_row`**: スレッド局所 max 用 **`State.am_best_v` / `am_best_i`** を起動時 1 回確保（decode 毎 malloc 廃止）。**`#pragma omp critical` なし**。
+- **2166dc4 から維持**: **`dot_f16_row`**（AVX2 FMA）、**`schedule(static, 512)`**（`mm_f16` / `mm_quant_dot_rows` / argmax 行ループ）。
+
+#### ベンチマーク参考（同一環境）
+
+| 版 | prefill (25 tok) | decode (32 tok) |
+|----|------------------|-----------------|
+| **8eec545** | ~6.50 tok/s | ~6.13〜6.24 tok/s |
+| **2166dc4（HEAD）** | ~6.35 tok/s | ~6.03 tok/s |
+| **本修正** | ~6.87 tok/s | ~6.60 tok/s |
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 05:08:32
 
 **`qwen3-8b/cpu-blas/`** — **埋め込み F32 キャッシュ**、**LM head top-k サンプリング**（**`FWD_LM_TOPK`**）、**F16 dot SIMD**、**OpenMP / argmax 集約の改善**。
+
+> **注**: 本エントリの **`FWD_LM_TOPK` 常時有効**および**埋め込みキャッシュ常時構築**は **2026-05-23 05:43:17** の修正で **スループット回帰**のため撤回・変更済み。有益部分（**`dot_f16_row`**、**`schedule(static,512)`**、argmax 集約改善）は維持。
 
 #### 埋め込み F32 キャッシュ（`Weights.embd_f32`）
 

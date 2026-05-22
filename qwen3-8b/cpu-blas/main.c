@@ -13,8 +13,7 @@
  *   - 層内 Q8_K 量子化共有（wq/wk/wv、gate/up で 1 回のみ quantize）。
  *   - AVX2: quantize_row_q8_K、vec_dot_*_q8_K（IQ2_S/IQ3_S/Q4_K/Q5_K）。
  *   - RoPE cos/sin キャッシュ、prefill 中 LM head スキップ（`FWD_NO_LM`）、greedy 時 `mm_argmax_row`。
- *   - 埋め込み F32 キャッシュ（量子化/F16 → ロード時 1 回展開、lookup は memcpy）。
- *   - LM head top-k サンプリング（`FWD_LM_TOPK`、4096 件で softmax/top-p、全 vocab 書き込み省略）。
+ *   - 埋め込み F32 キャッシュ（任意: 環境変数 `QWEN3_CPU_BLAS_EMBCACHE=1`、~2.3GiB）。
  *
  * Build: `make build` → `qwen3-cpu-blas`。
  * スレッド数: OMP_NUM_THREADS（OpenBLAS 側は実行時に 1 スレッド固定）。
@@ -72,9 +71,6 @@ static inline __m256i get_scale_shuffle_k4(int i) {
 #define QK_K            256
 #define K_SCALE_SIZE    12
 #define MAX_PROMPT_TOKS 8192
-#define LM_TOPK         4096   /* top-k LM head: softmax/top-p をこの件数に限定 */
-
-typedef struct { float v; int i; } LmTop;
 
 enum gguf_vtype {
     GV_U8 = 0, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL,
@@ -1311,8 +1307,8 @@ typedef struct {
     float *kc, *vc;
     BlockQ8_K *q8;   /* mm_quant: 活性化 Q8_K（最大 hidden_dim 分） */
     int argmax_tok;  /* forward LM argmax パス結果 */
-    LmTop *lm_topk;  /* FWD_LM_TOPK 結果（最大 LM_TOPK 件） */
-    int lm_topk_n;
+    float *am_best_v; /* mm_argmax_row: スレッド局所 max 値 */
+    int *am_best_i;   /* mm_argmax_row: スレッド局所 argmax index */
 } State;
 
 typedef struct {
@@ -1840,7 +1836,13 @@ static void alloc_state(State *s, Config *c) {
     s->kc     = (float *)calloc(kv_cache_len, sizeof(float));
     s->vc     = (float *)calloc(kv_cache_len, sizeof(float));
     s->q8     = (BlockQ8_K *)calloc((size_t)c->hidden_dim / QK_K, sizeof(BlockQ8_K));
-    s->lm_topk = (LmTop *)calloc(LM_TOPK, sizeof(LmTop));
+    int nth = omp_get_max_threads();
+    s->am_best_v = (float *)malloc((size_t)nth * sizeof(float));
+    s->am_best_i = (int *)malloc((size_t)nth * sizeof(int));
+    if (!s->am_best_v || !s->am_best_i) {
+        fprintf(stderr, "Error: argmax scratch alloc failed\n");
+        exit(1);
+    }
 }
 
 static void free_state(State *s) {
@@ -1850,7 +1852,8 @@ static void free_state(State *s) {
     free(s->att); free(s->logits);
     free(s->kc); free(s->vc);
     free(s->q8);
-    free(s->lm_topk);
+    free(s->am_best_v);
+    free(s->am_best_i);
 }
 
 static void free_weight_ptrs(Weights *w, int L) {
@@ -1956,88 +1959,6 @@ static void mm_f16(float *o, const float *x, const uint16_t *w, int n, int d) {
     }
 }
 
-static void topk_siftdown(LmTop *h, int n, int i) {
-    while (1) {
-        int l = 2 * i + 1, r = 2 * i + 2, m = i;
-        if (l < n && h[l].v < h[m].v) m = l;
-        if (r < n && h[r].v < h[m].v) m = r;
-        if (m == i) break;
-        LmTop t = h[i]; h[i] = h[m]; h[m] = t;
-        i = m;
-    }
-}
-
-static void topk_push(LmTop *h, int *n, int k, float v, int idx) {
-    if (*n < k) {
-        h[*n].v = v;
-        h[*n].i = idx;
-        (*n)++;
-        int i = *n - 1;
-        while (i > 0) {
-            int p = (i - 1) / 2;
-            if (h[p].v <= h[i].v) break;
-            LmTop t = h[p]; h[p] = h[i]; h[i] = t;
-            i = p;
-        }
-        return;
-    }
-    if (v <= h[0].v) return;
-    h[0].v = v;
-    h[0].i = idx;
-    topk_siftdown(h, *n, 0);
-}
-
-static void topk_merge(LmTop *dst, int *nd, int k, const LmTop *src, int ns) {
-    for (int j = 0; j < ns; j++)
-        topk_push(dst, nd, k, src[j].v, src[j].i);
-}
-
-static void mm_logits_topk(LmTop *out, int *out_n, int kmax,
-                             const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
-    *out_n = 0;
-    if (!is_q8_mm_type(type)) {
-        fprintf(stderr, "mm_logits_topk: unsupported type %d\n", type);
-        exit(1);
-    }
-    quantize_row_q8_K(x, q8, n);
-    size_t row_sz = row_bytes_quant(type, n);
-    const uint8_t *wb = (const uint8_t *)w;
-    int nth = omp_get_max_threads();
-    LmTop **thr = (LmTop **)malloc((size_t)nth * sizeof(LmTop *));
-    int *tn = (int *)calloc((size_t)nth, sizeof(int));
-    if (!thr || !tn) {
-        fprintf(stderr, "mm_logits_topk: alloc failed\n");
-        exit(1);
-    }
-    for (int t = 0; t < nth; t++) {
-        thr[t] = (LmTop *)malloc((size_t)kmax * sizeof(LmTop));
-        if (!thr[t]) {
-            fprintf(stderr, "mm_logits_topk: alloc failed\n");
-            exit(1);
-        }
-    }
-
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        LmTop *loc = thr[tid];
-        int nl = 0;
-        #pragma omp for schedule(static, 512)
-        for (int i = 0; i < d; i++) {
-            float v = vec_dot_row_q8_K(n, wb + (size_t)i * row_sz, type, q8);
-            topk_push(loc, &nl, kmax, v, i);
-        }
-        tn[tid] = nl;
-    }
-
-    for (int t = 0; t < nth; t++)
-        topk_merge(out, out_n, kmax, thr[t], tn[t]);
-
-    for (int t = 0; t < nth; t++) free(thr[t]);
-    free(thr);
-    free(tn);
-}
-
 static void mm_quant_dot_rows(float *o, const void *w, int n, int d, int type, const BlockQ8_K *q8) {
     size_t row_sz = row_bytes_quant(type, n);
     const uint8_t *wb = (const uint8_t *)w;
@@ -2048,15 +1969,9 @@ static void mm_quant_dot_rows(float *o, const void *w, int n, int d, int type, c
     }
 }
 
-static int mm_argmax_row(const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
+static int mm_argmax_row(const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8,
+                       float *tv, int *ti) {
     int nth = omp_get_max_threads();
-    float *tv = (float *)malloc((size_t)nth * sizeof(float));
-    int *ti = (int *)malloc((size_t)nth * sizeof(int));
-    if (!tv || !ti) {
-        fprintf(stderr, "mm_argmax_row: alloc failed\n");
-        exit(1);
-    }
-    for (int t = 0; t < nth; t++) { tv[t] = -INFINITY; ti[t] = 0; }
 
     if (is_q8_mm_type(type)) {
         quantize_row_q8_K(x, q8, n);
@@ -2120,8 +2035,6 @@ static int mm_argmax_row(const float *x, const void *w, int n, int d, int type, 
     for (int t = 0; t < nth; t++) {
         if (tv[t] > best_v) { best_v = tv[t]; best_i = ti[t]; }
     }
-    free(tv);
-    free(ti);
     return best_i;
 }
 
@@ -2187,6 +2100,9 @@ static void emb_lookup(float *o, const void *w, int type, int id, int dim) {
 }
 
 static void build_embd_f32_cache(Model *m) {
+    const char *env = getenv("QWEN3_CPU_BLAS_EMBCACHE");
+    if (!env || (env[0] != '1' && env[0] != 'y' && env[0] != 'Y')) return;
+
     Config *c = &m->cfg;
     Weights *w = &m->w;
     if (w->embd_t == DT_F32 || w->embd_f32) return;
@@ -2242,7 +2158,7 @@ static void apply_rope(float *vec, int n_heads, int head_dim, int pos,
     }
 }
 
-enum { FWD_NO_LM = 0, FWD_LM_FULL = 1, FWD_LM_ARGMAX = 2, FWD_LM_TOPK = 3 };
+enum { FWD_NO_LM = 0, FWD_LM_FULL = 1, FWD_LM_ARGMAX = 2 };
 
 static void forward(Model *m, int token, int pos, int lm_mode) {
     Config *c = &m->cfg;
@@ -2335,11 +2251,8 @@ static void forward(Model *m, int token, int pos, int lm_mode) {
         mm(s->logits, s->x, w->out, dim, c->vocab_size, w->out_t, s->q8, 0);
     } else if (lm_mode == FWD_LM_ARGMAX) {
         rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
-        s->argmax_tok = mm_argmax_row(s->x, w->out, dim, c->vocab_size, w->out_t, s->q8);
-    } else if (lm_mode == FWD_LM_TOPK) {
-        rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
-        mm_logits_topk(s->lm_topk, &s->lm_topk_n, LM_TOPK,
-                       s->x, w->out, dim, c->vocab_size, w->out_t, s->q8);
+        s->argmax_tok = mm_argmax_row(s->x, w->out, dim, c->vocab_size, w->out_t, s->q8,
+                                      s->am_best_v, s->am_best_i);
     }
 }
 
@@ -2356,57 +2269,6 @@ static int cmp_prob_desc(const void *a, const void *b) {
     float pa = ((const ProbIdx *)a)->p;
     float pb = ((const ProbIdx *)b)->p;
     return (pa < pb) - (pa > pb);
-}
-
-static int sample_token_topk(const LmTop *top, int n, float temp, float topp, uint64_t *rng) {
-    if (n <= 0) return 0;
-    float probs[LM_TOPK];
-    for (int i = 0; i < n; i++) probs[i] = top[i].v / temp;
-    softmax(probs, n);
-
-    float coin = rng_f32(rng);
-    if (topp <= 0.0f || topp >= 1.0f) {
-        float cdf = 0.0f;
-        for (int i = 0; i < n; i++) {
-            cdf += probs[i];
-            if (coin < cdf) return top[i].i;
-        }
-        return top[n - 1].i;
-    }
-
-    ProbIdx pi[LM_TOPK];
-    int np = 0;
-    float cutoff = (1.0f - topp) / (float)(n - 1 > 0 ? n - 1 : 1);
-    for (int i = 0; i < n; i++) {
-        if (probs[i] >= cutoff) {
-            pi[np].p = probs[i];
-            pi[np].idx = i;
-            np++;
-        }
-    }
-    if (np <= 0) {
-        int best = 0;
-        for (int i = 1; i < n; i++)
-            if (probs[i] > probs[best]) best = i;
-        return top[best].i;
-    }
-    qsort(pi, (size_t)np, sizeof(ProbIdx), cmp_prob_desc);
-
-    float cum = 0.0f;
-    int last = np - 1;
-    for (int i = 0; i < np; i++) {
-        cum += pi[i].p;
-        if (cum > topp) { last = i; break; }
-    }
-
-    float r = rng_f32(rng) * cum;
-    float cdf = 0.0f;
-    int result = top[pi[last].idx].i;
-    for (int i = 0; i <= last; i++) {
-        cdf += pi[i].p;
-        if (r < cdf) { result = top[pi[i].idx].i; break; }
-    }
-    return result;
 }
 
 static int sample_token(float *logits, int n, float temp, float topp, uint64_t *rng) {
@@ -2557,14 +2419,8 @@ static void generate(Model *m, int *prompt, int n_prompt,
         }
 
         int lm_mode = FWD_NO_LM;
-        if (pos >= n_prompt - 1) {
-            if (temp <= 0.0f)
-                lm_mode = FWD_LM_ARGMAX;
-            else if (topp < 0.999f)
-                lm_mode = FWD_LM_TOPK;
-            else
-                lm_mode = FWD_LM_FULL;
-        }
+        if (pos >= n_prompt - 1)
+            lm_mode = (temp <= 0.0f) ? FWD_LM_ARGMAX : FWD_LM_FULL;
 
         forward(m, token, pos, lm_mode);
 
@@ -2590,9 +2446,9 @@ static void generate(Model *m, int *prompt, int n_prompt,
                 clock_gettime(CLOCK_MONOTONIC, &t_decode);
                 decode_timing = 1;
             }
-            next = (lm_mode == FWD_LM_ARGMAX) ? m->s.argmax_tok
-                 : (lm_mode == FWD_LM_TOPK) ? sample_token_topk(m->s.lm_topk, m->s.lm_topk_n, temp, topp, &rng)
-                 : sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, &rng);
+            next = (lm_mode == FWD_LM_ARGMAX)
+                ? m->s.argmax_tok
+                : sample_token(m->s.logits, m->cfg.vocab_size, temp, topp, &rng);
             if (next == m->tok.eos || next == m->tok.eot) break;
             gen++;
             print_tok(&m->tok, next);
