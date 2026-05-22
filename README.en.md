@@ -37,7 +37,7 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 |---|---|---|---|
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
-| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV stays OpenMP row-parallel (same as `cpu-multicore`) |
+| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV (IQ2_S / IQ3_S / Q4_K / Q5_K) uses Q8_K activations + ggml-style integer dot products (no full row dequant) |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
 | CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). Not in aggregate `Makefile` |
 | CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Not in aggregate `Makefile` |
@@ -160,7 +160,7 @@ cd qwen3-8b/cpu-blas
 make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 ```
 
-At run time, set **`OMP_NUM_THREADS`** for CPU parallelism. OpenBLAS is fixed to **one thread** via **`openblas_set_num_threads(1)`** to avoid nested parallelism with OpenMP. **Do not use `-ffast-math`** for this build—it breaks IQ2_S / IQ3_S quantized dot products (disabled in the bundled Makefile).
+At run time, set **`OMP_NUM_THREADS`** for CPU parallelism. OpenBLAS is fixed to **one thread** via **`openblas_set_num_threads(1)`** to avoid nested parallelism with OpenMP. **Do not use `-ffast-math`** for this build—it breaks IQ / Q8_K quantized dot products (disabled in the bundled Makefile). Default **`CFLAGS`** include **`-march=native`** (optimize for the build CPU over portability).
 
 ### ROCm/HIP build
 
@@ -332,7 +332,7 @@ Speedup depends on core count, memory bandwidth, and quantization.
 
 ## CPU OpenMP + OpenBLAS
 
-Same decoder and GGUF as **`cpu-multicore`**, but **F32 matmul** (`cblas_sgemv`) and **attention K/V combine** go through OpenBLAS. IQ2_S / IQ3_S quantized GEMV stays OpenMP row-parallel like **`cpu-multicore`**.
+Same decoder and GGUF as **`cpu-multicore`**, but **F32 matmul** (`cblas_sgemv`) and **attention K/V combine** go through OpenBLAS. For IQ2_S / IQ3_S / Q4_K / Q5_K quantized GEMV, activations are quantized to **Q8_K** (`quantize_row_q8_K`), then **`vec_dot_*_q8_K`** integer dot products (aligned with **ggml-cpu/quants.c**) are used—without full float[256] row dequantization like **`cpu-multicore`**. Output rows stay OpenMP-parallel.
 
 ### Build
 
@@ -658,7 +658,7 @@ Expected for 8B on CPU alone. Try `-n 1` or `-n 4`:
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs, `gpu-cuda/qwen3-gpu-cuda` (FP16) or `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` (Blackwell NVFP4) on NVIDIA GPUs. On CPU only, **`cpu-blas/qwen3-cpu-blas`** may outperform **`cpu-multicore`** when OpenBLAS is installed.
+For speed, use `./gpu-rocm/qwen3-rocm` on AMD GPUs, `gpu-cuda/qwen3-gpu-cuda` (FP16) or `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` (Blackwell NVFP4) on NVIDIA GPUs. On CPU only, **`cpu-blas/qwen3-cpu-blas`** (OpenBLAS + Q8_K quantized GEMV) often outperforms **`cpu-multicore`**.
 
 ### `cpu-blas` build fails / `cblas.h` not found
 
@@ -666,7 +666,7 @@ Install OpenBLAS dev packages and set `CPPFLAGS` if needed (see **OpenBLAS build
 
 ### `cpu-blas` output is garbage (repeated characters, etc.)
 
-Building with **`-ffast-math`** breaks IQ2_S / IQ3_S quantized dots. The repo Makefile disables it—remove it if you override `CFLAGS`.
+Building with **`-ffast-math`** breaks IQ / Q8_K quantized dot products. The repo Makefile disables it—remove it if you override `CFLAGS`.
 
 ### `nvcc` not found / `nvlink` errors
 
@@ -747,7 +747,7 @@ Suggested order:
 2. `doc/design.md` — design, quantization, Qwen3 specifics.
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
-5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention.
+5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention; Q8_K activations + `vec_dot_*_q8_K` for quantized GEMV.
 6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).

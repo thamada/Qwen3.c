@@ -37,7 +37,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 |---|---|---|---|
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
-| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は OpenMP 行並列（`cpu-multicore` 同等） |
+| CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV（IQ2_S / IQ3_S / Q4_K / Q5_K）は活性 Q8_K 化 + ggml 準拠の整数内積（no per-row float[256] dequant） |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う |
 | CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。集約 `Makefile` 外 |
 | CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。集約 `Makefile` 外 |
@@ -160,7 +160,7 @@ cd qwen3-8b/cpu-blas
 make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 ```
 
-実行時は **`OMP_NUM_THREADS`** で CPU 並列度を調整します。OpenBLAS 側は **`openblas_set_num_threads(1)`** で 1 スレッド固定（OpenMP との二重並列化を避ける）です。**`-ffast-math` は IQ2_S / IQ3_S 量子化で数値が崩れるため Makefile では無効**にしています。
+実行時は **`OMP_NUM_THREADS`** で CPU 並列度を調整します。OpenBLAS 側は **`openblas_set_num_threads(1)`** で 1 スレッド固定（OpenMP との二重並列化を避ける）です。**`-ffast-math` は IQ / Q8_K 量子化で数値が崩れるため Makefile では無効**にしています。既定 **`CFLAGS`** には **`-march=native`** が含まれます（移植性より当該 CPU 向け最適化を優先）。
 
 ### ROCm/HIP 版を使う場合
 
@@ -330,7 +330,7 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 
 ## CPU OpenMP + OpenBLAS 版
 
-`cpu-multicore` と同じデコーダ・同じ GGUF を読み、**F32 行列積（`cblas_sgemv`）** と **Attention の K/V 合成**を OpenBLAS に任せます。IQ2_S / IQ3_S 等の量子化 GEMV は `cpu-multicore` と同様の OpenMP 行並列です。
+`cpu-multicore` と同じデコーダ・同じ GGUF を読み、**F32 行列積（`cblas_sgemv`）** と **Attention の K/V 合成**を OpenBLAS に任せます。IQ2_S / IQ3_S / Q4_K / Q5_K の量子化 GEMV は、入力を **Q8_K** に量子化（**`quantize_row_q8_K`**）したうえで **ggml-cpu/quants.c** 準拠の **`vec_dot_*_q8_K`** 整数内積を使います（`cpu-multicore` のような per-row float[256] dequantization は行わない）。出力行の OpenMP 並列は維持します。
 
 ### ビルド
 
@@ -654,7 +654,7 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
-速度が必要なら AMD GPU では `./gpu-rocm/qwen3-rocm`、NVIDIA GPU では `gpu-cuda/qwen3-gpu-cuda`（FP16）または `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`（Blackwell NVFP4）を使ってください。CPU のみの場合は **`cpu-blas/qwen3-cpu-blas`**（OpenBLAS あり）の方が **`cpu-multicore`** より速くなることがあります。
+速度が必要なら AMD GPU では `./gpu-rocm/qwen3-rocm`、NVIDIA GPU では `gpu-cuda/qwen3-gpu-cuda`（FP16）または `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`（Blackwell NVFP4）を使ってください。CPU のみの場合は **`cpu-blas/qwen3-cpu-blas`**（OpenBLAS + Q8_K 量子化 GEMV）の方が **`cpu-multicore`** より速くなることが多いです。
 
 ### `cpu-blas` のビルドが失敗する／`cblas.h` が見つからない
 
@@ -662,7 +662,7 @@ OpenBLAS 開発パッケージを入れ、必要なら `CPPFLAGS` でヘッダ�
 
 ### `cpu-blas` の出力が意味不明（同じ文字の連打など）
 
-**`-ffast-math`** を付けてビルドすると IQ2_S / IQ3_S 量子化内積で数値が崩れます。リポジトリ同梱の `cpu-blas/Makefile` では無効化済みです。手元で CFLAGS を上書きしている場合は外してください。
+**`-ffast-math`** を付けてビルドすると IQ / Q8_K 量子化内積で数値が崩れます。リポジトリ同梱の `cpu-blas/Makefile` では無効化済みです。手元で CFLAGS を上書きしている場合は外してください。
 
 ### `nvcc` が見つからない／`nvlink` エラー
 
@@ -754,7 +754,7 @@ make build.gpu-rocm GPU_ARCH=gfx1100
    OpenMP による並列化箇所を見る。
 
 5. `qwen3-8b/cpu-blas/main.c`  
-   OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。
+   OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。量子化 GEMV は Q8_K 活性化 + `vec_dot_*_q8_K` 整数内積。
 
 6. `qwen3-8b/gpu-rocm/main.c`  
    GPU メモリ、HIP カーネル、GPU サンプリングの流れを見る。

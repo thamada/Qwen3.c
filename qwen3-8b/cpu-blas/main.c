@@ -8,7 +8,8 @@
  *   - OpenBLAS は openblas_set_num_threads(1) で serial 固定し、並列度は OpenMP に一本化。
  *   - mm_f32: 行帯を OpenMP で分割し、帯ごとに cblas_sgemv(NoTrans)。
  *   - Attention: ヘッド毎に K 内積・V 合成を cblas_sgemv に集約（(pos+1) 回のループ → 1 回）。
- *   - 量子化 GEMV（IQ2_S / IQ3_S 等）は cpu-multicore と同様の OpenMP 行並列。
+ *   - 量子化 GEMV（IQ2_S / IQ3_S / Q4_K / Q5_K）: 活性化を Q8_K 化し、
+ *     llama.cpp (ggml_vec_dot_*_q8_K) 準拠の整数内積（no per-row full dequant）。
  *
  * Build: `make build` → `qwen3-cpu-blas`。
  * スレッド数: OMP_NUM_THREADS（OpenBLAS 側は実行時に 1 スレッド固定）。
@@ -109,6 +110,12 @@ typedef struct {
     uint8_t  scales[QK_K / 64];    /* 4-bit packed scale per 64-element pair */
 } BlockIQ3_S;                      /* 110 bytes */
 #pragma pack(pop)
+
+typedef struct {
+    float   d;
+    int8_t  qs[QK_K];
+    int16_t bsums[QK_K / 16];
+} BlockQ8_K;                       /* Q8_K 活性化バッファ（ggml block_q8_K） */
 
 /* ================================================================
  * IQ2_S / IQ3_S grid tables (verbatim from ggml-common.h)
@@ -608,6 +615,272 @@ static void dequant_iq3_s(const BlockIQ3_S *x, float *y, int64_t nb) {
         }
     }
 }
+
+/* ================================================================
+ * Q8_K 活性化量子化 + 量子化重み×Q8_K 内積（ggml-cpu/quants.c 準拠）
+ * Without per-row float[256] dequant; integer dot products speed up GEMV.
+ * ================================================================ */
+
+static int nearest_int(float fval) {
+    return (int)lrintf(fval);
+}
+
+static void quantize_row_q8_K(const float *x, BlockQ8_K *y, int k) {
+    const int nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        float maxv = 0.0f;
+        float amax = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            float ax = fabsf(x[j]);
+            if (ax > amax) {
+                amax = ax;
+                maxv = x[j];
+            }
+        }
+        if (!amax) {
+            y[i].d = 0.0f;
+            memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, QK_K / 16 * sizeof(int16_t));
+            x += QK_K;
+            continue;
+        }
+        const float iscale = -127.0f / maxv;
+        for (int j = 0; j < QK_K; ++j) {
+            int v = nearest_int(iscale * x[j]);
+            y[i].qs[j] = (int8_t)(v > 127 ? 127 : v);
+        }
+        for (int j = 0; j < QK_K / 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) sum += y[i].qs[j * 16 + ii];
+            y[i].bsums[j] = (int16_t)sum;
+        }
+        y[i].d = 1.0f / iscale;
+        x += QK_K;
+    }
+}
+
+static void vec_dot_iq2_s_q8_K(int n, const BlockIQ2_S *x, const BlockQ8_K *y, float *out) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = host_f16f32(x[i].d) * y[i].d;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = qs + QK_K / 8;
+        int bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const int ls1 = 1 + 2 * (x[i].scales[ib32] & 0xf);
+            const int ls2 = 1 + 2 * (x[i].scales[ib32] >> 4);
+            int sumi1 = 0, sumi2 = 0;
+            for (int l = 0; l < 2; ++l) {
+                const uint8_t *grid = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+                for (int j = 0; j < 8; ++j)
+                    sumi1 += q8[j] * grid[j] * ((signs[l] & kmask_iq2xs[j]) ? -1 : 1);
+                q8 += 8;
+            }
+            for (int l = 2; l < 4; ++l) {
+                const uint8_t *grid = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+                for (int j = 0; j < 8; ++j)
+                    sumi2 += q8[j] * grid[j] * ((signs[l] & kmask_iq2xs[j]) ? -1 : 1);
+                q8 += 8;
+            }
+            bsum += ls1 * sumi1 + ls2 * sumi2;
+            qs += 4;
+            signs += 4;
+        }
+        sumf += d * (float)bsum;
+    }
+    *out = 0.125f * sumf;
+}
+
+static void vec_dot_iq3_s_q8_K(int n, const BlockIQ3_S *x, const BlockQ8_K *y, float *out) {
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = host_f16f32(x[i].d) * y[i].d;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = x[i].signs;
+        const int8_t  *q8 = y[i].qs;
+        int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const uint32_t ls1 = 2 * (x[i].scales[ib32 / 2] & 0xf) + 1;
+            const uint32_t ls2 = 2 * (x[i].scales[ib32 / 2] >> 4) + 1;
+            int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 0] | ((qh[ib32 + 0] << (8 - 2 * l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[ib32 + 0] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += grid1[j] * q8[j + 0] * ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
+                    sumi += grid2[j] * q8[j + 4] * ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qs += 8;
+            signs += 4;
+            bsum += sumi * (int32_t)ls1;
+            sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 0] | ((qh[ib32 + 1] << (8 - 2 * l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[ib32 + 1] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += grid1[j] * q8[j + 0] * ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
+                    sumi += grid2[j] * q8[j + 4] * ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qs += 8;
+            signs += 4;
+            bsum += sumi * (int32_t)ls2;
+        }
+        sumf += d * (float)bsum;
+    }
+    *out = sumf;
+}
+
+static void vec_dot_q4_K_q8_K(int n, const BlockQ4_K *x, const BlockQ8_K *y, float *out) {
+    const int nb = n / QK_K;
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    uint32_t utmp[4];
+    const uint8_t *scales = (const uint8_t *)&utmp[0];
+    const uint8_t *mins   = (const uint8_t *)&utmp[2];
+    int8_t  aux8[QK_K];
+    int16_t aux16[8];
+    float   sums[8];
+    int32_t aux32[8];
+    float sumf = 0.0f;
+    memset(sums, 0, sizeof(sums));
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        memset(aux32, 0, 8 * sizeof(int32_t));
+        int8_t *a = aux8;
+        for (int j = 0; j < QK_K / 64; ++j) {
+            for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] & 0xF);
+            a += 32;
+            for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] >> 4);
+            a += 32;
+            q4 += 32;
+        }
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        {
+            const uint32_t uaux = utmp[1] & kmask1;
+            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= kmask1;
+        }
+        int sumi = 0;
+        for (int j = 0; j < QK_K / 16; ++j) sumi += y[i].bsums[j] * mins[j / 2];
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < QK_K / 32; ++j) {
+            const int32_t scale = scales[is++];
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+        }
+        const float d = host_f16f32(x[i].d) * y[i].d;
+        for (int l = 0; l < 8; ++l) sums[l] += d * (float)aux32[l];
+        const float dmin = host_f16f32(x[i].dmin) * y[i].d;
+        sumf -= dmin * (float)sumi;
+    }
+    for (int l = 0; l < 8; ++l) sumf += sums[l];
+    *out = sumf;
+}
+
+static void vec_dot_q5_K_q8_K(int n, const BlockQ5_K *x, const BlockQ8_K *y, float *out) {
+    const int nb = n / QK_K;
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    uint32_t utmp[4];
+    const uint8_t *scales = (const uint8_t *)&utmp[0];
+    const uint8_t *mins   = (const uint8_t *)&utmp[2];
+    int8_t  aux8[QK_K];
+    int16_t aux16[8];
+    float   sums[8];
+    int32_t aux32[8];
+    float sumf = 0.0f;
+    memset(sums, 0, sizeof(sums));
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t *q4 = x[i].qs;
+        const uint8_t *hm = x[i].qh;
+        const int8_t  *q8 = y[i].qs;
+        memset(aux32, 0, 8 * sizeof(int32_t));
+        int8_t *a = aux8;
+        uint8_t m = 1;
+        for (int j = 0; j < QK_K / 64; ++j) {
+            for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] & 0xF);
+            for (int l = 0; l < 32; ++l) a[l] += (hm[l] & m ? 16 : 0);
+            a += 32; m = (uint8_t)(m << 1);
+            for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] >> 4);
+            for (int l = 0; l < 32; ++l) a[l] += (hm[l] & m ? 16 : 0);
+            a += 32; m = (uint8_t)(m << 1);
+            q4 += 32;
+        }
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        {
+            const uint32_t uaux = utmp[1] & kmask1;
+            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+            utmp[2] = uaux;
+            utmp[0] &= kmask1;
+        }
+        int sumi = 0;
+        for (int j = 0; j < QK_K / 16; ++j) sumi += y[i].bsums[j] * mins[j / 2];
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < QK_K / 32; ++j) {
+            const int32_t scale = scales[is++];
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; ++l) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+        }
+        const float d = host_f16f32(x[i].d) * y[i].d;
+        for (int l = 0; l < 8; ++l) sums[l] += d * (float)aux32[l];
+        const float dmin = host_f16f32(x[i].dmin) * y[i].d;
+        sumf -= dmin * (float)sumi;
+    }
+    for (int l = 0; l < 8; ++l) sumf += sums[l];
+    *out = sumf;
+}
+
+static float vec_dot_row_q8_K(int n, const void *row, int type, const BlockQ8_K *q8) {
+    float val = 0.0f;
+    switch (type) {
+    case DT_IQ2_S: vec_dot_iq2_s_q8_K(n, (const BlockIQ2_S *)row, q8, &val); break;
+    case DT_IQ3_S: vec_dot_iq3_s_q8_K(n, (const BlockIQ3_S *)row, q8, &val); break;
+    case DT_Q4_K:  vec_dot_q4_K_q8_K(n, (const BlockQ4_K *)row, q8, &val); break;
+    case DT_Q5_K:  vec_dot_q5_K_q8_K(n, (const BlockQ5_K *)row, q8, &val); break;
+    default:
+        fprintf(stderr, "vec_dot_row_q8_K: unsupported type %d\n", type);
+        exit(1);
+    }
+    return val;
+}
+
 /* ================================================================
  * Model layout (host pointers into mmap)
  * ================================================================ */
@@ -659,6 +932,7 @@ typedef struct {
     float *x, *xb, *xb2, *hb, *hb2;
     float *q, *k, *v, *att, *logits;
     float *kc, *vc;
+    BlockQ8_K *q8;   /* mm_quant: 活性化 Q8_K（最大 hidden_dim 分） */
 } State;
 
 typedef struct {
@@ -1157,6 +1431,7 @@ static void alloc_state(State *s, Config *c) {
     s->logits = (float *)calloc(c->vocab_size, sizeof(float));
     s->kc     = (float *)calloc(kv_cache_len, sizeof(float));
     s->vc     = (float *)calloc(kv_cache_len, sizeof(float));
+    s->q8     = (BlockQ8_K *)calloc((size_t)c->hidden_dim / QK_K, sizeof(BlockQ8_K));
 }
 
 static void free_state(State *s) {
@@ -1165,6 +1440,7 @@ static void free_state(State *s) {
     free(s->q); free(s->k); free(s->v);
     free(s->att); free(s->logits);
     free(s->kc); free(s->vc);
+    free(s->q8);
 }
 
 static void free_weight_ptrs(Weights *w, int L) {
@@ -1248,35 +1524,27 @@ static void mm_f16(float *o, const float *x, const uint16_t *w, int n, int d) {
     }
 }
 
-static void mm_quant_rows(float *o, const float *x, const void *w, int n, int d, int type) {
+static void mm_quant_rows(float *o, const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
     if (n % QK_K) {
         fprintf(stderr, "mm_quant_rows: n=%d not multiple of QK_K\n", n);
         exit(1);
     }
-    int nb = n / QK_K;
+    quantize_row_q8_K(x, q8, n);
     size_t row_sz = row_bytes_quant(type, n);
-    size_t bs = block_size_quant(type);
     const uint8_t *wb = (const uint8_t *)w;
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < d; i++) {
-        float blk[QK_K];
         const uint8_t *row = wb + (size_t)i * row_sz;
-        float val = 0.0f;
-        for (int b = 0; b < nb; b++) {
-            dequant_one_block_to(row + (size_t)b * bs, type, blk);
-            const float *xp = x + b * QK_K;
-            for (int j = 0; j < QK_K; j++) val += xp[j] * blk[j];
-        }
-        o[i] = val;
+        o[i] = vec_dot_row_q8_K(n, row, type, q8);
     }
 }
 
-static void mm(float *o, const float *x, const void *w, int n, int d, int type) {
+static void mm(float *o, const float *x, const void *w, int n, int d, int type, BlockQ8_K *q8) {
     switch (type) {
     case DT_F32: mm_f32(o, x, (const float *)w, n, d); break;
     case DT_F16: mm_f16(o, x, (const uint16_t *)w, n, d); break;
     case DT_Q4_K: case DT_Q5_K: case DT_IQ2_S: case DT_IQ3_S:
-        mm_quant_rows(o, x, w, n, d, type);
+        mm_quant_rows(o, x, w, n, d, type, q8);
         break;
     default:
         fprintf(stderr, "Unsupported tensor type %d in matmul\n", type);
@@ -1352,9 +1620,9 @@ static void forward(Model *m, int token, int pos) {
     for (int l = 0; l < c->n_layers; l++) {
         rmsnorm(s->xb, s->x, w->norm_att[l], dim, c->norm_eps);
 
-        mm(s->q, s->xb, w->wq[l], dim, dim,    w->wq_t[l]);
-        mm(s->k, s->xb, w->wk[l], dim, kv_dim, w->wk_t[l]);
-        mm(s->v, s->xb, w->wv[l], dim, kv_dim, w->wv_t[l]);
+        mm(s->q, s->xb, w->wq[l], dim, dim,    w->wq_t[l], s->q8);
+        mm(s->k, s->xb, w->wk[l], dim, kv_dim, w->wk_t[l], s->q8);
+        mm(s->v, s->xb, w->wv[l], dim, kv_dim, w->wv_t[l], s->q8);
 
         rmsnorm_head_inplace(s->q, w->q_norm[l], n_heads, hd, c->norm_eps);
         rmsnorm_head_inplace(s->k, w->k_norm[l], n_kv, hd, c->norm_eps);
@@ -1395,14 +1663,14 @@ static void forward(Model *m, int token, int pos) {
                         0.0f, oh, 1);
         }
 
-        mm(s->xb2, s->xb, w->wo[l], dim, dim, w->wo_t[l]);
+        mm(s->xb2, s->xb, w->wo[l], dim, dim, w->wo_t[l], s->q8);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
         rmsnorm(s->xb, s->x, w->norm_ffn[l], dim, c->norm_eps);
 
-        mm(s->hb,  s->xb, w->gate[l], dim, hidden, w->gate_t[l]);
-        mm(s->hb2, s->xb, w->up[l],   dim, hidden, w->up_t[l]);
+        mm(s->hb,  s->xb, w->gate[l], dim, hidden, w->gate_t[l], s->q8);
+        mm(s->hb2, s->xb, w->up[l],   dim, hidden, w->up_t[l], s->q8);
 
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < hidden; i++) {
@@ -1411,13 +1679,13 @@ static void forward(Model *m, int token, int pos) {
             s->hb[i] = val * s->hb2[i];
         }
 
-        mm(s->xb, s->hb, w->down[l], hidden, dim, w->down_t[l]);
+        mm(s->xb, s->hb, w->down[l], hidden, dim, w->down_t[l], s->q8);
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
     rmsnorm(s->x, s->x, w->norm_out, dim, c->norm_eps);
-    mm(s->logits, s->x, w->out, dim, c->vocab_size, w->out_t);
+    mm(s->logits, s->x, w->out, dim, c->vocab_size, w->out_t, s->q8);
 }
 
 static float rng_f32(uint64_t *state) {
