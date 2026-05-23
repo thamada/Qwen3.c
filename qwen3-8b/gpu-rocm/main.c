@@ -2270,6 +2270,52 @@ static void print_tok(Tok *tk, int id) {
     fflush(stdout);
 }
 
+#define PREFILL_BAR_WIDTH 40
+
+static void prefill_progress_update(int done, int total) {
+    if (total <= 0) return;
+    if (done > total) done = total;
+    int filled = (done * PREFILL_BAR_WIDTH) / total;
+    int pct = (done * 100) / total;
+    fprintf(stderr, "\rPrefill [");
+    for (int i = 0; i < PREFILL_BAR_WIDTH; i++)
+        fputc(i < filled ? '=' : ' ', stderr);
+    fprintf(stderr, "] %3d%% (%d/%d)", pct, done, total);
+    fflush(stderr);
+}
+
+static void prefill_progress_done(int n_tokens, double elapsed_sec) {
+    double tps = (elapsed_sec > 0.0) ? (double)n_tokens / elapsed_sec : 0.0;
+    fprintf(stderr, "\rPrefill [");
+    for (int i = 0; i < PREFILL_BAR_WIDTH; i++)
+        fputc('=', stderr);
+    fprintf(stderr, "] 100%% (%d/%d)\n", n_tokens, n_tokens);
+    fprintf(stderr, "Prefill complete: %d tokens in %.2fs (%.2f tok/s)\n",
+            n_tokens, elapsed_sec, tps);
+}
+
+static void decode_progress_done(int n_tokens, double elapsed_sec) {
+    double tps = (elapsed_sec > 0.0) ? (double)n_tokens / elapsed_sec : 0.0;
+    fflush(stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+    fprintf(stderr, "\nDecode complete: %d tokens in %.2fs (%.2f tok/s)\n",
+            n_tokens, elapsed_sec, tps);
+}
+
+static void throughput_summary(int n_prefill, double prefill_sec,
+                             int n_decode, double decode_sec,
+                             double total_sec) {
+    double prefill_tps = (prefill_sec > 0.0) ? (double)n_prefill / prefill_sec : 0.0;
+    double decode_tps  = (decode_sec > 0.0)  ? (double)n_decode / decode_sec  : 0.0;
+    int n_total = n_prefill + n_decode;
+    double total_tps = (total_sec > 0.0) ? (double)n_total / total_sec : 0.0;
+    fprintf(stderr, "--- throughput ---\n");
+    fprintf(stderr, "  prefill: %.2f tok/s\n", prefill_tps);
+    fprintf(stderr, "  decode:  %.2f tok/s\n", decode_tps);
+    fprintf(stderr, "  total:   %.2f tok/s\n", total_tps);
+}
+
 /* ================================================================
  * Text Generation
  * ================================================================ */
@@ -2282,9 +2328,15 @@ static void generate(Model *m, int *prompt, int n_prompt,
 
     int token = prompt[0];
     int gen = 0;
+    int prefill_reported = 0;
+    int decode_timing = 0;
+    double prefill_sec = 0.0;
 
-    struct timespec t0, t1;
+    struct timespec t0, t1, t_prefill, t_decode;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_MONOTONIC, &t_prefill);
+    if (n_prompt > 0)
+        prefill_progress_update(0, n_prompt);
 
     for (int pos = 0; pos < n_prompt + max_new - 1; pos++) {
         if (pos >= m->cfg.max_seq) {
@@ -2295,10 +2347,28 @@ static void generate(Model *m, int *prompt, int n_prompt,
         int need_logits = (pos >= n_prompt - 1);
         forward_gpu(m, token, pos, need_logits);
 
+        if (n_prompt > 0 && pos < n_prompt) {
+            prefill_progress_update(pos + 1, n_prompt);
+            if (pos == n_prompt - 1 && !prefill_reported) {
+                struct timespec t_now;
+                clock_gettime(CLOCK_MONOTONIC, &t_now);
+                prefill_sec = (t_now.tv_sec - t_prefill.tv_sec)
+                    + (t_now.tv_nsec - t_prefill.tv_nsec) / 1e9;
+                prefill_progress_done(n_prompt, prefill_sec);
+                prefill_reported = 1;
+                clock_gettime(CLOCK_MONOTONIC, &t_decode);
+                decode_timing = 1;
+            }
+        }
+
         int next;
         if (pos < n_prompt - 1) {
             next = prompt[pos + 1];
         } else {
+            if (!decode_timing) {
+                clock_gettime(CLOCK_MONOTONIC, &t_decode);
+                decode_timing = 1;
+            }
             next = sample_on_gpu(m, temp, topp, m->cfg.vocab_size, &rng);
             if (next == m->tok.eos || next == m->tok.eot) break;
             gen++;
@@ -2309,9 +2379,17 @@ static void generate(Model *m, int *prompt, int n_prompt,
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double decode_sec = 0.0;
+    if (decode_timing) {
+        decode_sec = (t1.tv_sec - t_decode.tv_sec)
+            + (t1.tv_nsec - t_decode.tv_nsec) / 1e9;
+        decode_progress_done(gen, decode_sec);
+    }
+
     printf("\n\n--- %d prompt tokens + %d generated tokens ---\n", n_prompt, gen);
-    printf("--- %.1fs total (%.2f tok/s) ---\n", elapsed,
-           (gen > 0) ? gen / elapsed : 0.0);
+    printf("--- %.1fs total ---\n", elapsed);
+    if (prefill_reported || decode_timing)
+        throughput_summary(n_prompt, prefill_sec, gen, decode_sec, elapsed);
 }
 
 /* ================================================================
@@ -2319,6 +2397,7 @@ static void generate(Model *m, int *prompt, int n_prompt,
  * ================================================================ */
 
 int main(int argc, char *argv[]) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model.gguf> [options]\n", argv[0]);
         fprintf(stderr, "Options:\n");
