@@ -4,6 +4,22 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 16:05:09
+
+**`qwen3-8b/gpu-rocm/Makefile`** — **`make log`** 表表示の列幅調整と **`BENCH_LOG`** 日時形式の統一。
+
+#### 変更内容
+
+- **`log.push`**: 追記日時を **`date -Iseconds`**（**`+00:00` 付き**）から **`date +%Y-%m-%dT%H:%M:%S`**（ローカル、オフセットなし）に変更。
+- **`log`**: 表ヘッダ・データ行の **`printf`** 列幅を調整（Date 19 / GPU 8 / Host 14 等）。**`awk`** で日時フィールド末尾の **`+TZ`** を除去してから表示（旧エントリ互換）。
+- 既存 **`BENCH_LOG`** サンプル行の日時を **`2026-05-23T15:54:16`** 形式に更新。
+
+#### ドキュメント
+
+**`doc/design.md`**: ROCm ビルド節の **`BENCH_LOG`** 行形式・**`gpu-rocm/Makefile`** 一行説明を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 15:55:32
 
 **`qwen3-8b/gpu-rocm/`** — **`cpu-blas`** と同形式の **Prefill progress bar**・スループット要約、および **`make log` / `make log.push`** ベンチマーク履歴。
@@ -18,7 +34,7 @@
 #### `gpu-rocm/Makefile`
 
 - **`log`**: **`BENCH_LOG += …`** 行を表形式で表示（日時・**`GPU_ARCH`**・ホスト・prompt/gen トークン数・prefill/decode/total tok/s）。
-- **`log.push`**: 既定 **`BENCH_PROMPT`**（~128 token ChatML）・**`-n $(BENCH_N)`**（既定 128）・**`-t 0 -s $(BENCH_SEED)`** でベンチ実行し、結果を **`# BENCH_LOG_END`** 直前に **`BENCH_LOG += ISO8601|GPU_ARCH|hostname|…`** として追記。
+- **`log.push`**: 既定 **`BENCH_PROMPT`**（~128 token ChatML）・**`-n $(BENCH_N)`**（既定 128）・**`-t 0 -s $(BENCH_SEED)`** でベンチ実行し、結果を **`# BENCH_LOG_END`** 直前に **`BENCH_LOG += YYYY-MM-DDTHH:MM:SS|GPU_ARCH|hostname|…`** として追記（**`date +%Y-%m-%dT%H:%M:%S`**）。
 - 上書き例: **`make log.push BENCH_N=64 BENCH_SEED=42`**。
 
 #### ドキュメント

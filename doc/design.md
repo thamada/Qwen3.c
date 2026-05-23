@@ -47,7 +47,7 @@
 | `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS。**Q8_K GEMV**（全型 AVX2 整数内積・層内 Q8 共有）、**RoPE キャッシュ**、**lm_mode**（prefill LM スキップ / greedy argmax）、**F16 emb F16C**。詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**。**Prefill progress bar** を stderr に出力。 |
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** でビルド。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。未検出時はエラー。上書きは **`make GPU_ARCH=…`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`BENCH_LOG += …`** を Makefile 内に追記・表示）。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** でビルド。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。未検出時はエラー。上書きは **`make GPU_ARCH=…`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`BENCH_LOG += …`** を Makefile 内に追記。日時は **`YYYY-MM-DDTHH:MM:SS`** ローカル、**`make log`** は列幅調整済み表表示）。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（FP16 線形層）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
 | `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。既定 **`make build` / `make run`**（FP16・PTX 既定）。**`build.polarquant`** / **`run.polarquant`**（**`BONSAI_POLARQUANT=1`**）、**`pq-test`**。**`KERNELS_OBJ`** / **`MAIN_OBJ`** は **`BONSAI_POLARQUANT`/`FA_BR` 別名で stale `.o` 回避。NVFP4 関連は含まない。 |
 | `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等。PolarQuant 時は KV を **`PQBlock`** 経路に切替。 |
@@ -187,7 +187,7 @@ make log.push BENCH_N=64   # 生成トークン数など上書き可
 | `BENCH_N` | **`log.push`** の **`-n`**（生成トークン上限） | `128` |
 | `BENCH_SEED` | **`log.push`** の **`-s`** | `42` |
 
-**`log.push`** の 1 行形式（パイ区切り）: **`ISO8601|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**。スループットは推論のみ（prefill+decode）。モデル重み H2D は含まない。
+**`log.push`** の 1 行形式（パイ区切り）: **`YYYY-MM-DDTHH:MM:SS|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**（**`date +%Y-%m-%dT%H:%M:%S`**、タイムゾーンオフセットなし）。**`make log`** は上記を表表示（列幅調整。旧エントリに **`+00:00`** 等が付いていても表示時に除去）。スループットは推論のみ（prefill+decode）。モデル重み H2D は含まない。
 
 ### CUDA（NVIDIA GPU）
 
