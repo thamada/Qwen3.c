@@ -21,9 +21,10 @@
  *   - IQ2_S    (attn_q/k.weight, ffn_gate/up.weight)
  *
  * Loading strategy: ALL quantized weights are dequantized on CPU at load time
- * to FP16, then uploaded to the device.  At run time the FP16 GEMV kernel
- * (mm_f16_gemv_kernel) is used for matmul.  This minimizes kernel surface
- * area while keeping the run-time on the GPU end-to-end.
+ * to FP16, then uploaded to the device.
+ *   - Prefill: 全プロンプトトークンを1回の forward で並列（forward_prefill_gpu）。
+ *     線形層は mm_f16_gemv_batch_kernel（S×d の GEMM 相当）を使用。
+ *   - Decode:  1トークンずつ mm_f16_gemv_kernel（GEMV）+ FlashAttention decode。
  *
  * Build:
  *   make build.gpu-rocm -> qwen3-rocm（本ファイル）
@@ -683,6 +684,12 @@ typedef struct {
     WeightsDev wd;
     State s;       /* host logits buffer (top-p fallback) */
     State sd;      /* device activations / KV cache */
+    /* Prefill batch buffers (S tokens processed in parallel) */
+    float *d_x_batch, *d_xb_batch, *d_xb2_batch;
+    float *d_hb_batch, *d_hb2_batch;
+    float *d_q_batch, *d_k_batch, *d_v_batch;
+    int   *d_tokens;
+    int    batch_cap;
     int *d_next_token;
     uint64_t *d_rng;
     float *d_blk_val;
@@ -1320,6 +1327,22 @@ static void alloc_state_gpu(Model *m) {
     s->x = s->xb = s->xb2 = s->hb = s->hb2 = NULL;
     s->q = s->k = s->v = s->att = NULL;
     s->kc = s->vc = NULL;
+
+    m->batch_cap = c->max_seq;
+    {
+        size_t bc = (size_t)c->max_seq;
+        size_t q_nelem_b  = (size_t)c->n_heads    * c->head_dim;
+        size_t kv_nelem_b = (size_t)c->n_kv_heads * c->head_dim;
+        HIPCHK(hipMalloc((void **)&m->d_x_batch,   bc * (size_t)c->dim        * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_xb_batch,  bc * (size_t)c->dim        * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_xb2_batch, bc * (size_t)c->dim        * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_q_batch,   bc * q_nelem_b             * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_k_batch,   bc * kv_nelem_b            * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_v_batch,   bc * kv_nelem_b            * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_hb_batch,  bc * (size_t)c->hidden_dim * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_hb2_batch, bc * (size_t)c->hidden_dim * sizeof(float)));
+        HIPCHK(hipMalloc((void **)&m->d_tokens,    bc * sizeof(int)));
+    }
 }
 
 static void free_state_gpu(Model *m) {
@@ -1349,6 +1372,20 @@ static void free_state_gpu(Model *m) {
     if (sd->logits) HIPCHK(hipFree(sd->logits));
     if (sd->kc)     HIPCHK(hipFree(sd->kc));
     if (sd->vc)     HIPCHK(hipFree(sd->vc));
+    if (m->d_x_batch)   HIPCHK(hipFree(m->d_x_batch));
+    if (m->d_xb_batch)  HIPCHK(hipFree(m->d_xb_batch));
+    if (m->d_xb2_batch) HIPCHK(hipFree(m->d_xb2_batch));
+    if (m->d_q_batch)   HIPCHK(hipFree(m->d_q_batch));
+    if (m->d_k_batch)   HIPCHK(hipFree(m->d_k_batch));
+    if (m->d_v_batch)   HIPCHK(hipFree(m->d_v_batch));
+    if (m->d_hb_batch)  HIPCHK(hipFree(m->d_hb_batch));
+    if (m->d_hb2_batch) HIPCHK(hipFree(m->d_hb2_batch));
+    if (m->d_tokens)    HIPCHK(hipFree(m->d_tokens));
+    m->d_x_batch = m->d_xb_batch = m->d_xb2_batch = NULL;
+    m->d_q_batch = m->d_k_batch = m->d_v_batch = NULL;
+    m->d_hb_batch = m->d_hb2_batch = NULL;
+    m->d_tokens = NULL;
+    m->batch_cap = 0;
     memset(sd, 0, sizeof(*sd));
 }
 
@@ -1527,6 +1564,157 @@ __global__ void mm_f32_gemv_kernel(float *o, const float *x, const float *w, int
     o[row] = val;
 }
 
+/* Prefill GEMM: Y[t,d] = X[t,n] @ W[d,n]^T — one weight row reused for all tokens. */
+__launch_bounds__(GEMV_THREADS)
+__global__ void mm_f16_gemv_batch_kernel(float *o, const float *x, const uint16_t *w,
+                                         int n, int d, int n_tokens) {
+    int local_row = threadIdx.x / GEMV_WARP;
+    int lane      = threadIdx.x % GEMV_WARP;
+    int row       = blockIdx.x * GEMV_ROWS_PER_BLOCK + local_row;
+    if (row >= d) return;
+
+    const uint16_t *roww = w + (size_t)row * (size_t)n;
+    int n4 = n >> 2;
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float *xin = x + (size_t)t * (size_t)n;
+        float val = 0.f;
+        for (int b = lane; b < n4; b += GEMV_WARP) {
+            const float *xp = xin + b * 4;
+            const uint16_t *wp = roww + b * 4;
+            val += xp[0] * dev_f16f32(wp[0]);
+            val += xp[1] * dev_f16f32(wp[1]);
+            val += xp[2] * dev_f16f32(wp[2]);
+            val += xp[3] * dev_f16f32(wp[3]);
+        }
+        for (int j = n4 * 4 + lane; j < n; j += GEMV_WARP)
+            val += xin[j] * dev_f16f32(roww[j]);
+        for (int offset = GEMV_WARP / 2; offset > 0; offset >>= 1)
+            val += __shfl_down(val, offset, GEMV_WARP);
+        if (lane == 0)
+            o[(size_t)t * d + row] = val;
+    }
+}
+
+__global__ void emb_f16_batch_kernel(float *o, const uint16_t *w, const int *tokens,
+                                     int dim, int n_tokens) {
+    int t = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tokens || i >= dim) return;
+    o[(size_t)t * dim + i] = dev_f16f32(w[(size_t)tokens[t] * dim + i]);
+}
+
+__global__ void rmsnorm_batch_kernel(float *o, const float *x, const float *w,
+                                     int n, int n_tokens, float eps) {
+    int t = blockIdx.x;
+    if (t >= n_tokens) return;
+
+    const float *xin = x + (size_t)t * n;
+    float *xout = o + (size_t)t * n;
+
+    __shared__ float ssum[256];
+    float local = 0.f;
+    int n4 = n >> 2;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        float4 v = *(const float4 *)(xin + i * 4);
+        local += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    for (int i = n4 * 4 + (int)threadIdx.x; i < n; i += blockDim.x)
+        local += xin[i] * xin[i];
+    ssum[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s)
+            ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    float ss = rsqrtf(ssum[0] / (float)n + eps);
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        float4 xv = *(const float4 *)(xin + i * 4);
+        float4 wv = *(const float4 *)(w + i * 4);
+        float4 ov;
+        ov.x = xv.x * ss * wv.x;
+        ov.y = xv.y * ss * wv.y;
+        ov.z = xv.z * ss * wv.z;
+        ov.w = xv.w * ss * wv.w;
+        *(float4 *)(xout + i * 4) = ov;
+    }
+    for (int i = n4 * 4 + (int)threadIdx.x; i < n; i += blockDim.x)
+        xout[i] = xin[i] * ss * w[i];
+}
+
+__global__ void rmsnorm_head_batch_kernel(float *vec, const float *w,
+                                          int n_heads, int hd, int n_tokens, float eps) {
+    int bt = blockIdx.x;
+    int t = bt / n_heads;
+    int h = bt % n_heads;
+    if (t >= n_tokens || h >= n_heads) return;
+
+    float *seg = vec + ((size_t)t * n_heads + h) * hd;
+    __shared__ float ssum[256];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x)
+        local += seg[i] * seg[i];
+    ssum[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s)
+            ssum[threadIdx.x] += ssum[threadIdx.x + s];
+        __syncthreads();
+    }
+    float ss = rsqrtf(ssum[0] / (float)hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x)
+        seg[i] = seg[i] * ss * w[i];
+}
+
+__global__ void rope_prefill_batch_kernel(float *vec, int n_heads, int head_dim,
+                                          float theta_base, int n_tokens) {
+    int bt = blockIdx.x * blockDim.x + threadIdx.x;
+    int pairs_per_token = n_heads * (head_dim / 2);
+    int total = n_tokens * pairs_per_token;
+    if (bt >= total) return;
+
+    int t = bt / pairs_per_token;
+    int rem = bt % pairs_per_token;
+    int h = rem / (head_dim / 2);
+    int pr = rem % (head_dim / 2);
+    int pos = t;
+    int i = pr * 2;
+    float freq = 1.0f / powf(theta_base, (float)i / (float)head_dim);
+    float angle = (float)pos * freq;
+    float cr, ci;
+    __sincosf(angle, &ci, &cr);
+    int idx = ((size_t)t * n_heads + h) * head_dim + i;
+    float v0 = vec[idx], v1 = vec[idx + 1];
+    vec[idx]     = v0 * cr - v1 * ci;
+    vec[idx + 1] = v0 * ci + v1 * cr;
+}
+
+__global__ void kv_write_batch_kernel(float *kc, const float *src, int kv_dim, int n_tokens) {
+    int t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const float *srow = src + (size_t)t * kv_dim;
+    float *drow = kc + (size_t)t * kv_dim;
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x)
+        drow[i] = srow[i];
+}
+
+__global__ void silu_mul_batch_kernel(float *hb, const float *hb2, int n, int n_tokens) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * n_tokens;
+    if (i >= total) return;
+    float val = hb[i];
+    val = val / (1.0f + expf(-val));
+    hb[i] = val * hb2[i];
+}
+
+__global__ void vec_add_batch_kernel(float *a, const float *b, int n, int n_tokens) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * n_tokens;
+    if (i >= total) return;
+    a[i] += b[i];
+}
+
 __global__ void emb_f16_kernel(float *o, const uint16_t *w, int id, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     const uint16_t *row = w + (size_t)id * (size_t)dim;
@@ -1560,6 +1748,30 @@ __global__ void rope_kernel(float *vec, int n_heads, int head_dim, int pos, floa
 #define FA_MAX_HD 256
 #define FA_BC 64
 #define FA_HD128 128
+/* Prefill attention tile rows (K/V staging in shared memory). */
+#define FA_BR 32
+
+__device__ static inline float fa_sh_reduce_max(float val, float *red_sh) {
+    red_sh[threadIdx.x] = val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            red_sh[threadIdx.x] = fmaxf(red_sh[threadIdx.x], red_sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    return red_sh[0];
+}
+
+__device__ static inline float fa_sh_reduce_sum(float val, float *red_sh) {
+    red_sh[threadIdx.x] = val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            red_sh[threadIdx.x] += red_sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    return red_sh[0];
+}
 
 __launch_bounds__(256, 2)
 __global__ void attn_flash_decode_kernel_hd128(
@@ -1848,6 +2060,97 @@ __global__ void attn_mha_kernel(
     }
 }
 
+/*
+ * Prefill Attention — 各プロンプト位置 t を block (t, head) で並列。
+ * 因果マスク: 位置 t は K/V の 0..t のみ参照（npos = t + 1）。
+ */
+__launch_bounds__(FA_HD128, 2)
+__global__ void attn_flash_prefill_kernel(
+    float *xb, const float *q, const float *kc, const float *vc,
+    int n_tokens, int n_heads, int hd, int kv_dim, int kv_mul, float scale)
+{
+    int bt = blockIdx.x;
+    int t = bt / n_heads;
+    int h = bt % n_heads;
+    if (t >= n_tokens || h >= n_heads || hd > FA_HD128) return;
+
+    const int npos = t + 1;
+    int kvh = h / kv_mul;
+    const float *qh = q + ((size_t)t * n_heads + h) * hd;
+    const float *kbase = kc + (size_t)kvh * hd;
+    const float *vbase = vc + (size_t)kvh * hd;
+    float *oh = xb + ((size_t)t * n_heads + h) * hd;
+
+    __shared__ float k_tile[FA_BR][FA_HD128];
+    __shared__ float v_tile[FA_BR][FA_HD128];
+    __shared__ float q_sh[FA_HD128];
+    __shared__ float o_sh[FA_HD128];
+    __shared__ float scores[FA_BR];
+    __shared__ float red_sh[FA_HD128];
+
+    if (threadIdx.x < hd) {
+        q_sh[threadIdx.x] = qh[threadIdx.x];
+        o_sh[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t0 = 0; t0 < npos; t0 += FA_BR) {
+        int tc = npos - t0;
+        if (tc > FA_BR) tc = FA_BR;
+
+        for (int idx = threadIdx.x; idx < tc * hd; idx += blockDim.x) {
+            int j = idx / hd;
+            int d = idx - j * hd;
+            k_tile[j][d] = kbase[(size_t)(t0 + j) * kv_dim + d];
+            v_tile[j][d] = vbase[(size_t)(t0 + j) * kv_dim + d];
+        }
+        __syncthreads();
+
+        if (threadIdx.x < tc) {
+            float s = 0.0f;
+            for (int d = 0; d < hd; d++)
+                s += q_sh[d] * k_tile[threadIdx.x][d];
+            scores[threadIdx.x] = s * scale;
+        }
+        __syncthreads();
+
+        float m_tile = fa_sh_reduce_max(
+            (threadIdx.x < tc) ? scores[threadIdx.x] : -1e30f, red_sh);
+        __syncthreads();
+
+        float m_new = fmaxf(m, m_tile);
+        float alpha = (m > -1e29f) ? expf(m - m_new) : 0.0f;
+
+        if (threadIdx.x < hd)
+            o_sh[threadIdx.x] *= alpha;
+
+        if (threadIdx.x < tc)
+            scores[threadIdx.x] = expf(scores[threadIdx.x] - m_new);
+        __syncthreads();
+
+        float l_tile = fa_sh_reduce_sum(
+            (threadIdx.x < tc) ? scores[threadIdx.x] : 0.0f, red_sh);
+        __syncthreads();
+
+        if (threadIdx.x < hd) {
+            float acc = 0.0f;
+            for (int j = 0; j < tc; j++)
+                acc += scores[j] * v_tile[j][threadIdx.x];
+            o_sh[threadIdx.x] += acc;
+        }
+        __syncthreads();
+
+        l = l * alpha + l_tile;
+        m = m_new;
+    }
+
+    if (threadIdx.x < hd)
+        oh[threadIdx.x] = o_sh[threadIdx.x] / l;
+}
+
 /* ---------- GPU softmax / argmax / multinomial ---------- */
 
 __global__ void reduce_max_partial_k(const float *x, int n, float *blk_out) {
@@ -2056,10 +2359,112 @@ static void launch_mm_f16(float *o, const float *x, const uint16_t *w, int n, in
     mm_f16_gemv_kernel<<<blocks, GEMV_THREADS>>>(o, x, w, n, d);
 }
 
+static void launch_mm_f16_batch(float *o, const float *x, const uint16_t *w,
+                                int n, int d, int n_tokens) {
+    int blocks = (d + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
+    mm_f16_gemv_batch_kernel<<<blocks, GEMV_THREADS>>>(o, x, w, n, d, n_tokens);
+}
+
 static void launch_emb(float *o, const void *w, int id, int dim) {
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     emb_f16_kernel<<<blocks, threads>>>(o, (const uint16_t *)w, id, dim);
+}
+
+/* ================================================================
+ * Forward pass — Prefill (all prompt tokens in one batched forward)
+ * ================================================================ */
+
+static void forward_prefill_gpu(Model *m, const int *tokens, int n_tokens) {
+    if (n_tokens <= 0) return;
+    if (n_tokens > m->batch_cap) {
+        fprintf(stderr, "forward_prefill_gpu: n_tokens=%d exceeds batch_cap=%d\n",
+                n_tokens, m->batch_cap);
+        exit(1);
+    }
+
+    Config *c = &m->cfg;
+    WeightsDev *wd = &m->wd;
+    State *s = &m->sd;
+    int dim      = c->dim;
+    int hd       = c->head_dim;
+    int kv_dim   = c->kv_dim;
+    int kv_mul   = c->kv_mul;
+    int n_heads  = c->n_heads;
+    int n_kv     = c->n_kv_heads;
+    int max_seq  = c->max_seq;
+    int hidden   = c->hidden_dim;
+    int qdim     = n_heads * hd;
+    const float attn_scale = 1.0f / sqrtf((float)hd);
+
+    HIPCHK(hipMemcpy(m->d_tokens, tokens, (size_t)n_tokens * sizeof(int),
+                     hipMemcpyHostToDevice));
+
+    emb_f16_batch_kernel<<<dim3((dim + 255) / 256, n_tokens, 1), 256>>>(
+        m->d_x_batch, (const uint16_t *)wd->embd, m->d_tokens, dim, n_tokens);
+
+    for (int l = 0; l < c->n_layers; l++) {
+        rmsnorm_batch_kernel<<<n_tokens, 256>>>(
+            m->d_xb_batch, m->d_x_batch, wd->norm_att[l], dim, n_tokens, c->norm_eps);
+
+        launch_mm_f16_batch(m->d_q_batch, m->d_xb_batch, (const uint16_t *)wd->wq[l],
+                            dim, qdim, n_tokens);
+        launch_mm_f16_batch(m->d_k_batch, m->d_xb_batch, (const uint16_t *)wd->wk[l],
+                            dim, kv_dim, n_tokens);
+        launch_mm_f16_batch(m->d_v_batch, m->d_xb_batch, (const uint16_t *)wd->wv[l],
+                            dim, kv_dim, n_tokens);
+
+        rmsnorm_head_batch_kernel<<<n_tokens * n_heads, 256>>>(
+            m->d_q_batch, wd->q_norm[l], n_heads, hd, n_tokens, c->norm_eps);
+        rmsnorm_head_batch_kernel<<<n_tokens * n_kv, 256>>>(
+            m->d_k_batch, wd->k_norm[l], n_kv, hd, n_tokens, c->norm_eps);
+
+        {
+            int total_q = n_tokens * n_heads * (hd / 2);
+            rope_prefill_batch_kernel<<<(total_q + 255) / 256, 256>>>(
+                m->d_q_batch, n_heads, hd, c->rope_theta, n_tokens);
+            int total_k = n_tokens * n_kv * (hd / 2);
+            rope_prefill_batch_kernel<<<(total_k + 255) / 256, 256>>>(
+                m->d_k_batch, n_kv, hd, c->rope_theta, n_tokens);
+        }
+
+        size_t loff = (size_t)l * max_seq * kv_dim;
+        kv_write_batch_kernel<<<n_tokens, 256>>>(
+            s->kc + loff, m->d_k_batch, kv_dim, n_tokens);
+        kv_write_batch_kernel<<<n_tokens, 256>>>(
+            s->vc + loff, m->d_v_batch, kv_dim, n_tokens);
+
+        attn_flash_prefill_kernel<<<n_tokens * n_heads, FA_HD128>>>(
+            m->d_xb_batch, m->d_q_batch, s->kc + loff, s->vc + loff,
+            n_tokens, n_heads, hd, kv_dim, kv_mul, attn_scale);
+
+        launch_mm_f16_batch(m->d_xb2_batch, m->d_xb_batch, (const uint16_t *)wd->wo[l],
+                            qdim, dim, n_tokens);
+        vec_add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
+            m->d_x_batch, m->d_xb2_batch, dim, n_tokens);
+
+        rmsnorm_batch_kernel<<<n_tokens, 256>>>(
+            m->d_xb_batch, m->d_x_batch, wd->norm_ffn[l], dim, n_tokens, c->norm_eps);
+
+        launch_mm_f16_batch(m->d_hb_batch, m->d_xb_batch, (const uint16_t *)wd->gate[l],
+                            dim, hidden, n_tokens);
+        launch_mm_f16_batch(m->d_hb2_batch, m->d_xb_batch, (const uint16_t *)wd->up[l],
+                            dim, hidden, n_tokens);
+
+        silu_mul_batch_kernel<<<(n_tokens * hidden + 255) / 256, 256>>>(
+            m->d_hb_batch, m->d_hb2_batch, hidden, n_tokens);
+
+        launch_mm_f16_batch(m->d_xb_batch, m->d_hb_batch, (const uint16_t *)wd->down[l],
+                            hidden, dim, n_tokens);
+        vec_add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
+            m->d_x_batch, m->d_xb_batch, dim, n_tokens);
+    }
+
+    const float *x_last = m->d_x_batch + (size_t)(n_tokens - 1) * dim;
+    launch_rmsnorm(s->x, x_last, wd->norm_out, dim, c->norm_eps);
+    launch_mm_f16(s->logits, s->x, (const uint16_t *)wd->out, dim, c->vocab_size);
+
+    HIPCHK(hipDeviceSynchronize());
 }
 
 /* ================================================================
@@ -2331,7 +2736,6 @@ static void generate(Model *m, int *prompt, int n_prompt,
     if (rng == 0) rng = 1;
     HIPCHK(hipMemcpy(m->d_rng, &rng, sizeof(uint64_t), hipMemcpyHostToDevice));
 
-    int token = prompt[0];
     int gen = 0;
     int prefill_reported = 0;
     int decode_timing = 0;
@@ -2339,47 +2743,45 @@ static void generate(Model *m, int *prompt, int n_prompt,
 
     struct timespec t0, t1, t_prefill, t_decode;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    clock_gettime(CLOCK_MONOTONIC, &t_prefill);
-    if (n_prompt > 0)
-        prefill_progress_update(0, n_prompt);
 
-    for (int pos = 0; pos < n_prompt + max_new - 1; pos++) {
+    if (n_prompt > 0) {
+        if (n_prompt > m->cfg.max_seq) {
+            fprintf(stderr, "\n[prompt length %d exceeds max_seq %d]\n",
+                    n_prompt, m->cfg.max_seq);
+            return;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_prefill);
+        prefill_progress_update(0, n_prompt);
+        if (n_prompt > 1) {
+            forward_prefill_gpu(m, prompt, n_prompt);
+        } else {
+            forward_gpu(m, prompt[0], 0, 1);
+        }
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        prefill_sec = (t_now.tv_sec - t_prefill.tv_sec)
+            + (t_now.tv_nsec - t_prefill.tv_nsec) / 1e9;
+        prefill_progress_done(n_prompt, prefill_sec);
+        prefill_reported = 1;
+        clock_gettime(CLOCK_MONOTONIC, &t_decode);
+        decode_timing = 1;
+    }
+
+    for (int gen_i = 0; gen_i < max_new; gen_i++) {
+        int pos = n_prompt - 1 + gen_i;
         if (pos >= m->cfg.max_seq) {
             fprintf(stderr, "\n[max sequence length %d reached]\n", m->cfg.max_seq);
             break;
         }
 
-        int need_logits = (pos >= n_prompt - 1);
-        forward_gpu(m, token, pos, need_logits);
+        int next = sample_on_gpu(m, temp, topp, m->cfg.vocab_size, &rng);
+        if (next == m->tok.eos || next == m->tok.eot) break;
+        gen++;
+        print_tok(&m->tok, next);
 
-        if (n_prompt > 0 && pos < n_prompt) {
-            prefill_progress_update(pos + 1, n_prompt);
-            if (pos == n_prompt - 1 && !prefill_reported) {
-                struct timespec t_now;
-                clock_gettime(CLOCK_MONOTONIC, &t_now);
-                prefill_sec = (t_now.tv_sec - t_prefill.tv_sec)
-                    + (t_now.tv_nsec - t_prefill.tv_nsec) / 1e9;
-                prefill_progress_done(n_prompt, prefill_sec);
-                prefill_reported = 1;
-                clock_gettime(CLOCK_MONOTONIC, &t_decode);
-                decode_timing = 1;
-            }
-        }
-
-        int next;
-        if (pos < n_prompt - 1) {
-            next = prompt[pos + 1];
-        } else {
-            if (!decode_timing) {
-                clock_gettime(CLOCK_MONOTONIC, &t_decode);
-                decode_timing = 1;
-            }
-            next = sample_on_gpu(m, temp, topp, m->cfg.vocab_size, &rng);
-            if (next == m->tok.eos || next == m->tok.eot) break;
-            gen++;
-            print_tok(&m->tok, next);
-        }
-        token = next;
+        pos = n_prompt + gen_i;
+        if (pos >= m->cfg.max_seq) break;
+        forward_gpu(m, next, pos, 1);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -2388,7 +2790,8 @@ static void generate(Model *m, int *prompt, int n_prompt,
     if (decode_timing) {
         decode_sec = (t1.tv_sec - t_decode.tv_sec)
             + (t1.tv_nsec - t_decode.tv_nsec) / 1e9;
-        decode_progress_done(gen, decode_sec);
+        if (gen > 0)
+            decode_progress_done(gen, decode_sec);
     }
 
     printf("\n\n--- %d prompt tokens + %d generated tokens ---\n", n_prompt, gen);
