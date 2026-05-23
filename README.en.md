@@ -38,7 +38,7 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup. **Prefill progress bar** and throughput summary on stderr |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV uses **Q8_K activations + AVX2 integer dots for all types** (layer-shared Q8). **RoPE cache**, prefill **LM head skip**, greedy **`mm_argmax_row`**. **F16 embedding via F16C**. **Prefill progress bar** on stderr |
-| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs. **Prefill progress bar** (`Prefill [====...]`, width 40) and prefill / decode / total throughput summaries on stderr. Benchmark history via **`make log` / `make log.push`** in **`gpu-rocm/Makefile`** |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU. **Prefill**: one batched forward + **hipBLAS GemmEx** ([llama.cpp](https://github.com/ggml-org/llama.cpp/) cublas-style path). **Decode**: one-token GEMV. **Prefill progress bar** and prefill / decode / total throughput summaries. Benchmark history via **`make log` / `make log.push`**. Verify hipBLAS path / no embedded WMMA with **`make wmma`** |
 | CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). Not in aggregate `Makefile` |
 | CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Not in aggregate `Makefile` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
@@ -71,7 +71,10 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     │   └── main.c
     ├── gpu-rocm/
     │   ├── Makefile
-    │   └── main.c
+    │   ├── main.c
+    │   ├── wmma_probe.c          (`make wmma-probe` — WMMA detector calibration)
+    │   └── scripts/
+    │       └── check_wmma.sh     (`make wmma`)
     ├── gpu-cuda/                    (FP16 linear layers, no NVFP4)
     │   ├── Makefile
     │   ├── main.c
@@ -399,7 +402,38 @@ If ROCm is not under `/opt/rocm`:
 make build.gpu-rocm ROCM=/path/to/rocm
 ```
 
-Produces **`gpu-rocm/qwen3-rocm`**.
+Produces **`gpu-rocm/qwen3-rocm`**. Links **`-lhipblas -lrocblas`** (Prefill linear GEMM).
+
+### Prefill acceleration (overview)
+
+The ROCm build **separates Prefill** (prompt processing) and **Decode** (token generation).
+
+| Phase | Function | Linear layers | Description |
+|-------|----------|---------------|-------------|
+| **Prefill** | `forward_prefill_gpu` | **hipBLAS `GemmEx`** | All **S prompt tokens** in **one forward** |
+| **Decode** | `forward_gpu` | Custom **GEMV** | **One token at a time** |
+
+**Why Prefill can be much faster** (details in [`doc/design.md`](doc/design.md), section **“ROCm Prefill acceleration (3 stages)”**):
+
+1. During **Prefill**, all prompt tokens are known, so linear layers become **S×d GEMM** (matrix×matrix). Weight HBM reads are **amortized over S tokens**.
+2. **Decode** stays **GEMV** (matrix×vector) one token at a time — this dominates inter-token latency (ITL).
+
+Improvements were done in **3 stages** (132 prompt tokens, RX 7900 XTX / gfx1100, `make log.push` equivalent):
+
+| Stage | Method | prefill tok/s | Speedup vs stage 0 |
+|-------|--------|---------------|-------------------|
+| 0 (before) | One `forward_gpu` per token (GEMV × S) | 28.7 | 1.0× |
+| 1 | Batched `forward_prefill_gpu` + custom `mm_f16_gemv_batch_kernel` | 54 | 1.9× |
+| 2 | Above + **hipBLAS GemmEx** ([llama.cpp](https://github.com/ggml-org/llama.cpp/) `cublasGemmEx` equivalent) | **~550** | **~19×** |
+
+Stage 2 highlights:
+
+- **Matmul**: `O[S,d] = X[S,n] @ W[d,n]^T` via **`hipblasGemmEx(OP_T, OP_N, ...)`** (FP16 weights, FP16 activations, FP32 output).
+- **Activation conversion**: `f32_to_f16_batch_kernel` → **`d_scratch_f16`**. Shared inputs (q/k/v, gate/up) convert **once**.
+- **Attention / RoPE / Norm / FFN activations** remain custom HIP batch kernels (`attn_flash_prefill_kernel`, etc.).
+- Startup log **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** confirms the hipBLAS path is active.
+
+Decode throughput (~26 tok/s) is largely unchanged. Long prompts: **TTFT (Time To First Token)** tracks Prefill speed.
 
 ### Run
 
@@ -429,6 +463,25 @@ make log.push BENCH_N=64         # override generation length, etc.
 ```
 
 One line per entry (pipe-separated): **`timestamp|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
+
+### WMMA usage check (`make wmma`)
+
+Prefill linear layers go through **hipBLAS / rocBLAS**; **`main.c` does not embed WMMA / rocWMMA / MFMA directly** (Prefill GEMM is delegated to hipBLAS). **`make wmma`** verifies:
+
+- **`main.c` / `qwen3-rocm` binary** has **no WMMA instructions** (expected)
+- **`wmma-probe`** (gfx11 calibration binary) **does** contain WMMA (calibrates `llvm-objdump` detection)
+- **rocBLAS** bundled ISA may contain WMMA (0 is OK — FMAC path WARN possible)
+- Optional: runtime log **`Prefill linear: hipBLAS GemmEx`**, **`rocprofv3`** kernel trace
+
+```bash
+cd qwen3-8b/gpu-rocm
+make wmma                           # build + wmma-probe + checks (needs MODEL)
+make wmma WMMA_SKIP_RUN=1           # static checks only (no MODEL)
+make wmma WMMA_SKIP_ROCPROF=0       # also try rocprofv3 kernel ISA
+make wmma-probe                     # build calibration binary only
+```
+
+See [`doc/design.md`](doc/design.md) ROCm build section and **`scripts/check_wmma.sh`**.
 
 ## CUDA GPU (NVIDIA)
 
@@ -754,6 +807,18 @@ rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
 make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 
+### ROCm Prefill is slow (~30 tok/s)
+
+Check startup log for **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`**. If missing or prefill is very slow, **`make -C gpu-rocm clean build`** and confirm **`-lhipblas -lrocblas`** are linked. See **“Prefill acceleration (overview)”** above and **`doc/design.md`**, section **“ROCm Prefill acceleration (3 stages)”**.
+
+### **`undefined reference to hipblas*`** / hipBLAS link failure
+
+Verify **`libhipblas.so`** / **`librocblas.so`** under **`$(ROCM)/lib`**. Reinstall ROCm or fix **`ROCM=`** path if needed.
+
+### **`make wmma` fails**
+
+Possible causes: **WMMA instructions in `qwen3-rocm` binary** (unexpected), **hipBLAS path not reported**, **`wmma-probe` calibration failure**. Try **`make wmma WMMA_SKIP_RUN=1`** for static checks only. Set **`LLVM_OBJDUMP=$(ROCM)/llvm/bin/llvm-objdump`**. Use **`WMMA_SKIP_RUN=1`** when MODEL is not available.
+
 ### `/dev/accel/accel0` opens but `CREATE_HWCTX` returns `EINVAL`
 
 The driver may reject column/tile settings. Try `XDNA_NUM_COL=1` and check `dmesg` for `amdxdna` (see `doc/design.md`).
@@ -777,7 +842,7 @@ Suggested order:
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
 5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention; Q8_K activations + AVX2 integer dots for all quant types (layer-shared Q8). RoPE cache, **`lm_mode`** (prefill LM skip / greedy **`mm_argmax_row`**), F16 emb F16C. See **`doc/design.md`**, section **“`cpu-blas`: Q8_K activation GEMV”**.
-6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling. **Prefill progress bar** and throughput summaries (same as **`cpu-blas`**). Benchmark history via **`make log` / `make log.push`** in **`gpu-rocm/Makefile`**.
+6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling. **Prefill**: **`forward_prefill_gpu`** (**hipBLAS GemmEx** + batch Attention/Norm, etc.). **Decode**: **`forward_gpu`**. **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. **`make wmma`** (**`wmma_probe.c`** / **`scripts/check_wmma.sh`**) to verify hipBLAS path. Prefill details in **`doc/design.md`**, section **“ROCm Prefill acceleration (3 stages)”**.
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).
 

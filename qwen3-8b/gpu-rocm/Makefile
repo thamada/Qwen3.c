@@ -15,7 +15,17 @@ BENCH_PROMPT ?= Artificial intelligence has transformed many industries over the
 BENCH_N      ?= 128
 BENCH_SEED   ?= 42
 
-.PHONY: build run clean detect-gpu-arch log log.push
+.PHONY: build run clean detect-gpu-arch log log.push wmma wmma-probe
+
+LLVM_OBJDUMP ?= $(ROCM)/llvm/bin/llvm-objdump
+
+# WMMA check (make wmma): static + rocBLAS lib ISA + optional runtime (needs MODEL)
+# Static-only without model: make wmma WMMA_SKIP_RUN=1
+# Enable rocprof runtime ISA: make wmma WMMA_SKIP_ROCPROF=0
+WMMA_PROMPT      ?= Hello
+WMMA_N           ?= 0
+WMMA_SKIP_RUN    ?= 0
+WMMA_SKIP_ROCPROF ?= 1
 
 # -----------------------------------------------------------------------------
 # GPU architecture (auto-detect via rocminfo, or override on command line)
@@ -46,7 +56,25 @@ run: build
 	./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
 
 clean:
-	rm -f qwen3-rocm
+	rm -f qwen3-rocm wmma-probe
+
+# -----------------------------------------------------------------------------
+# WMMA usage check (make wmma)
+# -----------------------------------------------------------------------------
+
+wmma-probe: detect-gpu-arch
+	$(HIPCC) -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+		--offload-arch=$(GPU_ARCH) \
+		$(if $(findstring gfx11,$(GPU_ARCH)),-DWMMA_PROBE_HAS_GFX11=1,) \
+		-o wmma-probe -x hip wmma_probe.c \
+		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib
+
+wmma: build wmma-probe
+	@GPU_ARCH=$(GPU_ARCH) MODEL="$(MODEL)" ROCM=$(ROCM) \
+		LLVM_OBJDUMP="$(LLVM_OBJDUMP)" \
+		WMMA_PROMPT="$(WMMA_PROMPT)" WMMA_N=$(WMMA_N) \
+		WMMA_SKIP_RUN=$(WMMA_SKIP_RUN) WMMA_SKIP_ROCPROF=$(WMMA_SKIP_ROCPROF) \
+		bash scripts/check_wmma.sh
 
 # -----------------------------------------------------------------------------
 # Benchmark log (make log / make log.push)

@@ -38,7 +38,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす。**Prefill progress bar** とスループット要約を stderr に出力 |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は **Q8_K 活性化 + 全型 AVX2 整数内積**（層内 Q8 共有）。**RoPE キャッシュ**、prefill 中 **LM head スキップ**、greedy 時 **`mm_argmax_row`**。**F16 埋め込み F16C**。stderr に **Prefill progress bar** |
-| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴 |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴。**`make wmma`** で hipBLAS 経路・WMMA 非埋め込みを確認 |
 | CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。集約 `Makefile` 外 |
 | CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。集約 `Makefile` 外 |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
@@ -71,7 +71,10 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     │   └── main.c
     ├── gpu-rocm/
     │   ├── Makefile
-    │   └── main.c
+    │   ├── main.c
+    │   ├── wmma_probe.c          （`make wmma-probe` — WMMA 検出器校正）
+    │   └── scripts/
+    │       └── check_wmma.sh     （`make wmma`）
     ├── gpu-cuda/                    （FP16 線形層・NVFP4 なし）
     │   ├── Makefile
     │   ├── main.c
@@ -408,7 +411,7 @@ ROCm 版は Prefill（プロンプト処理）と Decode（トークン生成）
 | **Prefill** | `forward_prefill_gpu` | **hipBLAS `GemmEx`** | プロンプト **S トークン** を **1 回の forward** で並列処理 |
 | **Decode** | `forward_gpu` | カスタム **GEMV** | 生成トークンを **1 つずつ** 処理 |
 
-**なぜ Prefill だけ速くできるか**（詳細は [`doc/design.md`](doc/design.md) の **「ROCm Prefill 高速化の詳細」**）:
+**なぜ Prefill だけ速くできるか**（詳細は [`doc/design.md`](doc/design.md) の **「ROCm Prefill 高速化の詳細（3 段階）」**）:
 
 1. **Prefill** ではプロンプト全トークンが既知なので、線形層を **S×d の GEMM**（行列×行列）としてまとめられる。重み HBM 読み出しを **S トークン分で割れる**。
 2. **Decode** は 1 トークンずつ **GEMV**（行列×ベクトル）のまま。これが ITL（トークン間レイテンシ）の主体。
@@ -458,6 +461,25 @@ make log.push BENCH_N=64         # 生成トークン数など上書き可
 ```
 
 1 行形式（パイ区切り）: **`日時|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
+
+### WMMA 利用状況の確認（`make wmma`）
+
+Prefill 線形層は **hipBLAS / rocBLAS** ライブラリ経由であり、**`main.c` に WMMA / rocWMMA / MFMA を直接書いていません**（Prefill GEMM は hipBLAS に委譲）。**`make wmma`** で次を確認できます。
+
+- **`main.c` / `qwen3-rocm` バイナリ**に WMMA 命令が無いこと（正常）
+- **`wmma-probe`**（gfx11 向け校正用バイナリ）に WMMA があること（`llvm-objdump` 検出器の校正）
+- **rocBLAS** バンドル ISA に WMMA があるか（0 件でも FMAC 経路の WARN がありうる）
+- 任意: 実行時ログ **`Prefill linear: hipBLAS GemmEx`**、**`rocprofv3`** カーネル trace
+
+```bash
+cd qwen3-8b/gpu-rocm
+make wmma                           # build + wmma-probe + チェック（MODEL 要）
+make wmma WMMA_SKIP_RUN=1           # 静的チェックのみ（MODEL 不要）
+make wmma WMMA_SKIP_ROCPROF=0       # rocprofv3 カーネル ISA も試行
+make wmma-probe                     # 校正用 wmma-probe のみビルド
+```
+
+詳細は [`doc/design.md`](doc/design.md) の ROCm ビルド節と **`scripts/check_wmma.sh`** を参照。
 
 ## CUDA GPU 版（NVIDIA）
 
@@ -781,6 +803,18 @@ rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
 make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 
+### ROCm Prefill が遅い（~30 tok/s 程度）
+
+起動ログに **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** があるか確認してください。無い場合や prefill が極端に遅い場合は **`make -C gpu-rocm clean build`** で再ビルドし、**`-lhipblas -lrocblas`** がリンクされているか確認します。詳細は上記 **「Prefill 高速化（概要）」** と **`doc/design.md`** の **「ROCm Prefill 高速化の詳細（3 段階）」** を参照。
+
+### **`undefined reference to hipblas*`** / hipBLAS リンク失敗
+
+**`$(ROCM)/lib`** に **`libhipblas.so`** / **`librocblas.so`** があるか確認してください。ROCm の再インストールまたは **`ROCM=`** パスの修正が必要な場合があります。
+
+### **`make wmma` が FAIL**
+
+**`qwen3-rocm` バイナリに WMMA 命令が含まれる**、**hipBLAS 経路が報告されない**、**`wmma-probe` 校正失敗** 等が考えられます。まず **`make wmma WMMA_SKIP_RUN=1`** で静的チェックのみ実行。**`LLVM_OBJDUMP=$(ROCM)/llvm/bin/llvm-objdump`** を明示。MODEL 未配置時は **`WMMA_SKIP_RUN=1`** を使ってください。
+
 ### `/dev/accel/accel0` は開けるが `CREATE_HWCTX` が EINVAL
 
 ドライバが列数・タイル数の組み合わせを拒否していることがあります。`XDNA_NUM_COL=1` を試し、`dmesg` の `amdxdna` メッセージを確認してください（詳細は `doc/design.md` のトラブルシュート）。
@@ -815,7 +849,7 @@ make build.gpu-rocm GPU_ARCH=gfx1100
    OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。量子化 GEMV は Q8_K 活性化 + 全型 AVX2 整数内積（層内 Q8 共有）。RoPE キャッシュ、**`lm_mode`**（prefill LM スキップ / greedy **`mm_argmax_row`**）、F16 emb F16C。詳細は **`doc/design.md`** の **「`cpu-blas`：Q8_K 活性化 GEMV」** 節。
 
 6. `qwen3-8b/gpu-rocm/main.c`  
-   GPU メモリ、HIP カーネル、GPU サンプリング。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx** + バッチ Attention/Norm 等）。**Decode** は **`forward_gpu`**。**Prefill progress bar** とスループット要約。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細」**。
+   GPU メモリ、HIP カーネル、GPU サンプリング。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx** + バッチ Attention/Norm 等）。**Decode** は **`forward_gpu`**。**Prefill progress bar** とスループット要約。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴、**`make wmma`**（**`wmma_probe.c`** / **`scripts/check_wmma.sh`**）で hipBLAS 経路確認。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細（3 段階）」**。
 
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 版の Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。
