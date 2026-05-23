@@ -4,6 +4,37 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 16:23:31
+
+**`qwen3-8b/gpu-rocm/main.c`** — **Prefill バッチ forward**（CUDA **`gpu_forward_prefill`** と同趣旨）。Decode は従来どおり 1 トークン **`forward_gpu`**。
+
+#### `gpu-rocm/main.c`
+
+- **`forward_prefill_gpu`**: プロンプト全トークン（**`n_prompt > 1`**）を **1 回の GPU forward** で処理。teacher forcing ループを廃止。
+- **バッチ GPU バッファ**（**`Model`**: **`d_x_batch` / `d_xb_batch` / `d_q_batch` 等**、**`batch_cap = max_seq`**）を **`alloc_state_gpu`** で確保。
+- **Prefill 用カーネル**:
+  - **`emb_f16_batch_kernel`** — 全トークン embedding 一括。
+  - **`rmsnorm_batch_kernel`** / **`rmsnorm_head_batch_kernel`** — トークン次元バッチ RMSNorm。
+  - **`mm_f16_gemv_batch_kernel`** — 線形層 **S×d GEMM 相当**（重み行を全トークンで再利用）。
+  - **`rope_prefill_batch_kernel`** — 位置 **`t`** を token index として RoPE。
+  - **`kv_write_batch_kernel`** — K/V を **`0..n_tokens-1`** に一括書込。
+  - **`attn_flash_prefill_kernel`** — 因果マスク付き Flash Attention（位置 **`t`** は **`0..t`** のみ参照）。**`n_tokens × n_heads`** block 並列。
+  - **`silu_mul_batch_kernel`** / **`vec_add_batch_kernel`** — FFN・残差のバッチ版。
+- **Prefill 終了時**: 最終プロンプト token の hidden に **`output_norm` + LM head**（**`launch_mm_f16`**）で logits を 1 回だけ計算。
+- **Decode**: **`forward_gpu`**（**`mm_f16_gemv_kernel`** + **`attn_flash_decode_kernel_hd128`**）を生成トークンごとに実行。
+- **`generate`**: **`n_prompt > 1`** → **`forward_prefill_gpu`** → サンプル＋decode ループ。**`n_prompt == 1`** は **`forward_gpu(prompt[0], 0, 1)`** にフォールバック。
+- **Prefill progress bar**: バッチ prefill 中は **0 → 完了** の 2 段表示（トークン単位の `\r` 更新はしない）。
+
+#### `gpu-rocm/Makefile`
+
+- **`BENCH_LOG`** サンプル行を 1 件追加（**`2026-05-23T16:22:01|gfx1100|…`**）。
+
+#### ドキュメント
+
+**`doc/design.md`**: **`gpu-rocm`** のバリアント表・ディレクトリ表・実行時挙動・ROCm forward 節・生成ループを上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 16:05:09
 
 **`qwen3-8b/gpu-rocm/Makefile`** — **`make log`** 表表示の列幅調整と **`BENCH_LOG`** 日時形式の統一。
