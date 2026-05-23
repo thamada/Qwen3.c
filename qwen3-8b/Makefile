@@ -81,11 +81,10 @@ run.cpu-blas: build.cpu-blas
 # HIPCC が無い環境ではビルドを省略（gpu-rocm/Makefile の既定パスと一致させること）
 ROCM     ?= /opt/rocm
 HIPCC    ?= $(ROCM)/bin/hipcc
-GPU_ARCH ?= gfx1201
 
 build.gpu-rocm:
 	@if [ -x "$(HIPCC)" ]; then \
-		cd gpu-rocm && make build ROCM="$(ROCM)" HIPCC="$(HIPCC)" GPU_ARCH="$(GPU_ARCH)"; \
+		cd gpu-rocm && make build ROCM="$(ROCM)" HIPCC="$(HIPCC)" $(if $(GPU_ARCH),GPU_ARCH="$(GPU_ARCH)"); \
 	else \
 		echo "Skipping build.gpu-rocm: HIPCC ($(HIPCC)) not found"; \
 	fi

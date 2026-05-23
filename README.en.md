@@ -166,16 +166,16 @@ At run time, set **`OMP_NUM_THREADS`** for CPU parallelism. OpenBLAS is fixed to
 
 ### ROCm/HIP build
 
-You need an AMD GPU and ROCm. The `Makefile` assumes ROCm under `/opt/rocm` by default.
+You need an AMD GPU and ROCm. The `Makefile` assumes ROCm under `/opt/rocm` by default. **`GPU_ARCH`** (for `hipcc --offload-arch`) is **auto-detected from `rocminfo`**.
 
 Check:
 
 ```bash
 /opt/rocm/bin/hipcc --version
-rocminfo | grep -m 1 gfx
+make -C gpu-rocm detect-gpu-arch   # e.g. Detected GPU arch: gfx1100
 ```
 
-Pass the `gfx…` value from `rocminfo` as `GPU_ARCH` at build time.
+If `rocminfo` does not report a GPU, pass **`GPU_ARCH=gfx1100`** (or your ISA) manually at build time.
 
 ### CUDA build
 
@@ -369,25 +369,34 @@ make run.cpu-blas PROMPT="Hello, how are you?"
 
 The primary path when ROCm and an AMD GPU are available.
 
-### Find `GPU_ARCH`
+### `GPU_ARCH` (auto-detect)
 
-```bash
-rocminfo | grep -m 1 gfx
+`gpu-rocm/Makefile` **auto-detects** the first GPU agent name (`gfx*`) from **`$(ROCM)/bin/rocminfo`** as **`GPU_ARCH`** before building. On success you will see:
+
+```text
+===============================================
+  Detected GPU arch: gfx1100
+===============================================
 ```
 
-If you see e.g. `gfx1201`, build with `GPU_ARCH=gfx1201`.
+To override manually:
+
+```bash
+make build GPU_ARCH=gfx1100          # inside gpu-rocm/
+make build.gpu-rocm GPU_ARCH=gfx1100 # from qwen3-8b/
+```
 
 ### Build
 
 ```bash
 cd qwen3-8b
-make build.gpu-rocm GPU_ARCH=gfx1201
+make build.gpu-rocm
 ```
 
 If ROCm is not under `/opt/rocm`:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm
 ```
 
 Produces **`gpu-rocm/qwen3-rocm`**.
@@ -403,7 +412,7 @@ Produces **`gpu-rocm/qwen3-rocm`**.
 Using `run.gpu-rocm`:
 
 ```bash
-make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="Short explanation in English."
+make run.gpu-rocm PROMPT="Short explanation in English."
 ```
 
 ## CUDA GPU (NVIDIA)
@@ -718,18 +727,15 @@ ls /opt/rocm/bin/hipcc
 If elsewhere:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm
 ```
 
-### Wrong `GPU_ARCH`
+### Wrong `GPU_ARCH` / detection failed
 
-Must match the GPU ISA:
-
-```bash
-rocminfo | grep -m 1 gfx
-```
+Must match the GPU ISA. Normally **`GPU_ARCH`** is auto-detected from `rocminfo`; if detection fails or you need a different target, set it manually:
 
 ```bash
+rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
 make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 

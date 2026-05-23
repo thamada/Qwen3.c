@@ -166,16 +166,16 @@ make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 
 ### ROCm/HIP 版を使う場合
 
-AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。
+AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。`GPU_ARCH`（`hipcc --offload-arch`）は **`rocminfo` から自動検出**されます。
 
 確認例:
 
 ```bash
 /opt/rocm/bin/hipcc --version
-rocminfo | grep -m 1 gfx
+make -C gpu-rocm detect-gpu-arch   # 例: Detected GPU arch: gfx1100
 ```
 
-`rocminfo` で表示される `gfx1201` などの値を、ビルド時の `GPU_ARCH` に指定します。
+`rocminfo` が GPU を報告しない環境では、ビルド時に `GPU_ARCH=gfx1100` のように手動指定してください。
 
 ### CUDA 版を使う場合
 
@@ -367,25 +367,34 @@ make run.cpu-blas PROMPT="Hello, how are you?"
 
 AMD GPU と ROCm が使える環境では、こちらが本命です。
 
-### GPU_ARCH を確認する
+### GPU_ARCH（自動検出）
 
-```bash
-rocminfo | grep -m 1 gfx
+`gpu-rocm/Makefile` は、ビルド前に `$(ROCM)/bin/rocminfo` から最初の GPU エージェント名（`gfx*`）を **`GPU_ARCH` として自動検出**します。成功すると次のように表示されます:
+
+```text
+===============================================
+  Detected GPU arch: gfx1100
+===============================================
 ```
 
-例として `gfx1201` と表示されたら、ビルド時に `GPU_ARCH=gfx1201` を指定します。
+手動で上書きする場合:
+
+```bash
+make build GPU_ARCH=gfx1100          # gpu-rocm/ 内
+make build.gpu-rocm GPU_ARCH=gfx1100 # qwen3-8b/ から
+```
 
 ### ビルド
 
 ```bash
 cd qwen3-8b
-make build.gpu-rocm GPU_ARCH=gfx1201
+make build.gpu-rocm
 ```
 
 ROCm が `/opt/rocm` 以外にある場合:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm
 ```
 
 成功すると **`gpu-rocm/qwen3-rocm`** ができます。
@@ -401,7 +410,7 @@ make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
 `Makefile` の `run.gpu-rocm` を使う場合:
 
 ```bash
-make run.gpu-rocm GPU_ARCH=gfx1201 PROMPT="日本語で短く説明してください。"
+make run.gpu-rocm PROMPT="日本語で短く説明してください。"
 ```
 
 ## CUDA GPU 版（NVIDIA）
@@ -714,20 +723,15 @@ ls /opt/rocm/bin/hipcc
 別の場所にある場合:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm GPU_ARCH=gfx1201
+make build.gpu-rocm ROCM=/path/to/rocm
 ```
 
-### GPU_ARCH が合わない
+### GPU_ARCH が合わない / 検出に失敗する
 
-`GPU_ARCH` は実機の GPU ISA に合わせる必要があります。
-
-```bash
-rocminfo | grep -m 1 gfx
-```
-
-表示された値を使います。
+`GPU_ARCH` は実機の GPU ISA に合わせる必要があります。通常は `rocminfo` から自動検出されますが、検出に失敗したり別の GPU 向けにビルドしたい場合は手動指定してください。
 
 ```bash
+rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
 make build.gpu-rocm GPU_ARCH=gfx1100
 ```
 
