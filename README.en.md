@@ -38,7 +38,7 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU single-thread | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | Learning the flow, minimal setup. **Prefill progress bar** and throughput summary on stderr |
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV uses **Q8_K activations + AVX2 integer dots for all types** (layer-shared Q8). **RoPE cache**, prefill **LM head skip**, greedy **`mm_argmax_row`**. **F16 embedding via F16C**. **Prefill progress bar** on stderr |
-| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | Practical speed on AMD GPUs. **Prefill progress bar** (`Prefill [====...]`, width 40) and prefill / decode / total throughput summaries on stderr. Benchmark history via **`make log` / `make log.push`** in **`gpu-rocm/Makefile`** |
 | CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). Not in aggregate `Makefile` |
 | CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Not in aggregate `Makefile` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
@@ -415,6 +415,21 @@ Using `run.gpu-rocm`:
 make run.gpu-rocm PROMPT="Short explanation in English."
 ```
 
+During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). On exit, stdout also prints **`prefill_tps:` / `decode_tps:` / `total_tps:`** for **`make log.push`** to parse (**inference only**; model weight H2D is excluded).
+
+### Benchmark history (`gpu-rocm/Makefile`)
+
+From **`gpu-rocm/`**, **`make log.push`** runs a benchmark with the default long prompt (~128 tokens), **`-n 128`**, and **`-t 0`**, then appends the result to **`BENCH_LOG`** in the Makefile. **`make log`** prints the history as a table.
+
+```bash
+cd qwen3-8b/gpu-rocm
+make log.push                    # default BENCH_N=128, BENCH_SEED=42
+make log                         # show history
+make log.push BENCH_N=64         # override generation length, etc.
+```
+
+One line per entry (pipe-separated): **`timestamp|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
+
 ## CUDA GPU (NVIDIA)
 
 For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build under **`gpu-cuda/`** (FP16) or **`gpu-cuda-nvfp4/`** (NVFP4) depending on your GPU. Prompts run as a **prefill batch**; generation is **one-token decode**; attention uses **Flash Attention** (GQA).
@@ -762,7 +777,7 @@ Suggested order:
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
 5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention; Q8_K activations + AVX2 integer dots for all quant types (layer-shared Q8). RoPE cache, **`lm_mode`** (prefill LM skip / greedy **`mm_argmax_row`**), F16 emb F16C. See **`doc/design.md`**, section **“`cpu-blas`: Q8_K activation GEMV”**.
-6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling.
+6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling. **Prefill progress bar** and throughput summaries (same as **`cpu-blas`**). Benchmark history via **`make log` / `make log.push`** in **`gpu-rocm/Makefile`**.
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).
 

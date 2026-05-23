@@ -2314,6 +2314,11 @@ static void throughput_summary(int n_prefill, double prefill_sec,
     fprintf(stderr, "  prefill: %.2f tok/s\n", prefill_tps);
     fprintf(stderr, "  decode:  %.2f tok/s\n", decode_tps);
     fprintf(stderr, "  total:   %.2f tok/s\n", total_tps);
+    /* Inference-only lines for make log.push (excludes model weight H2D). */
+    printf("--- benchmark ---\n");
+    printf("prefill_tps: %.2f\n", prefill_tps);
+    printf("decode_tps: %.2f\n", decode_tps);
+    printf("total_tps: %.2f\n", total_tps);
 }
 
 /* ================================================================
