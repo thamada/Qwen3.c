@@ -40,7 +40,7 @@ build: detect-gpu-arch
 		--offload-arch=$(GPU_ARCH) \
 		-I$(ROCM)/include \
 		-o qwen3-rocm -x hip main.c \
-		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib
+		-L$(ROCM)/lib -lamdhip64 -lhipblas -lrocblas -Wl,-rpath,$(ROCM)/lib
 
 run: build
 	./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
@@ -57,6 +57,7 @@ clean:
 BENCH_LOG :=
 BENCH_LOG += 2026-05-23T15:54:16|gfx1100|7d630c88a170|132|8|28.74|29.35|28.77
 BENCH_LOG += 2026-05-23T16:22:01|gfx1100|7d630c88a170|132|16|53.95|25.49|48.14
+BENCH_LOG += 2026-05-23T16:37:12|gfx1100|7d630c88a170|132|16|549.94|25.67|171.41
 # BENCH_LOG_END
 
 log:

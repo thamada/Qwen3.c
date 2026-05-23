@@ -38,7 +38,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす。**Prefill progress bar** とスループット要約を stderr に出力 |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は **Q8_K 活性化 + 全型 AVX2 整数内積**（層内 Q8 共有）。**RoPE キャッシュ**、prefill 中 **LM head スキップ**、greedy 時 **`mm_argmax_row`**。**F16 埋め込み F16C**。stderr に **Prefill progress bar** |
-| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU で実用的な速度を狙う。**Prefill progress bar**（`Prefill [====...]`、幅 40）と prefill / decode / total のスループット要約を stderr に出力。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** でベンチ履歴 |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴 |
 | CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。集約 `Makefile` 外 |
 | CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。集約 `Makefile` 外 |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
@@ -397,7 +397,38 @@ ROCm が `/opt/rocm` 以外にある場合:
 make build.gpu-rocm ROCM=/path/to/rocm
 ```
 
-成功すると **`gpu-rocm/qwen3-rocm`** ができます。
+成功すると **`gpu-rocm/qwen3-rocm`** ができます。リンクには **`-lhipblas -lrocblas`** が含まれます（Prefill 線形層の GEMM 用）。
+
+### Prefill 高速化（概要）
+
+ROCm 版は Prefill（プロンプト処理）と Decode（トークン生成）を **分離** しています。
+
+| フェーズ | 関数 | 線形層 | 説明 |
+|----------|------|--------|------|
+| **Prefill** | `forward_prefill_gpu` | **hipBLAS `GemmEx`** | プロンプト **S トークン** を **1 回の forward** で並列処理 |
+| **Decode** | `forward_gpu` | カスタム **GEMV** | 生成トークンを **1 つずつ** 処理 |
+
+**なぜ Prefill だけ速くできるか**（詳細は [`doc/design.md`](doc/design.md) の **「ROCm Prefill 高速化の詳細」**）:
+
+1. **Prefill** ではプロンプト全トークンが既知なので、線形層を **S×d の GEMM**（行列×行列）としてまとめられる。重み HBM 読み出しを **S トークン分で割れる**。
+2. **Decode** は 1 トークンずつ **GEMV**（行列×ベクトル）のまま。これが ITL（トークン間レイテンシ）の主体。
+
+改善は **3 段階** で行った（132 prompt tokens、RX 7900 XTX / gfx1100、`make log.push` 相当）:
+
+| 段階 | 方式 | prefill tok/s | 倍率（対段階 0） |
+|------|------|---------------|------------------|
+| 0（改善前） | 1 トークンずつ `forward_gpu`（GEMV × S 回） | 28.7 | 1.0× |
+| 1 | バッチ `forward_prefill_gpu` + カスタム `mm_f16_gemv_batch_kernel` | 54 | 1.9× |
+| 2 | 上記 + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) `cublasGemmEx` 同型） | **~550** | **~19×** |
+
+段階 2 の要点:
+
+- **行列積**: `O[S,d] = X[S,n] @ W[d,n]^T` を **`hipblasGemmEx(OP_T, OP_N, ...)`** で実行（FP16 重み・FP16 活性・FP32 出力）。
+- **活性化変換**: `f32_to_f16_batch_kernel` で **`d_scratch_f16`** に変換。q/k/v や gate/up など **同一入力** は変換 **1 回** で使い回し。
+- **Attention / RoPE / Norm / FFN 活性化** は従来の HIP バッチカーネルのまま（`attn_flash_prefill_kernel` 等）。
+- 起動時に **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** と表示されれば hipBLAS 経路が有効。
+
+Decode スループット（~26 tok/s）は Prefill 改善の影響を受けない。長文プロンプトの **TTFT（Time To First Token）** が Prefill 速度に直結する。
 
 ### 実行
 
@@ -784,7 +815,7 @@ make build.gpu-rocm GPU_ARCH=gfx1100
    OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。量子化 GEMV は Q8_K 活性化 + 全型 AVX2 整数内積（層内 Q8 共有）。RoPE キャッシュ、**`lm_mode`**（prefill LM スキップ / greedy **`mm_argmax_row`**）、F16 emb F16C。詳細は **`doc/design.md`** の **「`cpu-blas`：Q8_K 活性化 GEMV」** 節。
 
 6. `qwen3-8b/gpu-rocm/main.c`  
-   GPU メモリ、HIP カーネル、GPU サンプリング。**Prefill progress bar** とスループット要約（**`cpu-blas`** 同形式）。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴。
+   GPU メモリ、HIP カーネル、GPU サンプリング。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx** + バッチ Attention/Norm 等）。**Decode** は **`forward_gpu`**。**Prefill progress bar** とスループット要約。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細」**。
 
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 版の Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。

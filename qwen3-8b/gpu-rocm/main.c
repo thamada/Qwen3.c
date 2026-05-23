@@ -23,7 +23,8 @@
  * Loading strategy: ALL quantized weights are dequantized on CPU at load time
  * to FP16, then uploaded to the device.
  *   - Prefill: 全プロンプトトークンを1回の forward で並列（forward_prefill_gpu）。
- *     線形層は mm_f16_gemv_batch_kernel（S×d の GEMM 相当）を使用。
+ *     線形層は hipBLAS GemmEx（llama.cpp の cublasGemmEx 経路と同趣旨）で S×d GEMM。
+ *     フォールバック: mm_f16_gemv_batch_kernel（カスタム GEMV バッチ）。
  *   - Decode:  1トークンずつ mm_f16_gemv_kernel（GEMV）+ FlashAttention decode。
  *
  * Build:
@@ -44,11 +45,20 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
+#include <hipblas/hipblas.h>
 
 #define HIPCHK(x) do { \
     hipError_t _hip_err = (x); \
     if (_hip_err != hipSuccess) { \
         fprintf(stderr, "%s:%d HIP error: %s\n", __FILE__, __LINE__, hipGetErrorString(_hip_err)); \
+        exit(1); \
+    } \
+} while (0)
+
+#define HIPBLASCHK(x) do { \
+    hipblasStatus_t _hb_err = (x); \
+    if (_hb_err != HIPBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "%s:%d hipBLAS error: %d\n", __FILE__, __LINE__, (int)_hb_err); \
         exit(1); \
     } \
 } while (0)
@@ -690,6 +700,9 @@ typedef struct {
     float *d_q_batch, *d_k_batch, *d_v_batch;
     int   *d_tokens;
     int    batch_cap;
+    hipblasHandle_t hipblas;
+    uint16_t *d_scratch_f16; /* FP16 activation scratch for hipBLAS prefill GEMM */
+    size_t scratch_f16_nelem;
     int *d_next_token;
     uint64_t *d_rng;
     float *d_blk_val;
@@ -1343,6 +1356,23 @@ static void alloc_state_gpu(Model *m) {
         HIPCHK(hipMalloc((void **)&m->d_hb2_batch, bc * (size_t)c->hidden_dim * sizeof(float)));
         HIPCHK(hipMalloc((void **)&m->d_tokens,    bc * sizeof(int)));
     }
+
+    size_t scratch_nelem = (size_t)c->max_seq * (size_t)c->hidden_dim;
+    m->scratch_f16_nelem = scratch_nelem;
+    HIPCHK(hipMalloc((void **)&m->d_scratch_f16, scratch_nelem * sizeof(uint16_t)));
+    HIPBLASCHK(hipblasCreate(&m->hipblas));
+}
+
+static void free_hipblas(Model *m) {
+    if (m->hipblas) {
+        hipblasDestroy(m->hipblas);
+        m->hipblas = NULL;
+    }
+    if (m->d_scratch_f16) {
+        HIPCHK(hipFree(m->d_scratch_f16));
+        m->d_scratch_f16 = NULL;
+    }
+    m->scratch_f16_nelem = 0;
 }
 
 static void free_state_gpu(Model *m) {
@@ -1381,6 +1411,7 @@ static void free_state_gpu(Model *m) {
     if (m->d_hb_batch)  HIPCHK(hipFree(m->d_hb_batch));
     if (m->d_hb2_batch) HIPCHK(hipFree(m->d_hb2_batch));
     if (m->d_tokens)    HIPCHK(hipFree(m->d_tokens));
+    free_hipblas(m);
     m->d_x_batch = m->d_xb_batch = m->d_xb2_batch = NULL;
     m->d_q_batch = m->d_k_batch = m->d_v_batch = NULL;
     m->d_hb_batch = m->d_hb2_batch = NULL;
@@ -1414,6 +1445,31 @@ __device__ static inline float dev_f16f32(uint16_t h) {
     union { uint32_t u; float fl; } cv;
     cv.u = f;
     return cv.fl;
+}
+
+__device__ static inline uint16_t dev_f32f16(float f) {
+    union { float fl; uint32_t u; } cv;
+    cv.fl = f;
+    uint32_t x = cv.u;
+    uint32_t sgn = (x >> 31) & 1u;
+    int32_t exp = (int32_t)((x >> 23) & 0xFFu) - 127;
+    uint32_t man = x & 0x7FFFFFu;
+    if (exp == 128) {
+        uint16_t h = (uint16_t)((sgn << 15) | 0x7C00u | (man ? 0x0200u : 0u));
+        return h;
+    }
+    if (exp > 15) return (uint16_t)((sgn << 15) | 0x7C00u);
+    if (exp < -14) return (uint16_t)(sgn << 15);
+    uint32_t new_exp = (uint32_t)(exp + 15);
+    uint32_t new_man = man >> 13;
+    if ((man >> 12) & 1u) new_man++;
+    return (uint16_t)((sgn << 15) | (new_exp << 10) | (new_man & 0x3FFu));
+}
+
+__global__ void f32_to_f16_batch_kernel(uint16_t *dst, const float *src, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = dev_f32f16(src[i]);
 }
 
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *w, int n, float eps) {
@@ -2359,8 +2415,36 @@ static void launch_mm_f16(float *o, const float *x, const uint16_t *w, int n, in
     mm_f16_gemv_kernel<<<blocks, GEMV_THREADS>>>(o, x, w, n, d);
 }
 
-static void launch_mm_f16_batch(float *o, const float *x, const uint16_t *w,
-                                int n, int d, int n_tokens) {
+static void launch_f32_to_f16_batch(uint16_t *dst, const float *src, int n) {
+    f32_to_f16_batch_kernel<<<(n + 255) / 256, 256>>>(dst, src, n);
+}
+
+/* llama.cpp ggml_cuda_op_mul_mat_cublas と同じ行列レイアウト:
+ * O[S,d] = X[S,n] * W[d,n]^T  (row-major, W は FP16 [d,n]) */
+static void launch_mm_f16_batch_hipblas(hipblasHandle_t handle, float *o,
+                                        const uint16_t *x_f16, const uint16_t *w,
+                                        int n, int d, int n_tokens) {
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    HIPBLASCHK(hipblasGemmEx(
+        handle,
+        HIPBLAS_OP_T, HIPBLAS_OP_N,
+        d, n_tokens, n,
+        &alpha,
+        w, HIPBLAS_R_16F, n,
+        x_f16, HIPBLAS_R_16F, n,
+        &beta,
+        o, HIPBLAS_R_32F, d,
+        HIPBLAS_COMPUTE_32F,
+        HIPBLAS_GEMM_DEFAULT));
+}
+
+static void launch_mm_f16_batch(Model *m, float *o, const float *x, const uint16_t *w,
+                                int n, int d, int n_tokens, const uint16_t *x_f16) {
+    if (m->hipblas && n_tokens >= 2 && x_f16) {
+        launch_mm_f16_batch_hipblas(m->hipblas, o, x_f16, w, n, d, n_tokens);
+        return;
+    }
     int blocks = (d + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
     mm_f16_gemv_batch_kernel<<<blocks, GEMV_THREADS>>>(o, x, w, n, d, n_tokens);
 }
@@ -2407,12 +2491,13 @@ static void forward_prefill_gpu(Model *m, const int *tokens, int n_tokens) {
         rmsnorm_batch_kernel<<<n_tokens, 256>>>(
             m->d_xb_batch, m->d_x_batch, wd->norm_att[l], dim, n_tokens, c->norm_eps);
 
-        launch_mm_f16_batch(m->d_q_batch, m->d_xb_batch, (const uint16_t *)wd->wq[l],
-                            dim, qdim, n_tokens);
-        launch_mm_f16_batch(m->d_k_batch, m->d_xb_batch, (const uint16_t *)wd->wk[l],
-                            dim, kv_dim, n_tokens);
-        launch_mm_f16_batch(m->d_v_batch, m->d_xb_batch, (const uint16_t *)wd->wv[l],
-                            dim, kv_dim, n_tokens);
+        launch_f32_to_f16_batch(m->d_scratch_f16, m->d_xb_batch, dim * n_tokens);
+        launch_mm_f16_batch(m, m->d_q_batch, m->d_xb_batch, (const uint16_t *)wd->wq[l],
+                            dim, qdim, n_tokens, m->d_scratch_f16);
+        launch_mm_f16_batch(m, m->d_k_batch, m->d_xb_batch, (const uint16_t *)wd->wk[l],
+                            dim, kv_dim, n_tokens, m->d_scratch_f16);
+        launch_mm_f16_batch(m, m->d_v_batch, m->d_xb_batch, (const uint16_t *)wd->wv[l],
+                            dim, kv_dim, n_tokens, m->d_scratch_f16);
 
         rmsnorm_head_batch_kernel<<<n_tokens * n_heads, 256>>>(
             m->d_q_batch, wd->q_norm[l], n_heads, hd, n_tokens, c->norm_eps);
@@ -2438,24 +2523,27 @@ static void forward_prefill_gpu(Model *m, const int *tokens, int n_tokens) {
             m->d_xb_batch, m->d_q_batch, s->kc + loff, s->vc + loff,
             n_tokens, n_heads, hd, kv_dim, kv_mul, attn_scale);
 
-        launch_mm_f16_batch(m->d_xb2_batch, m->d_xb_batch, (const uint16_t *)wd->wo[l],
-                            qdim, dim, n_tokens);
+        launch_f32_to_f16_batch(m->d_scratch_f16, m->d_xb_batch, qdim * n_tokens);
+        launch_mm_f16_batch(m, m->d_xb2_batch, m->d_xb_batch, (const uint16_t *)wd->wo[l],
+                            qdim, dim, n_tokens, m->d_scratch_f16);
         vec_add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
             m->d_x_batch, m->d_xb2_batch, dim, n_tokens);
 
         rmsnorm_batch_kernel<<<n_tokens, 256>>>(
             m->d_xb_batch, m->d_x_batch, wd->norm_ffn[l], dim, n_tokens, c->norm_eps);
 
-        launch_mm_f16_batch(m->d_hb_batch, m->d_xb_batch, (const uint16_t *)wd->gate[l],
-                            dim, hidden, n_tokens);
-        launch_mm_f16_batch(m->d_hb2_batch, m->d_xb_batch, (const uint16_t *)wd->up[l],
-                            dim, hidden, n_tokens);
+        launch_f32_to_f16_batch(m->d_scratch_f16, m->d_xb_batch, dim * n_tokens);
+        launch_mm_f16_batch(m, m->d_hb_batch, m->d_xb_batch, (const uint16_t *)wd->gate[l],
+                            dim, hidden, n_tokens, m->d_scratch_f16);
+        launch_mm_f16_batch(m, m->d_hb2_batch, m->d_xb_batch, (const uint16_t *)wd->up[l],
+                            dim, hidden, n_tokens, m->d_scratch_f16);
 
         silu_mul_batch_kernel<<<(n_tokens * hidden + 255) / 256, 256>>>(
             m->d_hb_batch, m->d_hb2_batch, hidden, n_tokens);
 
-        launch_mm_f16_batch(m->d_xb_batch, m->d_hb_batch, (const uint16_t *)wd->down[l],
-                            hidden, dim, n_tokens);
+        launch_f32_to_f16_batch(m->d_scratch_f16, m->d_hb_batch, hidden * n_tokens);
+        launch_mm_f16_batch(m, m->d_xb_batch, m->d_hb_batch, (const uint16_t *)wd->down[l],
+                            hidden, dim, n_tokens, m->d_scratch_f16);
         vec_add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
             m->d_x_batch, m->d_xb_batch, dim, n_tokens);
     }
@@ -2875,6 +2963,8 @@ int main(int argc, char *argv[]) {
         HIPCHK(hipGetDeviceProperties(&prop, 0));
         printf("ROCm HIP device 0: %s (gcnArchName: %s)\n", prop.name, prop.gcnArchName);
     }
+    if (model.hipblas)
+        printf("Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)\n");
 
     int n_prompt_tokens;
     int *prompt_tokens = chat_encode(&model.tok, prompt, &n_prompt_tokens);
