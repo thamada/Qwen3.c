@@ -4,6 +4,44 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 17:02:22
+
+**`qwen3-8b/gpu-rocm/`** — **WMMA 利用状況の確認**（**`make wmma`** / **`make wmma-probe`**）。
+
+#### 背景
+
+Prefill 線形層は **hipBLAS / rocBLAS** 経由であり、**`main.c` に WMMA / rocWMMA / MFMA を直接書いていない**。一方 rocBLAS 内部カーネルが gfx11 で **WMMA 命令**を使う場合がある。**`make wmma`** で「自前コードに WMMA が無いこと」「検出器が WMMA を拾えること」「ライブラリ側 ISA」をまとめて確認する。
+
+#### `gpu-rocm/Makefile`
+
+- **`wmma-probe`**: **`wmma_probe.c`** を **`hipcc`** でビルド（gfx11 時 **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`** を含む校正用バイナリ）。
+- **`wmma`**: **`build`** + **`wmma-probe`** の後 **`scripts/check_wmma.sh`** を実行。
+- **`clean`**: **`wmma-probe`** も削除。
+- 変数: **`WMMA_PROMPT`** / **`WMMA_N`** / **`WMMA_SKIP_RUN`**（既定 0）/ **`WMMA_SKIP_ROCPROF`**（既定 1）/ **`LLVM_OBJDUMP`**（既定 **`$(ROCM)/llvm/bin/llvm-objdump`**）。
+
+#### `scripts/check_wmma.sh`
+
+| 段階 | 内容 | 期待 |
+|------|------|------|
+| **static: source** | **`main.c`** に WMMA/MFMA/rocWMMA 参照が無い | OK |
+| **static: binary** | **`qwen3-rocm`** の objdump に WMMA 命令が無い | OK |
+| **probe** | **`wmma-probe`** に WMMA 命令あり（gfx11） | 検出器校正 |
+| **lib** | **`rocBLAS`** の **`Kernels.so-000-$(GPU_ARCH).hsaco`** に WMMA 有無 | 0 でも WARN（FMAC 経路の可能性） |
+| **path** | **`./qwen3-rocm`** 実行で **`Prefill linear: hipBLAS GemmEx`** | MODEL 要（**`WMMA_SKIP_RUN=1`** で省略可） |
+| **runtime** | **`rocprofv3 --kernel-trace`** で Prefill カーネル ISA | **`WMMA_SKIP_ROCPROF=0`** で有効化 |
+
+#### `wmma_probe.c`
+
+- gfx11 向け最小 HIP カーネル。**`make wmma`** の **`llvm-objdump`** による WMMA 検出が機能するかの校正用。
+
+#### ドキュメント
+
+**`README.md`** / **`README.en.md`**: 実行経路表・ディレクトリツリー・ROCm 節（**`make wmma`**）・トラブルシュート・「実装を読む順序」を上記に同期。
+
+**`doc/design.md`**: **`gpu-rocm`** ディレクトリ表・ROCm ビルド節（**`make wmma`**）・トラブルシュートを上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 16:40:33
 
 **`qwen3-8b/gpu-rocm/`** — Prefill 線形層を **hipBLAS `GemmEx`** に切替（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の `cublasGemmEx` 経路同趣旨）。Prefill スループット **~19×**（段階 0 比）。

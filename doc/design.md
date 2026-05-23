@@ -47,7 +47,9 @@
 | `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS。**Q8_K GEMV**（全型 AVX2 整数内積・層内 Q8 共有）、**RoPE キャッシュ**、**lm_mode**（prefill LM スキップ / greedy argmax）、**F16 emb F16C**。詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**。**Prefill progress bar** を stderr に出力。 |
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論（集約 Makefile の HIP ビルド対象）。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** でビルド（**`-lhipblas -lrocblas`**）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。未検出時はエラー。上書きは **`make GPU_ARCH=…`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`BENCH_LOG += …`** を Makefile 内に追記。日時は **`YYYY-MM-DDTHH:MM:SS`** ローカル、**`make log`** は列幅調整済み表表示）。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** でビルド（**`-lhipblas -lrocblas`**）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`make log`** / **`make log.push`** でベンチマーク履歴。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`clean`** は **`qwen3-rocm`** と **`wmma-probe`** を削除。 |
+| `qwen3-8b/gpu-rocm/wmma_probe.c` | gfx11 向け **WMMA 校正用**最小 HIP プローブ（**`__builtin_amdgcn_wmma_*`**）。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
+| `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（gfx11）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3`** カーネル trace。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（FP16 線形層）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。 |
 | `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。既定 **`make build` / `make run`**（FP16・PTX 既定）。**`build.polarquant`** / **`run.polarquant`**（**`BONSAI_POLARQUANT=1`**）、**`pq-test`**。**`KERNELS_OBJ`** / **`MAIN_OBJ`** は **`BONSAI_POLARQUANT`/`FA_BR` 別名で stale `.o` 回避。NVFP4 関連は含まない。 |
 | `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等。PolarQuant 時は KV を **`PQBlock`** 経路に切替。 |
@@ -179,15 +181,28 @@ cd gpu-rocm
 make log.push              # 既定 BENCH_PROMPT (~128 tok) / BENCH_N=128 / -t 0
 make log                   # Makefile 内 BENCH_LOG を表表示
 make log.push BENCH_N=64   # 生成トークン数など上書き可
+# WMMA 利用状況（hipBLAS 経路・自前コードに WMMA が無いことの確認）:
+cd gpu-rocm
+make wmma                           # build + wmma-probe + check_wmma.sh（MODEL 要）
+make wmma WMMA_SKIP_RUN=1           # 静的チェックのみ（MODEL 不要）
+make wmma WMMA_SKIP_ROCPROF=0       # rocprofv3 カーネル ISA も試行
+make wmma-probe                     # 校正用 wmma-probe のみビルド
 ```
 
 起動時に **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** が出れば Prefill 線形層は hipBLAS 経路が有効。Prefill / Decode の分離と 3 段階の改善経緯は **「ROCm Prefill 高速化の詳細（3 段階）」** を参照。
+
+**`make wmma`** は Prefill が **hipBLAS / rocBLAS ライブラリ経由**であること（**`main.c` に直接 WMMA を書いていない**こと）を **`llvm-objdump`** で検証する。**`qwen3-rocm` バイナリ自体に WMMA 命令が無い**のが正常。**rocBLAS** 内部カーネルに WMMA があるかは **`Kernels.so-000-$(GPU_ARCH).hsaco`** を参照（0 件でも FMAC 経路の WARN がありうる）。詳細は **`scripts/check_wmma.sh`** のコメント参照。
 
 | 変数（`gpu-rocm/Makefile`） | 意味 | 既定例 |
 |-----------------------------|------|--------|
 | `BENCH_PROMPT` | **`log.push`** のプロンプト文字列（~128 token 想定） | 英語長文（Makefile 内） |
 | `BENCH_N` | **`log.push`** の **`-n`**（生成トークン上限） | `128` |
 | `BENCH_SEED` | **`log.push`** の **`-s`** | `42` |
+| `WMMA_PROMPT` | **`make wmma`** 実行時プロンプト | `Hello` |
+| `WMMA_N` | **`make wmma`** の **`-n`**（0 で prefill のみ短時間） | `0` |
+| `WMMA_SKIP_RUN` | **`1`** で実行時チェック省略（静的 ISA のみ） | `0` |
+| `WMMA_SKIP_ROCPROF` | **`0`** で **`rocprofv3 --kernel-trace`** を試行 | `1` |
+| `LLVM_OBJDUMP` | WMMA 命令カウント用 **`llvm-objdump`** | **`$(ROCM)/llvm/bin/llvm-objdump`** |
 
 **`log.push`** の 1 行形式（パイ区切り）: **`YYYY-MM-DDTHH:MM:SS|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**（**`date +%Y-%m-%dT%H:%M:%S`**、タイムゾーンオフセットなし）。**`make log`** は上記を表表示（列幅調整。旧エントリに **`+00:00`** 等が付いていても表示時に除去）。スループットは推論のみ（prefill+decode）。モデル重み H2D は含まない。
 
@@ -796,6 +811,7 @@ hipblasGemmEx(handle,
 | **`launch_mm_f16_batch`** | **`n_tokens >= 2`** かつ **`x_f16 != NULL`** なら hipBLAS。それ以外は **`mm_f16_gemv_batch_kernel`**。 |
 | **Makefile** | **`-lhipblas -lrocblas`** を追加。 |
 | **起動ログ** | **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** |
+| **WMMA** | **`main.c` に直接 WMMA なし**（Prefill GEMM は hipBLAS → rocBLAS）。WMMA が rocBLAS 内部で使われるかはカーネル選択依存。**`make wmma`** で確認 |
 | **未変更** | **Decode**（**`mm_f16_gemv_kernel`**）、**Attention**（**`attn_flash_prefill_kernel`**）、サンプリング、重みロード。 |
 
 **なぜ段階 1 より大幅に速いか**:
@@ -900,6 +916,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | `hipcc` not found | `ROCM` 誤り | `make ROCM=/opt/rocm` 等 |
 | **`undefined reference to hipblas*`** / **`-lhipblas` リンク失敗** | ROCm の hipBLAS / rocBLAS 未インストール・不完全 | **`$(ROCM)/lib`** に **`libhipblas.so`** / **`librocblas.so`** があるか確認。ROCm 再インストールまたは **`ROCM=`** パス修正 |
 | **ROCm Prefill が遅い（~30 tok/s 程度）** | 古いバイナリ・hipBLAS 未リンク | 起動ログに **`Prefill linear: hipBLAS GemmEx`** があるか確認。**`make -C gpu-rocm clean build`**。詳細は **「ROCm Prefill 高速化の詳細（3 段階）」** |
+| **`make wmma` が FAIL** | **`qwen3-rocm` に WMMA 命令**・hipBLAS 経路未報告・**`wmma-probe` 校正失敗** | **`make -C gpu-rocm wmma WMMA_SKIP_RUN=1`** で静的のみ確認。**`llvm-objdump`** パス（**`LLVM_OBJDUMP=`**）。MODEL 未配置時は **`WMMA_SKIP_RUN=1`** |
 | ISA 不一致 / `GPU_ARCH not detected` | 自動検出失敗・手動指定の誤り | **`make -C gpu-rocm detect-gpu-arch`**。失敗時は **`rocminfo`** の **`Name: gfx*`** を確認し **`make build.gpu-rocm GPU_ARCH=…`** |
 | `nvcc` not found / `nvlink` 失敗 | `PATH` に CUDA `bin` が無い | `export PATH=/usr/local/cuda/bin:$PATH` または各 CUDA ディレクトリの **`Makefile`** の `CUDA_HOME` を確認 |
 | CUDA で PTX は動くが極端に遅い | `CUDA_GENCODE` が PTX のみ | 実機 **`sm_XX`** を `code=sm_XX` で指定して再ビルド（**`gpu-cuda`**） |
