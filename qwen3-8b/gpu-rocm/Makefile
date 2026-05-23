@@ -55,7 +55,7 @@ clean:
 # Throughput is inference-only (prefill+decode); model weight H2D is excluded.
 # BENCH_LOG_BEGIN — appended by make log.push
 BENCH_LOG :=
-BENCH_LOG += 2026-05-23T15:54:16+00:00|gfx1100|7d630c88a170|132|8|28.74|29.35|28.77
+BENCH_LOG += 2026-05-23T15:54:16|gfx1100|7d630c88a170|132|8|28.74|29.35|28.77
 # BENCH_LOG_END
 
 log:
@@ -68,14 +68,15 @@ log:
 	if [ "$$count" -eq 0 ]; then \
 		echo "  (no entries yet — run: make log.push)"; \
 	else \
-		printf "  %-20s %-10s %-12s %8s %8s %10s %10s %10s\n" \
+		printf "  %-19s %8s %14s %8s %6s %10s %10s %10s\n" \
 			"Date" "GPU" "Host" "Prompt" "Gen" "Prefill/s" "Decode/s" "Total/s"; \
-		printf "  %-20s %-10s %-12s %8s %8s %10s %10s %10s\n" \
-			"--------------------" "----------" "------------" "--------" "--------" "----------" "----------" "----------"; \
+		printf "  %-19s %8s %14s %8s %6s %10s %10s %10s\n" \
+			"-------------------" "--------" "--------------" "--------" "------" "----------" "----------" "----------"; \
 		sed -n '/^BENCH_LOG += /s/^BENCH_LOG += //p' Makefile | \
 		awk -F'|' '{ \
-			printf "  %-20s %-10s %-12s %8s %8s %10s %10s %10s\n", \
-				$$1, $$2, $$3, $$4, $$5, $$6, $$7, $$8 }'; \
+			date = $$1; sub(/[+].*$$/, "", date); \
+			printf "  %-19s %8s %14s %8s %6s %10s %10s %10s\n", \
+				date, $$2, $$3, $$4, $$5, $$6, $$7, $$8 }'; \
 	fi
 	@echo ""
 
@@ -97,7 +98,7 @@ log.push: build
 		echo "$$out" >&2; \
 		exit 1; \
 	fi; \
-	entry="BENCH_LOG += $$(date -Iseconds)|$(GPU_ARCH)|$$(hostname -s)|$$np|$$ng|$$pf|$$dc|$$tt"; \
+	entry="BENCH_LOG += $$(date +%Y-%m-%dT%H:%M:%S)|$(GPU_ARCH)|$$(hostname -s)|$$np|$$ng|$$pf|$$dc|$$tt"; \
 	sed -i "/^# BENCH_LOG_END/i $$entry" Makefile; \
 	echo ""; \
 	echo "Logged: $$np prompt + $$ng gen, prefill $${pf} / decode $${dc} / total $${tt} tok/s on $(GPU_ARCH)"; \
