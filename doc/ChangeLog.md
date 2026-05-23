@@ -4,6 +4,29 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 06:33:02
+
+**`qwen3-8b/gpu-rocm/`** — **`GPU_ARCH` の `rocminfo` 自動検出**と集約 Makefile の追随。
+
+#### `gpu-rocm/Makefile`
+
+- **`ROCMININFO`**（既定 **`$(ROCM)/bin/rocminfo`**）の awk で、最初の GPU エージェント **`Name: gfx*`** を **`GPU_ARCH`** に採用（**`GPU_ARCH ?= $(shell …)`**）。
+- **`detect-gpu-arch`** ターゲット: 検出成功時に **`Detected GPU arch: …`** を表示。未検出時はエラー終了（手動 **`GPU_ARCH=gfx1100`** を案内）。
+- **`build`** は **`detect-gpu-arch`** に依存。既定の固定 **`gfx1201`** は廃止。
+- 手動上書き: **`make build GPU_ARCH=gfx1100`** / **`make detect-gpu-arch`**。
+
+#### 集約 `qwen3-8b/Makefile`
+
+- ルートの **`GPU_ARCH ?= gfx1201`** を削除。**`build.gpu-rocm`** は **`gpu-rocm`** 側の自動検出に任せ、コマンドラインで **`GPU_ARCH`** が渡されたときだけ **`$(if $(GPU_ARCH),GPU_ARCH="…")`** で子 Makefile に転送。
+
+#### ドキュメント
+
+**`README.md`** / **`README.en.md`**: ROCm 節を自動検出前提に更新（**`make -C gpu-rocm detect-gpu-arch`**、集約 **`make build.gpu-rocm`** から **`GPU_ARCH` 省略可**、トラブルシュートの awk 例）。
+
+**`doc/design.md`**: 実装バリアント表・Make 変数表・ROCm ビルド例・制約・トラブルシュートを上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 04:53:10
 
 **`qwen3-8b/cpu-blas/`** — **IQ2_S / IQ3_S の AVX2 整数内積**、**RoPE キャッシュ**、**prefill LM head スキップ**、**greedy argmax 専用パス**、**F16 埋め込み F16C**。
