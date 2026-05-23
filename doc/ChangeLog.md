@@ -4,6 +4,41 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-23 16:40:33
+
+**`qwen3-8b/gpu-rocm/`** — Prefill 線形層を **hipBLAS `GemmEx`** に切替（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の `cublasGemmEx` 経路同趣旨）。Prefill スループット **~19×**（段階 0 比）。
+
+#### `gpu-rocm/main.c`
+
+- **`hipblasGemmEx`**（**`HIPBLAS_OP_T, HIPBLAS_OP_N`**）: **`O[S,d] = X[S,n] @ W[d,n]^T`**。FP16 重み・FP16 活性・FP32 出力（**`HIPBLAS_COMPUTE_32F`**）。
+- **`Model`**: **`hipblasHandle_t`**、**`d_scratch_f16`**（**`max_seq × hidden_dim`** 要素）を追加。**`alloc_state_gpu`** / **`free_hipblas`**。
+- **`f32_to_f16_batch_kernel`** / **`dev_f32f16`**: 活性 FP32 → FP16 変換。同一入力の q/k/v や gate/up は **変換 1 回**で使い回し。
+- **`launch_mm_f16_batch`**: **`n_tokens >= 2`** かつ **`x_f16 != NULL`** なら hipBLAS。それ以外は **`mm_f16_gemv_batch_kernel`** フォールバック。
+- 起動時 **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** を表示。
+
+#### `gpu-rocm/Makefile`
+
+- リンクに **`-lhipblas -lrocblas`** を追加。
+- **`BENCH_LOG`** サンプル行を 1 件追加（**`2026-05-23T16:37:12|…|549.94|25.67|171.41`**）。
+
+#### ベンチマーク（132 prompt tokens、RX 7900 XTX / gfx1100、`make log.push` 相当）
+
+| 段階 | prefill tok/s | 備考 |
+|------|---------------|------|
+| 0: 1 トークンずつ GEMV | 28.74 | 改善前 |
+| 1: バッチ + カスタム GEMV | 53.95 | 前コミット |
+| 2: hipBLAS GemmEx | **549.94** | 本変更 |
+
+Decode（~26 tok/s）はほぼ不変。詳細は **`doc/design.md`** **「ROCm Prefill 高速化の詳細（3 段階）」**。
+
+#### ドキュメント
+
+**`README.md`**: 実行経路表・ROCm 節（Prefill 高速化概要・3 段階ベンチ表）・「実装を読む順序」を上記に同期。
+
+**`doc/design.md`**: **`gpu-rocm`** のバリアント表・ディレクトリ表・実行時挙動・ROCm forward 節・**「ROCm Prefill 高速化の詳細（3 段階）」** を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 16:23:31
 
 **`qwen3-8b/gpu-rocm/main.c`** — **Prefill バッチ forward**（CUDA **`gpu_forward_prefill`** と同趣旨）。Decode は従来どおり 1 トークン **`forward_gpu`**。
