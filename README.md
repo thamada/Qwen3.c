@@ -39,8 +39,8 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は **Q8_K 活性化 + 全型 AVX2 整数内積**（層内 Q8 共有）。**RoPE キャッシュ**、prefill 中 **LM head スキップ**、greedy 時 **`mm_argmax_row`**。**F16 埋め込み F16C**。stderr に **Prefill progress bar** |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴。**`make wmma`** で hipBLAS 経路・WMMA 非埋め込みを確認 |
-| CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。集約 `Makefile` 外 |
-| CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。集約 `Makefile` 外 |
+| CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。**Prefill progress bar** とスループット要約。**`make log` / `make log.push`** ベンチ履歴。集約 `Makefile` 外 |
+| CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。**`make log` / `make log.push`** ベンチ履歴。集約 `Makefile` 外 |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
@@ -205,6 +205,8 @@ nvidia-smi
 | CUDA 13 の導入から NVFP4 一式 | `cd qwen3-8b/gpu-cuda-nvfp4` → `make blackwell` |
 | PolarQuant ラウンドトリップ検証 | 各ディレクトリで `make pq-test` |
 | CUTLASS NVFP4 GEMM 単体検証 | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fp4-test`（**Blackwell / sm_120a 必須**） |
+| ベンチマーク履歴（FP16） | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log` |
+| ベンチマーク履歴（NVFP4） | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log` |
 
 FP16 ビルド（`gpu-cuda`）の既定は PTX（`compute_86`）。実 GPU 向けには `CUDA_GENCODE=arch=compute_XX,code=sm_XX` を指定します。NVFP4 ビルド（`gpu-cuda-nvfp4`）の既定は **`sm_120a`** です。**`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** は **`BLACKWELL_NVCCFLAGS`**（**`-std=c++17`** + **`sm_120a` 固定**）でコンパイルします。CUTLASS は **`v4.5.0`**（**`make cutlass`** で **`third_party/cutlass`** を取得）を使用し、CUDA 13 非推奨ベクトル型警告は CUTLASS 側で解消済みです。
 
@@ -450,7 +452,7 @@ Decode スループット（~26 tok/s）は Prefill 改善の影響を受けな�
 make run.gpu-rocm PROMPT="日本語で短く説明してください。"
 ```
 
-プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。終了時 stdout には **`prefill_tps:` / `decode_tps:` / `total_tps:`** も出力され、**`make log.push`** がパースします（**推論区間のみ**。モデル重み H2D は計測外）。
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。終了時 stdout には **`prefill_tps:` / `decode_tps:` / `total_tps:`** も出力され、**`make log.push`** がパースします（**推論区間のみ**。モデル重み H2D は計測外）。**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** も共有 **`main.c`** により同形式です。
 
 ### ベンチマーク履歴（`gpu-rocm/Makefile`）
 
@@ -579,6 +581,28 @@ NVFP4 版:
 ```
 
 CUTLASS NVFP4 GEMM の単体確認（任意）: `cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test`（**`fp4_verify.cu`**。**Blackwell / sm_120a 向け**、RTX 50 系等。**`fp4_gemm.sm120a.o`** は **C++17 + `sm_120a` 固定**）。詳細は `doc/design.md` の CUDA 節を参照してください。
+
+### ベンチマーク履歴（`gpu-cuda/Makefile` / `gpu-cuda-nvfp4/Makefile`）
+
+**`gpu-rocm/`** と同形式です。**`gpu-cuda/`** または **`gpu-cuda-nvfp4/`** で **`make log.push`** を実行すると、既定の長文プロンプト（~128 token）・**`-n 128`**・**`-t 0`** でベンチを走らせ、結果を各 **`Makefile` 内の `BENCH_LOG`** に追記します。**`make log`** で履歴を表表示できます。
+
+```bash
+cd qwen3-8b/gpu-cuda
+make log.push                    # 既定 BENCH_N=128, BENCH_SEED=42
+make log                         # 履歴一覧
+make log.push BENCH_N=64         # 生成トークン数など上書き可
+
+cd qwen3-8b/gpu-cuda-nvfp4
+make log.push
+make log
+```
+
+1 行形式（パイ区切り）: **`日時|GPU_SM|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
+
+- **`gpu-cuda`**: 第 2 列 **`GPU_SM`** は **`CUDA_GENCODE`** の **`code=`** から自動取得（既定 **`compute_86`**）。上書き例: **`make log.push CUDA_GENCODE=arch=compute_90,code=sm_90`**
+- **`gpu-cuda-nvfp4`**: 第 2 列は既定 **`sm_120a`**
+
+132 prompt tokens・RTX 5090 / Blackwell の **`BENCH_LOG`** 例（NVFP4）: prefill **622.60** / decode **66.71** / total **122.03** tok/s（**`2026-05-24T15:03:39|sm_120a|…`**）。
 
 ## AMD Ryzen AI XDNA2 NPU 版
 
@@ -855,10 +879,10 @@ make build.gpu-rocm GPU_ARCH=gfx1100
    GPU メモリ、HIP カーネル、GPU サンプリング。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx** + バッチ Attention/Norm 等。**`attn_flash_prefill_kernel`** は **`(int)threadIdx.x`** による符号付き比較）。**Decode** は **`forward_gpu`**。**Prefill progress bar** とスループット要約。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴、**`make wmma`**（**`wmma_probe.c`** / **`scripts/check_wmma.sh`**）で hipBLAS 経路確認。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細（3 段階）」**。
 
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
-   CUDA FP16 版の Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。
+   CUDA FP16 版の Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。**Prefill progress bar** とスループット要約。**`gpu-cuda/Makefile`** の **`make log` / `make log.push`** ベンチ履歴。
 
 8. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
-   Blackwell NVFP4 版。H2D 時 NVFP4 ロード、**`fp4_gemv_cached`**（decode）と **`fp4_qwen3_mm`**（GEMM/GEMV 分岐）。**`fp4_*` は C++17 + `sm_120a` 固定**（CUTLASS）。共有ソースは **`../gpu-cuda/`** を参照。
+   Blackwell NVFP4 版。H2D 時 NVFP4 ロード、**`fp4_gemv_cached`**（decode）と **`fp4_qwen3_mm`**（GEMM/GEMV 分岐）。**`fp4_*` は C++17 + `sm_120a` 固定**（CUTLASS）。共有ソースは **`../gpu-cuda/`** を参照。**`gpu-cuda-nvfp4/Makefile`** の **`make log` / `make log.push`** ベンチ履歴。
 
 9. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c`  
    `amdxdna` ioctl、`ERT_START_NPU`、`launch_mm_bf16`、CPU フォールバック。mmap スクラッチ方式は **`load_weights_xdna`／`weight_prepare_bf16`／単一 `w_scratch_bo`**。BFPX 版は **`bfpx_convert_weight_2d`** と mmap 解放パス。

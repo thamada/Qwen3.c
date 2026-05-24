@@ -4,6 +4,32 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-24 15:20:11
+
+**`qwen3-8b/gpu-cuda/`** / **`qwen3-8b/gpu-cuda-nvfp4/`** — **`make log` / `make log.push`** ベンチマーク履歴（ROCm 版と同形式）。
+
+#### `qwen3-8b/gpu-cuda/main.c`
+
+- **`throughput_summary`**: **`make log.push`** 用に stdout へ **`--- benchmark ---`** と **`prefill_tps:` / `decode_tps:` / `total_tps:`** を出力（**推論区間のみ**。モデル重み H2D は計測外）。**`gpu-cuda-nvfp4`** も **`../gpu-cuda/main.c`** を共有参照。
+
+#### `qwen3-8b/gpu-cuda/Makefile`
+
+- **`log`**: **`BENCH_LOG += …`** 行を表形式で表示。
+- **`log.push`**: 既定 **`BENCH_PROMPT`**（~128 token ChatML）・**`-n $(BENCH_N)`**（既定 128）・**`-t 0 -s $(BENCH_SEED)`** で **`qwen3-gpu-cuda`** を実行し、結果を **`# BENCH_LOG_END`** 直前に追記。**`GPU_SM`** は **`CUDA_GENCODE`** の **`code=`** から自動取得（既定 **`compute_86`**）。
+- 上書き例: **`make log.push BENCH_N=64 CUDA_GENCODE=arch=compute_90,code=sm_90`**。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/Makefile`
+
+- **`log`** / **`log.push`**: 上記と同形式。**`GPU_SM`** 既定 **`sm_120a`**。**`BENCH_LOG`** サンプル行を 1 件追加（**`2026-05-24T15:03:39|sm_120a|…|622.60|66.71|122.03`**、132 prompt tokens、RTX 5090 / Blackwell）。
+
+#### ドキュメント
+
+**`doc/design.md`**: ファイル一覧（**`gpu-cuda/main.c`** / **`gpu-cuda/Makefile`** / **`gpu-cuda-nvfp4/Makefile`**）、CUDA ビルド節（**`make log` / `make log.push`**）、実行時挙動（CUDA stdout ベンチ行）、**`BENCH_LOG`** 行形式（**`GPU_SM`**）を上記に同期。
+
+**`README.md`** / **`README.en.md`**: 実行経路表の CUDA 行、CUDA クイックリファレンス表、ROCm 節（共有 **`main.c`** の stdout ベンチ行）、CUDA 節（**`make log` / `make log.push`**）、「実装を読む順序」を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-24 05:11:57
 
 **`qwen3-8b/gpu-rocm/`** — **`attn_flash_prefill_kernel`** の **`threadIdx.x` 符号付き比較**を修正（コンパイラ警告解消）。

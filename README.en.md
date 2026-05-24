@@ -39,8 +39,8 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV uses **Q8_K activations + AVX2 integer dots for all types** (layer-shared Q8). **RoPE cache**, prefill **LM head skip**, greedy **`mm_argmax_row`**. **F16 embedding via F16C**. **Prefill progress bar** on stderr |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU. **Prefill**: one batched forward + **hipBLAS GemmEx** ([llama.cpp](https://github.com/ggml-org/llama.cpp/) cublas-style path). **Decode**: one-token GEMV. **Prefill progress bar** and prefill / decode / total throughput summaries. Benchmark history via **`make log` / `make log.push`**. Verify hipBLAS path / no embedded WMMA with **`make wmma`** |
-| CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). Not in aggregate `Makefile` |
-| CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Not in aggregate `Makefile` |
+| CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. Not in aggregate `Makefile` |
+| CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Benchmark history via **`make log` / `make log.push`**. Not in aggregate `Makefile` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
@@ -205,6 +205,8 @@ Put CUDA’s **`bin`** directory on **`PATH`** (linking can fail if only `/usr/l
 | Install CUDA 13 + full NVFP4 build | `cd qwen3-8b/gpu-cuda-nvfp4` → `make blackwell` |
 | PolarQuant round-trip verify | `make pq-test` in either directory |
 | CUTLASS NVFP4 GEMM unit verify | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fp4-test` (**Blackwell / sm_120a required**) |
+| Benchmark history (FP16) | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log` |
+| Benchmark history (NVFP4) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log` |
 
 FP16 builds (`gpu-cuda`) default to PTX (`compute_86`). For native SASS, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. NVFP4 builds (`gpu-cuda-nvfp4`) default to **`sm_120a`**. **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** are compiled with **`BLACKWELL_NVCCFLAGS`** (**`-std=c++17`** + fixed **`sm_120a`**). CUTLASS **`v4.5.0`** is fetched via **`make cutlass`** into **`third_party/cutlass`**; CUDA 13 deprecated vector-type warnings are resolved upstream in CUTLASS.
 
@@ -452,7 +454,7 @@ Using `run.gpu-rocm`:
 make run.gpu-rocm PROMPT="Short explanation in English."
 ```
 
-During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). On exit, stdout also prints **`prefill_tps:` / `decode_tps:` / `total_tps:`** for **`make log.push`** to parse (**inference only**; model weight H2D is excluded).
+During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). On exit, stdout also prints **`prefill_tps:` / `decode_tps:` / `total_tps:`** for **`make log.push`** to parse (**inference only**; model weight H2D is excluded). **`gpu-cuda/`** and **`gpu-cuda-nvfp4/`** use the same format via shared **`main.c`**.
 
 ### Benchmark history (`gpu-rocm/Makefile`)
 
@@ -581,6 +583,28 @@ NVFP4 build:
 ```
 
 Optional CUTLASS NVFP4 GEMM smoke test: `cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test` (builds and runs **`fp4_verify.cu`**, **Blackwell / sm_120a**, e.g. RTX 50. **`fp4_gemm.sm120a.o`** uses **C++17 + fixed `sm_120a`**). See `doc/design.md` (CUDA section).
+
+### Benchmark history (`gpu-cuda/Makefile` / `gpu-cuda-nvfp4/Makefile`)
+
+Same format as **`gpu-rocm/`**. From **`gpu-cuda/`** or **`gpu-cuda-nvfp4/`**, **`make log.push`** runs a benchmark with the default long prompt (~128 tokens), **`-n 128`**, and **`-t 0`**, then appends the result to **`BENCH_LOG`** in that directory's Makefile. **`make log`** prints the history as a table.
+
+```bash
+cd qwen3-8b/gpu-cuda
+make log.push                    # default BENCH_N=128, BENCH_SEED=42
+make log                         # show history
+make log.push BENCH_N=64         # override generation length, etc.
+
+cd qwen3-8b/gpu-cuda-nvfp4
+make log.push
+make log
+```
+
+One line per entry (pipe-separated): **`timestamp|GPU_SM|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
+
+- **`gpu-cuda`**: column 2 **`GPU_SM`** is taken from **`CUDA_GENCODE`** **`code=`** (default **`compute_86`**). Override example: **`make log.push CUDA_GENCODE=arch=compute_90,code=sm_90`**
+- **`gpu-cuda-nvfp4`**: column 2 defaults to **`sm_120a`**
+
+Example **`BENCH_LOG`** entry (NVFP4, 132 prompt tokens, RTX 5090 / Blackwell): prefill **622.60** / decode **66.71** / total **122.03** tok/s (**`2026-05-24T15:03:39|sm_120a|…`**).
 
 ## AMD Ryzen AI XDNA2 NPU
 
@@ -847,10 +871,10 @@ Suggested order:
 5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention; Q8_K activations + AVX2 integer dots for all quant types (layer-shared Q8). RoPE cache, **`lm_mode`** (prefill LM skip / greedy **`mm_argmax_row`**), F16 emb F16C. See **`doc/design.md`**, section **“`cpu-blas`: Q8_K activation GEMV”**.
 6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling. **Prefill**: **`forward_prefill_gpu`** (**hipBLAS GemmEx** + batch Attention/Norm, etc.; **`attn_flash_prefill_kernel`** uses **`(int)threadIdx.x`** for signed comparisons). **Decode**: **`forward_gpu`**. **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. **`make wmma`** (**`wmma_probe.c`** / **`scripts/check_wmma.sh`**) to verify hipBLAS path. Prefill details in **`doc/design.md`**, section **“ROCm Prefill acceleration (3 stages)”**.
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
-   CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).
+   CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode). **Prefill progress bar** and throughput summaries. Benchmark history via **`gpu-cuda/Makefile`** **`make log` / `make log.push`**.
 
 8. `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_gemm.cu`  
-   Blackwell NVFP4 build. H2D NVFP4 load, **`fp4_gemv_cached`** (decode), **`fp4_qwen3_mm`** (GEMM/GEMV routing). **`fp4_*` uses C++17 + fixed `sm_120a`** (CUTLASS). Shared sources live under **`../gpu-cuda/`**.
+   Blackwell NVFP4 build. H2D NVFP4 load, **`fp4_gemv_cached`** (decode), **`fp4_qwen3_mm`** (GEMM/GEMV routing). **`fp4_*` uses C++17 + fixed `sm_120a`** (CUTLASS). Shared sources live under **`../gpu-cuda/`**. Benchmark history via **`gpu-cuda-nvfp4/Makefile`** **`make log` / `make log.push`**.
 
 9. `qwen3-8b/xdna2/main.c` / `qwen3-8b/xdna2-bfp16/main.c` — `amdxdna` ioctl, `ERT_START_NPU`, `launch_mm_bf16`, CPU fallback. **Mmap scratch build**: `load_weights_xdna` / `weight_prepare_bf16` / single `w_scratch_bo`. **BFPX**: `bfpx_convert_weight_2d` and the mmap release path.
 
