@@ -746,7 +746,7 @@ ROCm 版は **Prefill**（**`forward_prefill_gpu`**）と **Decode**（**`forwar
 - **`launch_mm_f16_batch` → `hipblasGemmEx`**（**`n_tokens >= 2`**）: **`O[S,d] = X[S,n] @ W[d,n]^T`**。llama.cpp **`ggml_cuda_op_mul_mat_cublas`** と同じ **`OP_T, OP_N`** 呼び出し（FP16 重み・FP16 活性・FP32 出力・**`HIPBLAS_COMPUTE_32F`**）。活性化は事前に **`f32_to_f16_batch_kernel`** で **`d_scratch_f16`** へ変換。フォールバック: **`mm_f16_gemv_batch_kernel`**（出力行ごとに重み行を S トークン分再利用するカスタム GEMV バッチ）。
 - `rope_prefill_batch_kernel`: token index を position として RoPE。
 - `kv_write_batch_kernel`: 全プロンプト位置 **`0..S-1`** へ K/V を一括書込。
-- `attn_flash_prefill_kernel`: 因果マスク付き Flash Attention。位置 **`t`** は K/V **`0..t`** のみ参照（**`n_tokens × n_heads`** block 並列）。K/V タイル **`FA_BR=32`**（gfx1100 では 64 だと shared memory 65 KiB 上限超過）。
+- `attn_flash_prefill_kernel`: 因果マスク付き Flash Attention。位置 **`t`** は K/V **`0..t`** のみ参照（**`n_tokens × n_heads`** block 並列）。K/V タイル **`FA_BR=32`**（gfx1100 では 64 だと shared memory 65 KiB 上限超過）。共有リダクション（**`fa_sh_reduce_max`** / **`fa_sh_reduce_sum`**）および分岐条件では **`threadIdx.x`**（符号なし）を **`(int)threadIdx.x`** にキャストして **`hd`** / **`tc`** / **`s`** と比較（**`-Wsign-compare`** 回避。挙動は同一）。
 - `silu_mul_batch_kernel` / `vec_add_batch_kernel`: FFN・残差のバッチ版。
 
 ### ROCm Prefill 高速化の詳細（3 段階）
@@ -827,8 +827,9 @@ hipblasGemmEx(handle,
 | 0: 1 トークンずつ GEMV | 28.74 | 29.35 | 28.77 | **`BENCH_LOG` 2026-05-23T15:54:16** |
 | 1: バッチ forward + カスタム GEMV | 53.95 | 25.49 | 48.14 | **`BENCH_LOG` 2026-05-23T16:22:01** |
 | 2: hipBLAS GemmEx | **549.94** | 25.67 | **171.41** | **`BENCH_LOG` 2026-05-23T16:37:12** |
+| 2: 再計測（`threadIdx` キャスト後） | **556.77** / **556.95** | 25.77–25.78 | **172.50**–**172.56** | **`BENCH_LOG` 2026-05-24T04:56:58** / **05:05:36** |
 
-Prefill は段階 0 比 **約 19 倍**、段階 1 比 **約 10 倍**。Decode はほぼ不変（設計どおり Prefill 専用の改善）。
+Prefill は段階 0 比 **約 19 倍**、段階 1 比 **約 10 倍**。Decode はほぼ不変（設計どおり Prefill 専用の改善）。段階 2 再計測は初回と同程度（計測ばらつき範囲）。
 
 **今後の余地**（未実装）:
 
