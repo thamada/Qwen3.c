@@ -363,6 +363,36 @@ static void quantize_matrix_colmajor_host(
 }
 
 template <typename LayoutSF>
+static void quantize_row_host(
+    const cutlass::bfloat16_t *row_ptr, uint8_t *dst_fp4,
+    ScaleFactorType *dst_sf, int r, int K, LayoutSF layout_sf)
+{
+    int nsb = K / SF_VEC_SIZE;
+    for (int sb = 0; sb < nsb; sb++) {
+        int k_start = sb * SF_VEC_SIZE;
+        float max_abs = 0.0f;
+        for (int i = 0; i < SF_VEC_SIZE; i++) {
+            float val = float(row_ptr[k_start + i]);
+            max_abs = fmaxf(max_abs, fabsf(val));
+        }
+        float scale_val = max_abs / 6.0f;
+        if (scale_val < 1e-10f) scale_val = 1e-10f;
+        ScaleFactorType scale_ue4m3 = ScaleFactorType(scale_val);
+        float actual_scale = float(scale_ue4m3);
+        float scale_inv = 1.0f / actual_scale;
+        int sf_idx = layout_sf(r, k_start, 0);
+        dst_sf[sf_idx] = scale_ue4m3;
+        for (int i = 0; i < SF_VEC_SIZE; i += 2) {
+            float v0 = float(row_ptr[k_start + i]) * scale_inv;
+            float v1 = float(row_ptr[k_start + i + 1]) * scale_inv;
+            uint8_t fp4_0 = float_to_fp4(v0);
+            uint8_t fp4_1 = float_to_fp4(v1);
+            dst_fp4[(size_t)r * (K / 2) + (k_start + i) / 2] = (fp4_1 << 4) | fp4_0;
+        }
+    }
+}
+
+template <typename LayoutSF>
 static void quantize_matrix_host(
     const cutlass::bfloat16_t* src, uint8_t* dst_fp4,
     ScaleFactorType* dst_sf, int rows, int K, LayoutSF layout_sf)
@@ -795,58 +825,106 @@ static float host_fp16_to_float(uint16_t h) {
     return out;
 }
 
-static FP4WeightCache *build_weight_cache_host_bf16(
-    const cutlass::bfloat16_t *h_bf16, int N, int K)
+static FP4HostWeight *build_host_weight_padded(
+    int N_pad, int K_pad, int N_act, int K_act,
+    fp4_dequant_row_fn get_row, void *ctx)
 {
     int dummy_M = 128;
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(dummy_M, N, K, 1));
+        cute::make_shape(dummy_M, N_pad, K_pad, 1));
     int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
 
-    FP4WeightCache *cache = new FP4WeightCache();
-    cache->N = N;
-    cache->K = K;
-    cache->sf_elems = sf_elems;
+    FP4HostWeight *w = (FP4HostWeight *)calloc(1, sizeof(FP4HostWeight));
+    if (!w) return nullptr;
 
-    uint8_t *h_fp4 = (uint8_t *)calloc((size_t)N * K / 2, 1);
-    ScaleFactorType *h_sf = (ScaleFactorType *)calloc((size_t)sf_elems,
-                                                      sizeof(ScaleFactorType));
-    if (!h_fp4 || !h_sf) {
-        free(h_fp4);
-        free(h_sf);
-        delete cache;
+    w->N = N_pad;
+    w->K = K_pad;
+    w->N_act = N_act;
+    w->K_act = K_act;
+    w->sf_elems = sf_elems;
+    w->h_fp4 = (uint8_t *)calloc((size_t)N_pad * K_pad / 2, 1);
+    w->h_sf = (uint8_t *)calloc((size_t)sf_elems, sizeof(ScaleFactorType));
+    if (!w->h_fp4 || !w->h_sf) {
+        fp4_host_weight_free(w);
         return nullptr;
     }
 
-    quantize_matrix_host(h_bf16, h_fp4, h_sf, N, K, layout_SFB);
+    cutlass::bfloat16_t *row_bf16 = (cutlass::bfloat16_t *)calloc((size_t)K_pad,
+        sizeof(cutlass::bfloat16_t));
+    float *row_f32 = (float *)malloc((size_t)K_act * sizeof(float));
+    if (!row_bf16 || !row_f32) {
+        free(row_bf16);
+        free(row_f32);
+        fp4_host_weight_free(w);
+        return nullptr;
+    }
+
+    ScaleFactorType *dst_sf = (ScaleFactorType *)w->h_sf;
+    for (int r = 0; r < N_act; r++) {
+        get_row(ctx, r, row_f32, K_act);
+        for (int k = 0; k < K_act; k++)
+            row_bf16[k] = cutlass::bfloat16_t(row_f32[k]);
+        quantize_row_host(row_bf16, w->h_fp4, dst_sf, r, K_pad, layout_SFB);
+    }
+
+    free(row_bf16);
+    free(row_f32);
+    return w;
+}
+
+static FP4WeightCache *upload_weight_cache_from_host(const FP4HostWeight *host)
+{
+    if (!host || !host->h_fp4 || !host->h_sf) return nullptr;
+
+    FP4WeightCache *cache = new FP4WeightCache();
+    cache->N = host->N;
+    cache->K = host->K;
+    cache->sf_elems = host->sf_elems;
+
+    size_t fp4_bytes = (size_t)host->N * (size_t)host->K / 2;
+    size_t sf_bytes = (size_t)host->sf_elems * sizeof(ScaleFactorType);
 
     cudaError_t err;
-    err = cudaMalloc(&cache->d_fp4, (size_t)N * K / 2);
+    err = cudaMalloc(&cache->d_fp4, fp4_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "fp4 weight cache: cudaMalloc fp4 failed: %s\n",
                 cudaGetErrorString(err));
-        free(h_fp4);
-        free(h_sf);
         delete cache;
         return nullptr;
     }
-    err = cudaMalloc(&cache->d_sf, sf_elems);
+    err = cudaMalloc(&cache->d_sf, (size_t)host->sf_elems);
     if (err != cudaSuccess) {
         fprintf(stderr, "fp4 weight cache: cudaMalloc sf failed: %s\n",
                 cudaGetErrorString(err));
         cudaFree(cache->d_fp4);
-        free(h_fp4);
-        free(h_sf);
         delete cache;
         return nullptr;
     }
 
-    cudaMemcpy(cache->d_fp4, h_fp4, (size_t)N * K / 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(cache->d_sf, h_sf, (size_t)sf_elems * sizeof(ScaleFactorType),
-               cudaMemcpyHostToDevice);
+    cudaMemcpy(cache->d_fp4, host->h_fp4, fp4_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(cache->d_sf, host->h_sf, sf_bytes, cudaMemcpyHostToDevice);
+    return cache;
+}
 
-    free(h_fp4);
-    free(h_sf);
+struct Bf16RowCtx {
+    const cutlass::bfloat16_t *src;
+    int K;
+};
+
+static void bf16_row_get(void *vctx, int row, float *row_out, int K_act) {
+    Bf16RowCtx *c = (Bf16RowCtx *)vctx;
+    for (int k = 0; k < K_act; k++)
+        row_out[k] = float(c->src[(size_t)row * c->K + k]);
+}
+
+static FP4WeightCache *build_weight_cache_host_bf16(
+    const cutlass::bfloat16_t *h_bf16, int N, int K)
+{
+    Bf16RowCtx ctx = { h_bf16, K };
+    FP4HostWeight *host = build_host_weight_padded(N, K, N, K, bf16_row_get, &ctx);
+    if (!host) return nullptr;
+    FP4WeightCache *cache = upload_weight_cache_from_host(host);
+    fp4_host_weight_free(host);
     return cache;
 }
 
@@ -872,26 +950,30 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     return (void *)cache;
 }
 
+struct F16RowCtx {
+    const uint16_t *src;
+    int K;
+};
+
+static void f16_row_get(void *vctx, int row, float *row_out, int K_act) {
+    F16RowCtx *c = (F16RowCtx *)vctx;
+    for (int k = 0; k < K_act; k++)
+        row_out[k] = host_fp16_to_float(c->src[(size_t)row * c->K + k]);
+}
+
 void *fp4_quantize_weights_host_f16(const uint16_t *host_f16, int N, int K) {
     int N_pad = align128(N);
     int K_pad = align128(K);
 
-    cutlass::bfloat16_t *h_bf16 = (cutlass::bfloat16_t *)calloc(
-        (size_t)N_pad * K_pad, sizeof(cutlass::bfloat16_t));
-    if (!h_bf16) return nullptr;
-
-    for (int r = 0; r < N; r++) {
-        for (int k = 0; k < K; k++) {
-            float v = host_fp16_to_float(host_f16[(size_t)r * K + k]);
-            h_bf16[(size_t)r * K_pad + k] = cutlass::bfloat16_t(v);
-        }
-    }
-
-    FP4WeightCache *cache = build_weight_cache_host_bf16(h_bf16, N_pad, K_pad);
-    free(h_bf16);
-    if (!cache)
+    F16RowCtx ctx = { host_f16, K };
+    FP4HostWeight *host = build_host_weight_padded(N_pad, K_pad, N, K, f16_row_get, &ctx);
+    if (!host) {
         fprintf(stderr, "fp4_quantize_weights_host_f16: quantize failed N=%d K=%d\n",
                 N, K);
+        return nullptr;
+    }
+    FP4WeightCache *cache = upload_weight_cache_from_host(host);
+    fp4_host_weight_free(host);
     return (void *)cache;
 }
 
@@ -914,6 +996,26 @@ int fp4_weight_cache_N(const void* cache_handle) {
 
 int fp4_weight_cache_K(const void* cache_handle) {
     return cache_handle ? ((const FP4WeightCache*)cache_handle)->K : 0;
+}
+
+size_t fp4_weight_cache_device_bytes(const void *cache_handle) {
+    if (!cache_handle) return 0;
+    const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
+    return (size_t)cache->N * (size_t)cache->K / 2
+         + (size_t)cache->sf_elems * sizeof(ScaleFactorType);
+}
+
+FP4HostWeight *fp4_host_weight_build(int N_act, int K_act,
+                                     fp4_dequant_row_fn get_row, void *ctx) {
+    if (!get_row || N_act <= 0 || K_act <= 0) return nullptr;
+    int N_pad = align128(N_act);
+    int K_pad = align128(K_act);
+    return build_host_weight_padded(N_pad, K_pad, N_act, K_act, get_row, ctx);
+}
+
+void *fp4_weight_cache_upload(const FP4HostWeight *host) {
+    FP4WeightCache *cache = upload_weight_cache_from_host(host);
+    return (void *)cache;
 }
 
 // Free cached weight data

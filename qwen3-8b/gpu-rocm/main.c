@@ -1234,6 +1234,34 @@ static size_t max_tensor_nelements(Model *m) {
     return mx;
 }
 
+static double timespec_elapsed_sec(const struct timespec *t0, const struct timespec *t1) {
+    return (double)(t1->tv_sec - t0->tv_sec)
+         + (double)(t1->tv_nsec - t0->tv_nsec) * 1e-9;
+}
+
+static size_t ti_dev_upload_bytes(const TensorInfo *ti) {
+    if (!ti) return 0;
+    size_t nel = ti_nelements(ti);
+    if (ti->type == DT_F32)
+        return nel * sizeof(float);
+    return nel * sizeof(uint16_t);
+}
+
+static size_t layer_device_bytes(Model *m, int l) {
+    char name[128];
+    size_t b = 0;
+    static const char *suffix[] = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+        "ffn_norm.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
+    };
+    for (int i = 0; i < (int)(sizeof(suffix) / sizeof(suffix[0])); i++) {
+        sprintf(name, "blk.%d.%s", l, suffix[i]);
+        b += ti_dev_upload_bytes(ti_find(m, name));
+    }
+    return b;
+}
+
 static void upload_weights_gpu(Model *m) {
     Config *c = &m->cfg;
     int L = c->n_layers;
@@ -1269,6 +1297,9 @@ static void upload_weights_gpu(Model *m) {
 
     char name[128];
     for (int l = 0; l < L; l++) {
+        struct timespec t_layer0, t_layer1;
+        clock_gettime(CLOCK_MONOTONIC, &t_layer0);
+
         sprintf(name, "blk.%d.attn_norm.weight", l);     wd->norm_att[l] = (float *)upload_f32(m, name);
         sprintf(name, "blk.%d.attn_q.weight", l);        wd->wq[l]       = upload_fp16_dequant(m, name, f32, f16);
         sprintf(name, "blk.%d.attn_k.weight", l);        wd->wk[l]       = upload_fp16_dequant(m, name, f32, f16);
@@ -1286,8 +1317,15 @@ static void upload_weights_gpu(Model *m) {
             fprintf(stderr, "Error: layer %d missing weight tensor\n", l);
             exit(1);
         }
-        if ((l + 1) % 8 == 0)
-            printf("  layer %d/%d uploaded\n", l + 1, L);
+        clock_gettime(CLOCK_MONOTONIC, &t_layer1);
+        if ((l + 1) % 8 == 0) {
+            double sec = timespec_elapsed_sec(&t_layer0, &t_layer1);
+            size_t nbytes = layer_device_bytes(m, l);
+            double gbps = sec > 0.0
+                ? ((double)nbytes / (1024.0 * 1024.0 * 1024.0)) / sec : 0.0;
+            printf("  layer %d/%d uploaded: %.2f sec, %.2f GB/sec\n",
+                   l + 1, L, sec, gbps);
+        }
     }
 
     wd->norm_out = (float *)upload_f32(m, "output_norm.weight");

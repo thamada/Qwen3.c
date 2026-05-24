@@ -1,7 +1,10 @@
 #ifndef BONSAI_FP4_GEMM_H
 #define BONSAI_FP4_GEMM_H
 
+#include <stddef.h>
 #include <stdint.h>
+
+#include "fp4_cache.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,7 +26,12 @@ const void *fp4_weight_cache_fp4_ptr(const void *cache);
 const void *fp4_weight_cache_sf_ptr(const void *cache);
 int   fp4_weight_cache_N(const void *cache);
 int   fp4_weight_cache_K(const void *cache);
+size_t fp4_weight_cache_device_bytes(const void *cache);
 void  fp4_weight_cache_free(void *cache);
+
+FP4HostWeight *fp4_host_weight_build(int N_act, int K_act,
+                                       fp4_dequant_row_fn get_row, void *ctx);
+void *fp4_weight_cache_upload(const FP4HostWeight *host);
 
 void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
                      int n, int d);

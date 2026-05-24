@@ -77,7 +77,7 @@ BLACKWELL_NVCCFLAGS = -O3 -std=c++17 -Xcompiler -Wall,-Wextra,-Wno-unused-parame
 FP4_FLAG  := -DBONSAI_FP4=1
 FP4_GEMM_OBJ  := fp4_gemm.sm120a.o
 FP4_QWEN3_OBJ := fp4_qwen3.sm120a.o
-FP4_OBJS      := $(FP4_GEMM_OBJ) $(FP4_QWEN3_OBJ)
+FP4_OBJS      := $(FP4_GEMM_OBJ) $(FP4_QWEN3_OBJ) fp4_cache_io.o
 
 # PolarQuant KV cache: BONSAI_POLARQUANT=1（make build.polarquant）
 BONSAI_POLARQUANT ?= 0
@@ -111,17 +111,20 @@ BENCH_SEED   ?= 42
 # GPU identifier for BENCH_LOG (Blackwell sm_120a target)
 GPU_SM ?= sm_120a
 
-.PHONY: build build.polarquant run run.polarquant clean blackwell cutlass fp4-test pq-test log log.push
+.PHONY: build build.polarquant run run.polarquant clean blackwell cutlass fp4-test pq-test log log.push pack-cache
 
 .DEFAULT_GOAL := run
 
 build: cutlass $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS) $(LDFLAGS)
 
+fp4_cache_io.o: fp4_cache_io.c fp4_cache.h
+	$(CC) $(CFLAGS) -c fp4_cache_io.c -o $@
+
 build.polarquant:
 	$(MAKE) build BONSAI_POLARQUANT=1
 
-$(MAIN_OBJ): $(SRC_DIR)/main.c $(SRC_DIR)/gpu.h fp4_qwen3.h $(SRC_DIR)/polarquant.h
+$(MAIN_OBJ): $(SRC_DIR)/main.c $(SRC_DIR)/gpu.h fp4_qwen3.h fp4_cache.h $(SRC_DIR)/polarquant.h
 	$(CC) $(CFLAGS) $(FP4_FLAG) $(PQ_FLAG) -c $(SRC_DIR)/main.c -o $@
 
 $(KERNELS_OBJ): $(SRC_DIR)/kernels.cu $(SRC_DIR)/gpu.h fp4_qwen3.h $(SRC_DIR)/polarquant.h
@@ -165,9 +168,12 @@ run: build
 run.polarquant: build.polarquant
 	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
+pack-cache: build
+	./$(BIN) "$(MODEL)" --pack-nvfp4-cache
+
 clean:
 	rm -f $(BIN) fp4_verify polarquant_verify \
-	      main.pq*.o kernels.*.o fp4_gemm.sm120a.o fp4_qwen3.sm120a.o polarquant.o
+	      main.pq*.o kernels.*.o fp4_gemm.sm120a.o fp4_qwen3.sm120a.o fp4_cache_io.o polarquant.o
 
 # -----------------------------------------------------------------------------
 # Benchmark log (make log / make log.push)

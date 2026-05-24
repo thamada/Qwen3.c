@@ -100,6 +100,28 @@ void *fp4_qwen3_weight_from_f16_host(const uint16_t *host_f16, int N, int K)
     return cache;
 }
 
+void *fp4_qwen3_weight_from_rows(int N, int K,
+                                 fp4_dequant_row_fn get_row, void *ctx)
+{
+    FP4HostWeight *host = fp4_host_weight_build(N, K, get_row, ctx);
+    if (!host) return NULL;
+    void *cache = fp4_weight_cache_upload(host);
+    fp4_host_weight_free(host);
+    return cache;
+}
+
+FP4HostWeight *fp4_qwen3_host_weight_from_rows(int N, int K,
+                                               fp4_dequant_row_fn get_row,
+                                               void *ctx)
+{
+    return fp4_host_weight_build(N, K, get_row, ctx);
+}
+
+void *fp4_qwen3_weight_from_host(const FP4HostWeight *host)
+{
+    return fp4_weight_cache_upload(host);
+}
+
 void fp4_qwen3_free_weight(void *cache)
 {
     fp4_weight_cache_free(cache);
