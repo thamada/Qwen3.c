@@ -1811,7 +1811,7 @@ __device__ static inline float fa_sh_reduce_max(float val, float *red_sh) {
     red_sh[threadIdx.x] = val;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s)
+        if ((int)threadIdx.x < s)
             red_sh[threadIdx.x] = fmaxf(red_sh[threadIdx.x], red_sh[threadIdx.x + s]);
         __syncthreads();
     }
@@ -1822,7 +1822,7 @@ __device__ static inline float fa_sh_reduce_sum(float val, float *red_sh) {
     red_sh[threadIdx.x] = val;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s)
+        if ((int)threadIdx.x < s)
             red_sh[threadIdx.x] += red_sh[threadIdx.x + s];
         __syncthreads();
     }
@@ -2144,7 +2144,7 @@ __global__ void attn_flash_prefill_kernel(
     __shared__ float scores[FA_BR];
     __shared__ float red_sh[FA_HD128];
 
-    if (threadIdx.x < hd) {
+    if ((int)threadIdx.x < hd) {
         q_sh[threadIdx.x] = qh[threadIdx.x];
         o_sh[threadIdx.x] = 0.0f;
     }
@@ -2165,7 +2165,7 @@ __global__ void attn_flash_prefill_kernel(
         }
         __syncthreads();
 
-        if (threadIdx.x < tc) {
+        if ((int)threadIdx.x < tc) {
             float s = 0.0f;
             for (int d = 0; d < hd; d++)
                 s += q_sh[d] * k_tile[threadIdx.x][d];
@@ -2174,24 +2174,24 @@ __global__ void attn_flash_prefill_kernel(
         __syncthreads();
 
         float m_tile = fa_sh_reduce_max(
-            (threadIdx.x < tc) ? scores[threadIdx.x] : -1e30f, red_sh);
+            ((int)threadIdx.x < tc) ? scores[threadIdx.x] : -1e30f, red_sh);
         __syncthreads();
 
         float m_new = fmaxf(m, m_tile);
         float alpha = (m > -1e29f) ? expf(m - m_new) : 0.0f;
 
-        if (threadIdx.x < hd)
+        if ((int)threadIdx.x < hd)
             o_sh[threadIdx.x] *= alpha;
 
-        if (threadIdx.x < tc)
+        if ((int)threadIdx.x < tc)
             scores[threadIdx.x] = expf(scores[threadIdx.x] - m_new);
         __syncthreads();
 
         float l_tile = fa_sh_reduce_sum(
-            (threadIdx.x < tc) ? scores[threadIdx.x] : 0.0f, red_sh);
+            ((int)threadIdx.x < tc) ? scores[threadIdx.x] : 0.0f, red_sh);
         __syncthreads();
 
-        if (threadIdx.x < hd) {
+        if ((int)threadIdx.x < hd) {
             float acc = 0.0f;
             for (int j = 0; j < tc; j++)
                 acc += scores[j] * v_tile[j][threadIdx.x];
@@ -2203,7 +2203,7 @@ __global__ void attn_flash_prefill_kernel(
         m = m_new;
     }
 
-    if (threadIdx.x < hd)
+    if ((int)threadIdx.x < hd)
         oh[threadIdx.x] = o_sh[threadIdx.x] / l;
 }
 

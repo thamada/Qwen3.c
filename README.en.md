@@ -425,13 +425,16 @@ Improvements were done in **3 stages** (132 prompt tokens, RX 7900 XTX / gfx1100
 | 0 (before) | One `forward_gpu` per token (GEMV × S) | 28.7 | 1.0× |
 | 1 | Batched `forward_prefill_gpu` + custom `mm_f16_gemv_batch_kernel` | 54 | 1.9× |
 | 2 | Above + **hipBLAS GemmEx** ([llama.cpp](https://github.com/ggml-org/llama.cpp/) `cublasGemmEx` equivalent) | **~550** | **~19×** |
+| 2 (re-measured) | Stage 2 path (after `threadIdx` cast in `attn_flash_prefill_kernel`) | **~557** | **~19×** |
 
 Stage 2 highlights:
 
 - **Matmul**: `O[S,d] = X[S,n] @ W[d,n]^T` via **`hipblasGemmEx(OP_T, OP_N, ...)`** (FP16 weights, FP16 activations, FP32 output).
 - **Activation conversion**: `f32_to_f16_batch_kernel` → **`d_scratch_f16`**. Shared inputs (q/k/v, gate/up) convert **once**.
-- **Attention / RoPE / Norm / FFN activations** remain custom HIP batch kernels (`attn_flash_prefill_kernel`, etc.).
+- **Attention / RoPE / Norm / FFN activations** remain custom HIP batch kernels (`attn_flash_prefill_kernel`, etc.). Prefill Flash Attention casts **`threadIdx.x`** to **`(int)threadIdx.x`** when comparing with **`hd`** / **`tc`** (avoids **`-Wsign-compare`**; behavior unchanged).
 - Startup log **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** confirms the hipBLAS path is active.
+
+Stage 2 re-measurement (**`BENCH_LOG` 2026-05-24**, 132 prompt tokens): prefill **556.77** / **556.95** tok/s — similar to the first run (549.94; within measurement variance).
 
 Decode throughput (~26 tok/s) is largely unchanged. Long prompts: **TTFT (Time To First Token)** tracks Prefill speed.
 
@@ -842,7 +845,7 @@ Suggested order:
 3. `qwen3-8b/cpu/main.c` — GGUF load through one-token generation on CPU.
 4. `qwen3-8b/cpu-multicore/main.c` — OpenMP parallelization.
 5. `qwen3-8b/cpu-blas/main.c` — OpenBLAS (`cblas_sgemv`) for F32 GEMV and batched attention; Q8_K activations + AVX2 integer dots for all quant types (layer-shared Q8). RoPE cache, **`lm_mode`** (prefill LM skip / greedy **`mm_argmax_row`**), F16 emb F16C. See **`doc/design.md`**, section **“`cpu-blas`: Q8_K activation GEMV”**.
-6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling. **Prefill**: **`forward_prefill_gpu`** (**hipBLAS GemmEx** + batch Attention/Norm, etc.). **Decode**: **`forward_gpu`**. **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. **`make wmma`** (**`wmma_probe.c`** / **`scripts/check_wmma.sh`**) to verify hipBLAS path. Prefill details in **`doc/design.md`**, section **“ROCm Prefill acceleration (3 stages)”**.
+6. `qwen3-8b/gpu-rocm/main.c` — GPU memory, HIP kernels, GPU sampling. **Prefill**: **`forward_prefill_gpu`** (**hipBLAS GemmEx** + batch Attention/Norm, etc.; **`attn_flash_prefill_kernel`** uses **`(int)threadIdx.x`** for signed comparisons). **Decode**: **`forward_gpu`**. **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. **`make wmma`** (**`wmma_probe.c`** / **`scripts/check_wmma.sh`**) to verify hipBLAS path. Prefill details in **`doc/design.md`**, section **“ROCm Prefill acceleration (3 stages)”**.
 7. `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 prefill/decode, Flash Attention. Optional **`build.polarquant`**: PolarQuant-R KV (**`pq_decode_head`** tile decode).
 

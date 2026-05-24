@@ -4,6 +4,34 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-24 05:11:57
+
+**`qwen3-8b/gpu-rocm/`** — **`attn_flash_prefill_kernel`** の **`threadIdx.x` 符号付き比較**を修正（コンパイラ警告解消）。
+
+#### 背景
+
+**`threadIdx.x`**（**`unsigned int`**）を **`hd`** / **`tc`** / リダクション **`s`**（いずれも **`int`**）と `<` 比較すると、**`-Wsign-compare`** 相当の警告が出る。挙動は変わらないが、意図を明示するため **`(int)threadIdx.x`** にキャストして比較する。
+
+#### `gpu-rocm/main.c`
+
+- **`fa_sh_reduce_max`** / **`fa_sh_reduce_sum`**: 共有メモリリダクションループの **`threadIdx.x < s`** を **`(int)threadIdx.x < s`** に変更。
+- **`attn_flash_prefill_kernel`**: Q/K/V タイル読込・スコア計算・online softmax・出力書込の各分岐で **`(int)threadIdx.x < hd`** / **`< tc`** に統一。
+
+#### `gpu-rocm/Makefile`
+
+- **`BENCH_LOG`** に再計測 2 件を追加（段階 2 経路・132 prompt tokens、RX 7900 XTX / gfx1100）:
+  - **`2026-05-24T04:56:58`**: prefill **556.77** / decode **25.78** / total **172.56**
+  - **`2026-05-24T05:05:36`**: prefill **556.95** / decode **25.77** / total **172.50**
+- 段階 2 初回（**549.94** prefill）と同程度。性能改善目的の変更ではない。
+
+#### ドキュメント
+
+**`README.md`** / **`README.en.md`**: Prefill 高速化ベンチ表（再計測行）・段階 2 要点（**`threadIdx` キャスト**）・「実装を読む順序」を上記に同期。
+
+**`doc/design.md`**: **`attn_flash_prefill_kernel`** 節に **`(int)threadIdx.x` キャスト**の注記、**「ROCm Prefill 高速化の詳細（3 段階）」** のベンチ表に再計測行を追加。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-23 17:02:22
 
 **`qwen3-8b/gpu-rocm/`** — **WMMA 利用状況の確認**（**`make wmma`** / **`make wmma-probe`**）。
