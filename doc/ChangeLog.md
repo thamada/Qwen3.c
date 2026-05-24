@@ -4,6 +4,25 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-25 00:53:36
+
+**`qwen3-8b/Makefile`** — トップ Makefile を **`make model` のみ**に整理。ビルド・実行・クリーンは各サブディレクトリの **`Makefile`** に一本化。
+
+#### `qwen3-8b/Makefile`
+
+- 削除: **`build.*` / `run.*`**（**`build.cpu`**、**`build.gpu-rocm`**、**`run.xdna2`** 等）、**`all`**、集約 **`clean`**、**`gen-xdna-kernels`**。
+- 残存: **`model`** のみ（**`gguf.txt`** → **`wget`** + **`.sha256sum`** 検証）。
+- **`model`**: **`$(MODEL)`** が既に存在し **`sha256sum --check`** が成功した場合は **ダウンロードをスキップ**。
+- 成功・失敗時にターミナルへ **チェックサム検証結果のバナー**（ASCII 枠・前景色のみ）を表示。
+
+#### ドキュメント
+
+**`README.md`** / **`README.en.md`**: クイックスタート・各バリアントのビルド／実行例を **`cd qwen3-8b/<variant> && make build`** / **`make run`** に更新。片付けは各サブディレクトリの **`make clean`**。モデル取得（スキップ・バナー）の説明を追加。
+
+**`doc/design.md`**: ディレクトリ表・Make ターゲット表・ビルド例・モデル参照・トラブルシュートを上記構成に同期（集約 Makefile 表記の削除、**`gen-xdna-kernels`** → Python スクリプト直接実行）。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-24 15:20:11
 
 **`qwen3-8b/gpu-cuda/`** / **`qwen3-8b/gpu-cuda-nvfp4/`** — **`make log` / `make log.push`** ベンチマーク履歴（ROCm 版と同形式）。

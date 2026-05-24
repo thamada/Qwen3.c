@@ -39,8 +39,8 @@ Build the C sources under `qwen3-8b/` and try the following targets:
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV uses **Q8_K activations + AVX2 integer dots for all types** (layer-shared Q8). **RoPE cache**, prefill **LM head skip**, greedy **`mm_argmax_row`**. **F16 embedding via F16C**. **Prefill progress bar** on stderr |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU. **Prefill**: one batched forward + **hipBLAS GemmEx** ([llama.cpp](https://github.com/ggml-org/llama.cpp/) cublas-style path). **Decode**: one-token GEMV. **Prefill progress bar** and prefill / decode / total throughput summaries. Benchmark history via **`make log` / `make log.push`**. Verify hipBLAS path / no embedded WMMA with **`make wmma`** |
-| CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. Not in aggregate `Makefile` |
-| CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Benchmark history via **`make log` / `make log.push`**. Not in aggregate `Makefile` |
+| CUDA GPU (FP16) | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPUs; prefill batch + Flash Attention. All linear layers in **FP16 VRAM**. Optional **`build.polarquant`**: **PolarQuant-R** KV (64 B/head). **Prefill progress bar** and throughput summaries. Benchmark history via **`make log` / `make log.push`**. Build under `gpu-cuda/` |
+| CUDA GPU (NVFP4) | `qwen3-8b/gpu-cuda-nvfp4/` + shared `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell (e.g. RTX 50). Linear weights **NVFP4 only** at H2D (CUTLASS). Embedding only in FP16 VRAM. Optional **`build.polarquant`**: NVFP4 + PolarQuant-R combined (max VRAM savings). Benchmark history via **`make log` / `make log.push`**. Build under `gpu-cuda-nvfp4/` |
 | AMD Ryzen AI XDNA2 NPU (mmap + per-GEMV BF16 scratch) | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | NPU via direct `amdxdna` ioctl; weights **mmap'd** like **CPU OpenMP** build; single BF16 scratch BO filled **per GEMV** |
 | AMD Ryzen AI XDNA2 NPU (BFPX host weights) | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | Same ioctl/GEMV path; linear weights held on host as block FP (BF16 scale + int8); GGUF mmap released after conversion |
 
@@ -100,7 +100,7 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
-You normally work inside `qwen3-8b/` for builds and runs.
+You normally work inside `qwen3-8b/`. Use **`make model`** there to fetch the GGUF; **build and run** each variant from its subdirectory Makefile (`cpu/`, `gpu-rocm/`, etc.).
 
 ## Beginners: what happens during LLM inference?
 
@@ -182,7 +182,7 @@ If `rocminfo` does not report a GPU, pass **`GPU_ARCH=gfx1100`** (or your ISA) m
 
 ### CUDA build
 
-You need an NVIDIA GPU and the **CUDA Toolkit** (`nvcc`, `libcudart`). There is **no** CUDA target in the aggregate `qwen3-8b/Makefile`; build in one of these directories:
+You need an NVIDIA GPU and the **CUDA Toolkit** (`nvcc`, `libcudart`). The top-level `qwen3-8b/Makefile` only provides **`make model`**; build CUDA targets in one of these directories:
 
 - **`qwen3-8b/gpu-cuda/`** — FP16 linear layers (general NVIDIA GPUs)
 - **`qwen3-8b/gpu-cuda-nvfp4/`** — NVFP4 linear layers (Blackwell / RTX 50, **CUDA 13** + CUTLASS). First run **`make cutlass`** to fetch **`third_party/cutlass`**. **`fp4_*` objects are built with C++17** (CUTLASS requirement). Do **not** mix apt **`nvidia-cuda-toolkit` (CUDA 11)** with CUDA 13 (**`make blackwell`** removes 11.x and installs 13).
@@ -218,12 +218,14 @@ The default name in `qwen3-8b/Makefile` is:
 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ```
 
-The GGUF is **not** shipped in the repo (license + size). Place it under `qwen3-8b/`. Recommended: aggregate **`make model`** (`wget` + bundled `.sha256sum` verification).
+The GGUF is **not** shipped in the repo (license + size). Place it under `qwen3-8b/`. Recommended: **`make model`** (`wget` + bundled `.sha256sum` verification; skips download when the file is already present and the checksum passes).
 
 ```bash
 cd qwen3-8b
 make model
 ```
+
+On success, the terminal prints a checksum verification banner.
 
 Manual download:
 
@@ -265,9 +267,9 @@ Build the CPU binary first. An 8B model is slow on CPU; use a small `-n` (e.g. `
 
 ```bash
 cd qwen3-8b
-make model          # if missing: download and verify GGUF
-make build.cpu
-./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
+make model          # if missing: download and verify GGUF (skip if already verified)
+cd cpu && make build
+./qwen3-cpu ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
 On success, text should appear gradually after load.
@@ -277,14 +279,14 @@ On success, text should appear gradually after load.
 ### Build
 
 ```bash
-cd qwen3-8b
-make build.cpu
+cd qwen3-8b/cpu
+make build
 ```
 
-Produces **`cpu/qwen3-cpu`** (or `make build` inside `cpu/`).
+Produces **`qwen3-cpu`** (inside `cpu/`).
 
 ```bash
-ls -lh cpu/qwen3-cpu
+ls -lh qwen3-cpu
 ```
 
 ### Run
@@ -292,21 +294,24 @@ ls -lh cpu/qwen3-cpu
 During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries.
 
 ```bash
-./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/cpu
+./qwen3-cpu ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Give a one-sentence introduction of yourself." \
   -n 16
 ```
 
-Using aggregate `run.cpu`:
+Using the subdirectory `Makefile` `run` target:
 
 ```bash
-make run.cpu PROMPT="Give a one-sentence introduction of yourself."
+cd qwen3-8b/cpu
+make run PROMPT="Give a one-sentence introduction of yourself."
 ```
 
 Model elsewhere:
 
 ```bash
-make run.cpu MODEL=/data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+cd qwen3-8b/cpu
+make run MODEL=/data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
 ## CPU OpenMP
@@ -316,16 +321,17 @@ Uses multiple CPU cores; same model file as single-thread.
 ### Build
 
 ```bash
-cd qwen3-8b
-make build.cpu-multicore
+cd qwen3-8b/cpu-multicore
+make build
 ```
 
-Produces **`cpu-multicore/qwen3-cpu-omp`**.
+Produces **`qwen3-cpu-omp`**.
 
 ### Run
 
 ```bash
-OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/cpu-multicore
+OMP_NUM_THREADS=8 ./qwen3-cpu-omp ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Explain in bullet points what quantization is." \
   -n 32
 ```
@@ -333,8 +339,9 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 `OMP_NUM_THREADS` sets thread count; try 4 or 8 first.
 
 ```bash
-OMP_NUM_THREADS=4 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+cd qwen3-8b/cpu-multicore
+OMP_NUM_THREADS=4 ./qwen3-cpu-omp ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+OMP_NUM_THREADS=8 ./qwen3-cpu-omp ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 Speedup depends on core count, memory bandwidth, and quantization.
@@ -348,26 +355,28 @@ Additional CPU optimizations: **RoPE cos/sin cache** (precomputed at startup), *
 ### Build
 
 ```bash
-cd qwen3-8b
-make build.cpu-blas
+cd qwen3-8b/cpu-blas
+make build
 ```
 
-Produces **`cpu-blas/qwen3-cpu-blas`** (or `make build` inside `cpu-blas/`).
+Produces **`qwen3-cpu-blas`** (inside `cpu-blas/`).
 
 ### Run
 
 During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries.
 
 ```bash
-OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/cpu-blas
+OMP_NUM_THREADS=8 ./qwen3-cpu-blas ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Hello, how are you?" \
   -n 32
 ```
 
-Via aggregate Makefile:
+Via the subdirectory Makefile:
 
 ```bash
-make run.cpu-blas PROMPT="Hello, how are you?"
+cd qwen3-8b/cpu-blas
+make run PROMPT="Hello, how are you?"
 ```
 
 ## ROCm/HIP GPU
@@ -387,24 +396,25 @@ The primary path when ROCm and an AMD GPU are available.
 To override manually:
 
 ```bash
-make build GPU_ARCH=gfx1100          # inside gpu-rocm/
-make build.gpu-rocm GPU_ARCH=gfx1100 # from qwen3-8b/
+cd qwen3-8b/gpu-rocm
+make build GPU_ARCH=gfx1100
 ```
 
 ### Build
 
 ```bash
-cd qwen3-8b
-make build.gpu-rocm
+cd qwen3-8b/gpu-rocm
+make build
 ```
 
 If ROCm is not under `/opt/rocm`:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm
+cd qwen3-8b/gpu-rocm
+make build ROCM=/path/to/rocm
 ```
 
-Produces **`gpu-rocm/qwen3-rocm`**. Links **`-lhipblas -lrocblas`** (Prefill linear GEMM).
+Produces **`qwen3-rocm`**. Links **`-lhipblas -lrocblas`** (Prefill linear GEMM).
 
 ### Prefill acceleration (overview)
 
@@ -443,15 +453,17 @@ Decode throughput (~26 tok/s) is largely unchanged. Long prompts: **TTFT (Time T
 ### Run
 
 ```bash
-./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/gpu-rocm
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Explain what ROCm is for beginners." \
   -n 64
 ```
 
-Using `run.gpu-rocm`:
+Using the subdirectory `run` target:
 
 ```bash
-make run.gpu-rocm PROMPT="Short explanation in English."
+cd qwen3-8b/gpu-rocm
+make run PROMPT="Short explanation in English."
 ```
 
 During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). On exit, stdout also prints **`prefill_tps:` / `decode_tps:` / `total_tps:`** for **`make log.push`** to parse (**inference only**; model weight H2D is excluded). **`gpu-cuda/`** and **`gpu-cuda-nvfp4/`** use the same format via shared **`main.c`**.
@@ -490,7 +502,7 @@ See [`doc/design.md`](doc/design.md) ROCm build section and **`scripts/check_wmm
 
 ## CUDA GPU (NVIDIA)
 
-For NVIDIA GPUs with CUDA. There is **no** `build.gpu-cuda` in the aggregate `qwen3-8b/Makefile`; build under **`gpu-cuda/`** (FP16) or **`gpu-cuda-nvfp4/`** (NVFP4) depending on your GPU. Prompts run as a **prefill batch**; generation is **one-token decode**; attention uses **Flash Attention** (GQA).
+For NVIDIA GPUs with CUDA. The top-level **`qwen3-8b/Makefile` only fetches the model**; build under **`gpu-cuda/`** (FP16) or **`gpu-cuda-nvfp4/`** (NVFP4) depending on your GPU. Prompts run as a **prefill batch**; generation is **one-token decode**; attention uses **Flash Attention** (GQA).
 
 | Directory | Weights at load | Linear / KV at runtime |
 |-----------|-----------------|------------------------|
@@ -625,37 +637,39 @@ sudo usermod -aG render "$USER"   # re-login to apply
 ### Build
 
 ```bash
-cd qwen3-8b
-make build.xdna2
+cd qwen3-8b/xdna2
+make build
 ```
 
-Produces **`xdna2/qwen3-xdna2`**.
+Produces **`qwen3-xdna2`**.
 
 ### Run
 
 For fast BF16 GEMV on the NPU you need **MLIR-AIE / IRON**-generated control microcode bundles, named like `bf16-gemv-<n>x<d>.bin`, under `XDNA_GEMV_DIR`. If missing, the code falls back to OpenMP BF16 GEMV on CPU (**bit-identical** with the NPU path).
 
-The repo ships **`xdna2/xdna-gemv/kernels/`** (paths relative to **`qwen3-8b/`**) with **64-byte placeholders** (magic `GQF3XDNA`). They are **not** executed on the device (`--xdna-status` shows `[STUB]`). Regenerate with `python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels` from the repo root, or `make gen-xdna-kernels` from `qwen3-8b/`. Replace with real MLIR-AIE outputs for hardware GEMV.
+The repo ships **`xdna2/xdna-gemv/kernels/`** (paths relative to **`qwen3-8b/`**) with **64-byte placeholders** (magic `GQF3XDNA`). They are **not** executed on the device (`--xdna-status` shows `[STUB]`). Regenerate with `python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels` from the repo root. Replace with real MLIR-AIE outputs for hardware GEMV.
 
 Useful env vars: `XDNA_GEMV_DIR` (search path for control blobs), `XDNA_FORCE_CPU=1` (force CPU), `XDNA_NUM_COL` (column count; try `XDNA_NUM_COL=1` if `CREATE_HWCTX` returns `EINVAL`).
 
 ```bash
+cd qwen3-8b/xdna2
 # Force CPU fallback
-XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_FORCE_CPU=1 ./qwen3-xdna2 ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 
-# Repo stub placeholders (from qwen3-8b/): not real NPU ctrlcode — `--xdna-status` shows [STUB]
-XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
-  Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
+# Repo stub placeholders (relative to xdna2/): not real NPU ctrlcode — `--xdna-status` shows [STUB]
+XDNA_GEMV_DIR=xdna-gemv/kernels ./qwen3-xdna2 \
+  ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
 
 # With real MLIR-AIE blobs under XDNA_GEMV_DIR: NPU path
-XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
-  Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_GEMV_DIR=xdna-gemv/kernels ./qwen3-xdna2 \
+  ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
-Or:
+Or use the subdirectory Makefile:
 
 ```bash
-make run.xdna2 PROMPT="Short explanation in English."
+cd qwen3-8b/xdna2
+make run PROMPT="Short explanation in English."
 ```
 
 ### XDNA2 + BFPX host weights (`xdna2-bfp16/qwen3-xdna2-bfpx`)
@@ -663,15 +677,16 @@ make run.xdna2 PROMPT="Short explanation in English."
 `xdna2-bfp16/main.c` shares the **same DRM ioctl and chunked BF16 GEMV** as `xdna2/main.c`, but converts linear weights at load time to **BFPX (per-block BF16 scale + int8)** on the host and releases the GGUF mmap afterward. CPU fallback uses **`mm_bfpx`** (float activations × BFPX weights) and is **not numerically aligned** with `xdna2/qwen3-xdna2`. Block approximation means **behavior differs** from **`xdna2/qwen3-xdna2`**, which decodes quantized mmap weights into BF16 **on each GEMV**; neither quality nor speed dominates in all cases.
 
 ```bash
-cd qwen3-8b
-make build.xdna2-bfp16
-XDNA_FORCE_CPU=1 ./xdna2-bfp16/qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
-  Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+cd qwen3-8b/xdna2-bfp16
+make build
+XDNA_FORCE_CPU=1 ./qwen3-xdna2-bfpx ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_GEMV_DIR=../xdna2/xdna-gemv/kernels ./qwen3-xdna2-bfpx \
+  ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 ```bash
-make run.xdna2-bfp16 PROMPT="Short explanation in English."
+cd qwen3-8b/xdna2-bfp16
+make run PROMPT="Short explanation in English."
 ```
 
 ### Notes
@@ -694,13 +709,15 @@ make run.xdna2-bfp16 PROMPT="Short explanation in English."
 Start small:
 
 ```bash
-./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+cd qwen3-8b/cpu
+./qwen3-cpu ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 Then increase `-n`:
 
 ```bash
-./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/gpu-rocm
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Write a short poem." \
   -n 128
 ```
@@ -710,7 +727,8 @@ Then increase `-n`:
 Lower temperature and fix the seed when comparing runs:
 
 ```bash
-./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/gpu-rocm
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "One sentence: what is GGUF?" \
   -n 32 \
   -t 0.2 \
@@ -721,11 +739,17 @@ Byte-identical output across CPU vs GPU is not guaranteed; compare with the **sa
 
 ## Clean
 
-Remove build artifacts:
+Remove build artifacts from each variant subdirectory:
 
 ```bash
-cd qwen3-8b
-make clean
+cd qwen3-8b/cpu && make clean
+cd qwen3-8b/cpu-multicore && make clean
+cd qwen3-8b/cpu-blas && make clean
+cd qwen3-8b/gpu-rocm && make clean
+cd qwen3-8b/xdna2 && make clean
+cd qwen3-8b/xdna2-bfp16 && make clean
+cd qwen3-8b/gpu-cuda && make clean
+cd qwen3-8b/gpu-cuda-nvfp4 && make clean
 ```
 
 Typical files removed:
@@ -736,13 +760,8 @@ Typical files removed:
 - `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
-
-**CUDA** artifacts (`gpu-cuda/qwen3-gpu-cuda`, `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`, etc.) are **not** removed by aggregate `make clean`. To clean them:
-
-```bash
-cd qwen3-8b/gpu-cuda && make clean
-cd qwen3-8b/gpu-cuda-nvfp4 && make clean
-```
+- `gpu-cuda/qwen3-gpu-cuda`
+- `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`
 
 `make clean` does **not** delete the GGUF model.
 
@@ -759,7 +778,8 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 Put the model under `qwen3-8b/` or pass an absolute path:
 
 ```bash
-./cpu/qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+cd qwen3-8b/cpu
+./qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 ### CPU is slow
@@ -822,7 +842,8 @@ ls /opt/rocm/bin/hipcc
 If elsewhere:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm
+cd qwen3-8b/gpu-rocm
+make build ROCM=/path/to/rocm
 ```
 
 ### Wrong `GPU_ARCH` / detection failed
@@ -831,7 +852,8 @@ Must match the GPU ISA. Normally **`GPU_ARCH`** is auto-detected from `rocminfo`
 
 ```bash
 rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
-make build.gpu-rocm GPU_ARCH=gfx1100
+cd qwen3-8b/gpu-rocm
+make build GPU_ARCH=gfx1100
 ```
 
 ### ROCm Prefill is slow (~30 tok/s)
@@ -960,4 +982,4 @@ The goal is to **understand, experiment with, and adapt** Qwen3-family GGUF text
 - Design: `doc/design.md`
 - Changelog: `doc/ChangeLog.md`
 
-When stuck, check `qwen3-8b/Makefile` target names and the model path you pass at runtime—most build/run issues come from those two drifting apart.
+When stuck, confirm you ran **`make model`** under `qwen3-8b/`, built the binary in the correct variant subdirectory, and pass a model path that matches at runtime.

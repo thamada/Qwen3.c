@@ -39,8 +39,8 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は **Q8_K 活性化 + 全型 AVX2 整数内積**（層内 Q8 共有）。**RoPE キャッシュ**、prefill 中 **LM head スキップ**、greedy 時 **`mm_argmax_row`**。**F16 埋め込み F16C**。stderr に **Prefill progress bar** |
 | ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴。**`make wmma`** で hipBLAS 経路・WMMA 非埋め込みを確認 |
-| CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。**Prefill progress bar** とスループット要約。**`make log` / `make log.push`** ベンチ履歴。集約 `Makefile` 外 |
-| CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。**`make log` / `make log.push`** ベンチ履歴。集約 `Makefile` 外 |
+| CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形層 **FP16 VRAM**。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。**Prefill progress bar** とスループット要約。**`make log` / `make log.push`** ベンチ履歴。`gpu-cuda/` で単体ビルド |
+| CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。埋め込みのみ FP16 VRAM。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。**`make log` / `make log.push`** ベンチ履歴。`gpu-cuda-nvfp4/` で単体ビルド |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
 | AMD Ryzen AI XDNA2 NPU（BFPXホスト重み） | `qwen3-8b/xdna2-bfp16/main.c` | `xdna2-bfp16/qwen3-xdna2-bfpx` | 同上の IOCTL・GEMV パイプラインだが、線形重みをブロック FP（BF16スケール + int8）でホスト保持。GGUF mmap は変換後に解放 |
 
@@ -100,7 +100,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
-主に触る場所は `qwen3-8b/` です。ビルドも推論実行も、基本的にはこのディレクトリに移動してから行います。
+主に触る場所は `qwen3-8b/` です。**GGUF の取得**は `qwen3-8b/` の **`make model`**、**ビルドと実行**は各バリアント配下（`cpu/`、`gpu-rocm/` 等）の Makefile で行います。
 
 ## 初心者向け: LLM推論で何が起きるか
 
@@ -182,7 +182,7 @@ make -C gpu-rocm detect-gpu-arch   # 例: Detected GPU arch: gfx1100
 
 ### CUDA 版を使う場合
 
-NVIDIA GPU と **CUDA Toolkit**（`nvcc`・`libcudart`）が必要です。集約 `qwen3-8b/Makefile` には CUDA ターゲットは無く、次の2ディレクトリで単体ビルドします。
+NVIDIA GPU と **CUDA Toolkit**（`nvcc`・`libcudart`）が必要です。`qwen3-8b/Makefile` はモデル取得（**`make model`**）のみで、CUDA ビルドは次の2ディレクトリで行います。
 
 - **`qwen3-8b/gpu-cuda/`** — FP16 線形層（汎用 NVIDIA GPU）
 - **`qwen3-8b/gpu-cuda-nvfp4/`** — NVFP4 線形層（Blackwell / RTX 50 系、**CUDA 13** + CUTLASS）。初回は **`make cutlass`** で **`third_party/cutlass`** を取得。**`fp4_*` オブジェクトは C++17 でビルド**（CUTLASS 要件）。apt **`nvidia-cuda-toolkit`（CUDA 11）** と CUDA 13 は併存させない（**`make blackwell`** が 11.x を除去して 13 を入れる）。
@@ -218,12 +218,14 @@ FP16 ビルド（`gpu-cuda`）の既定は PTX（`compute_86`）。実 GPU 向�
 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 ```
 
-モデルファイルは著作権とファイルサイズの都合により、リポジトリには含めません。`qwen3-8b/gguf.txt` の URL から取得し、`qwen3-8b/` の直下に置きます。推奨は集約 Makefile の **`make model`**（`wget` + 同梱 `.sha256sum` で検証）です。
+モデルファイルは著作権とファイルサイズの都合により、リポジトリには含めません。`qwen3-8b/gguf.txt` の URL から取得し、`qwen3-8b/` の直下に置きます。推奨は **`make model`**（`wget` + 同梱 `.sha256sum` で検証。既にファイルがありチェックサムが通ればダウンロードをスキップ）です。
 
 ```bash
 cd qwen3-8b
 make model
 ```
+
+成功時はターミナルにチェックサム検証成功のメッセージが表示されます。
 
 手動で取得する場合:
 
@@ -265,9 +267,9 @@ sha256sum -c Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 
 ```bash
 cd qwen3-8b
-make model          # 未取得なら GGUF を取得・検証
-make build.cpu
-./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
+make model          # 未取得なら GGUF を取得・検証（取得済みならスキップ）
+cd cpu && make build
+./qwen3-cpu ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 1
 ```
 
 うまくいくと、モデル読み込み後に少しずつテキストが表示されます。
@@ -277,14 +279,14 @@ make build.cpu
 ### ビルド
 
 ```bash
-cd qwen3-8b
-make build.cpu
+cd qwen3-8b/cpu
+make build
 ```
 
-成功すると **`cpu/qwen3-cpu`** ができます（`cpu/` 直下で `make build` でも可）。
+成功すると **`qwen3-cpu`** ができます（`cpu/` 直下）。
 
 ```bash
-ls -lh cpu/qwen3-cpu
+ls -lh qwen3-cpu
 ```
 
 ### 実行
@@ -292,19 +294,22 @@ ls -lh cpu/qwen3-cpu
 プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます。
 
 ```bash
-./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で短く自己紹介してください。" -n 16
+cd qwen3-8b/cpu
+./qwen3-cpu ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で短く自己紹介してください。" -n 16
 ```
 
-集約 `Makefile` の `run.cpu` を使う場合:
+`Makefile` の `run` を使う場合:
 
 ```bash
-make run.cpu PROMPT="日本語で短く自己紹介してください。"
+cd qwen3-8b/cpu
+make run PROMPT="日本語で短く自己紹介してください。"
 ```
 
 別の場所にあるモデルを使う場合:
 
 ```bash
-make run.cpu MODEL=/data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+cd qwen3-8b/cpu
+make run MODEL=/data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
 ## CPU OpenMP 版
@@ -314,16 +319,17 @@ CPU コアを複数使う版です。単スレッド版と同じモデルを読�
 ### ビルド
 
 ```bash
-cd qwen3-8b
-make build.cpu-multicore
+cd qwen3-8b/cpu-multicore
+make build
 ```
 
-成功すると **`cpu-multicore/qwen3-cpu-omp`** ができます。
+成功すると **`qwen3-cpu-omp`** ができます。
 
 ### 実行
 
 ```bash
-OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/cpu-multicore
+OMP_NUM_THREADS=8 ./qwen3-cpu-omp ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "箇条書きで、量子化とは何かを説明してください。" \
   -n 32
 ```
@@ -331,8 +337,9 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 `OMP_NUM_THREADS` は使う CPU スレッド数です。迷ったら、まずは 4 や 8 から試してください。
 
 ```bash
-OMP_NUM_THREADS=4 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+cd qwen3-8b/cpu-multicore
+OMP_NUM_THREADS=4 ./qwen3-cpu-omp ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+OMP_NUM_THREADS=8 ./qwen3-cpu-omp ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 速くなるかどうかは CPU のコア数、メモリ帯域、モデルの量子化形式に依存します。
@@ -346,26 +353,28 @@ OMP_NUM_THREADS=8 ./cpu-multicore/qwen3-cpu-omp Qwen_Qwen3-VL-8B-Instruct-IQ2_M.
 ### ビルド
 
 ```bash
-cd qwen3-8b
-make build.cpu-blas
+cd qwen3-8b/cpu-blas
+make build
 ```
 
-成功すると **`cpu-blas/qwen3-cpu-blas`** ができます（`cpu-blas/` 直下で `make build` でも可）。
+成功すると **`qwen3-cpu-blas`** ができます（`cpu-blas/` 直下）。
 
 ### 実行
 
 プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます。
 
 ```bash
-OMP_NUM_THREADS=8 ./cpu-blas/qwen3-cpu-blas Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/cpu-blas
+OMP_NUM_THREADS=8 ./qwen3-cpu-blas ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "Hello, how are you?" \
   -n 32
 ```
 
-集約 `Makefile` の `run.cpu-blas` を使う場合:
+`Makefile` の `run` を使う場合:
 
 ```bash
-make run.cpu-blas PROMPT="Hello, how are you?"
+cd qwen3-8b/cpu-blas
+make run PROMPT="Hello, how are you?"
 ```
 
 ## ROCm/HIP GPU 版
@@ -385,24 +394,25 @@ AMD GPU と ROCm が使える環境では、こちらが本命です。
 手動で上書きする場合:
 
 ```bash
-make build GPU_ARCH=gfx1100          # gpu-rocm/ 内
-make build.gpu-rocm GPU_ARCH=gfx1100 # qwen3-8b/ から
+cd qwen3-8b/gpu-rocm
+make build GPU_ARCH=gfx1100
 ```
 
 ### ビルド
 
 ```bash
-cd qwen3-8b
-make build.gpu-rocm
+cd qwen3-8b/gpu-rocm
+make build
 ```
 
 ROCm が `/opt/rocm` 以外にある場合:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm
+cd qwen3-8b/gpu-rocm
+make build ROCM=/path/to/rocm
 ```
 
-成功すると **`gpu-rocm/qwen3-rocm`** ができます。リンクには **`-lhipblas -lrocblas`** が含まれます（Prefill 線形層の GEMM 用）。
+成功すると **`qwen3-rocm`** ができます。リンクには **`-lhipblas -lrocblas`** が含まれます（Prefill 線形層の GEMM 用）。
 
 ### Prefill 高速化（概要）
 
@@ -441,15 +451,17 @@ Decode スループット（~26 tok/s）は Prefill 改善の影響を受けな�
 ### 実行
 
 ```bash
-./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/gpu-rocm
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "日本語で、ROCmとは何かを初心者向けに説明してください。" \
   -n 64
 ```
 
-`Makefile` の `run.gpu-rocm` を使う場合:
+`Makefile` の `run` を使う場合:
 
 ```bash
-make run.gpu-rocm PROMPT="日本語で短く説明してください。"
+cd qwen3-8b/gpu-rocm
+make run PROMPT="日本語で短く説明してください。"
 ```
 
 プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。終了時 stdout には **`prefill_tps:` / `decode_tps:` / `total_tps:`** も出力され、**`make log.push`** がパースします（**推論区間のみ**。モデル重み H2D は計測外）。**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** も共有 **`main.c`** により同形式です。
@@ -488,7 +500,7 @@ make wmma-probe                     # 校正用 wmma-probe のみビルド
 
 ## CUDA GPU 版（NVIDIA）
 
-NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` には `build.gpu-cuda` は無い**ため、用途に応じて **`gpu-cuda/`**（FP16）または **`gpu-cuda-nvfp4/`**（NVFP4）で単体ビルドします。プロンプトは **Prefill バッチ**、生成は **1 トークン Decode**、Attention は **Flash Attention**（GQA）です。
+NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` はモデル取得のみ**のため、用途に応じて **`gpu-cuda/`**（FP16）または **`gpu-cuda-nvfp4/`**（NVFP4）で単体ビルドします。プロンプトは **Prefill バッチ**、生成は **1 トークン Decode**、Attention は **Flash Attention**（GQA）です。
 
 | ディレクトリ | ロード時の重み | 線形層 / KV キャッシュの実行 |
 |--------------|----------------|------------------------------|
@@ -623,37 +635,39 @@ sudo usermod -aG render "$USER"   # 反映には再ログイン要
 ### ビルド
 
 ```bash
-cd qwen3-8b
-make build.xdna2
+cd qwen3-8b/xdna2
+make build
 ```
 
-成功すると **`xdna2/qwen3-xdna2`** ができます。
+成功すると **`qwen3-xdna2`** ができます。
 
 ### 実行
 
 NPU 上で実際に高速 GEMV を回すには **MLIR-AIE / IRON ツールチェイン**で生成した BF16 GEMV 制御コードバイナリ一式が必要です。`bf16-gemv-<n>x<d>.bin` という命名で `XDNA_GEMV_DIR` 配下に配置します。未配置の場合は OpenMP BF16 GEMV にフォールバックします（**NPU 経路とこの CPU フォールバックは bit-identical**）。
 
-**`xdna2/xdna-gemv/kernels/`** には、名前とレイアウト用の **64 バイト・プレースホルダ**（マジック `GQF3XDNA`）が置いてあります。**実機の ERT には渡されません**（`--xdna-status` では `[STUB]`）。再生成はリポジトリルートで `python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels`、または `cd qwen3-8b && make gen-xdna-kernels`。本番の NPU 用には MLIR-AIE 等で生成したバイナリに差し替えてください。
+**`xdna2/xdna-gemv/kernels/`** には、名前とレイアウト用の **64 バイト・プレースホルダ**（マジック `GQF3XDNA`）が置いてあります。**実機の ERT には渡されません**（`--xdna-status` では `[STUB]`）。再生成はリポジトリルートで `python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels`。本番の NPU 用には MLIR-AIE 等で生成したバイナリに差し替えてください。
 
 環境変数の例: `XDNA_GEMV_DIR`（制御コード検索ディレクトリ）、`XDNA_FORCE_CPU=1`（CPU 強制）、`XDNA_NUM_COL`（列数。`CREATE_HWCTX` が EINVAL になる環境では `XDNA_NUM_COL=1` を試す）。
 
 ```bash
+cd qwen3-8b/xdna2
 # 強制的に CPU フォールバックで動かす場合
-XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_FORCE_CPU=1 ./qwen3-xdna2 ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 
-# リポジトリ同梱プレースホルダ（qwen3-8b からの相対パス）。実 NPU ctrlcode ではない。
-XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
-  Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
+# リポジトリ同梱プレースホルダ（xdna2/ からの相対パス）。実 NPU ctrlcode ではない。
+XDNA_GEMV_DIR=xdna-gemv/kernels ./qwen3-xdna2 \
+  ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --xdna-status
 
 # 制御コードが揃っているときは NPU 経路で実行（本物の .bin に差し替え後）
-XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2/qwen3-xdna2 \
-  Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_GEMV_DIR=xdna-gemv/kernels ./qwen3-xdna2 \
+  ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
-`make run.xdna2` も使えます。
+`Makefile` の `run` を使う場合:
 
 ```bash
-make run.xdna2 PROMPT="日本語で短く説明してください。"
+cd qwen3-8b/xdna2
+make run PROMPT="日本語で短く説明してください。"
 ```
 
 ### XDNA2 + BFPX ホスト重み版（`xdna2-bfp16/qwen3-xdna2-bfpx`）
@@ -661,15 +675,16 @@ make run.xdna2 PROMPT="日本語で短く説明してください。"
 `xdna2-bfp16/main.c` は、**`xdna2/main.c` と同一の DRM ioctl** および **チャンク構成の BF16 GEMV（NPU 経路の枠組み）** を用います。一方で、密な行列レイアウトの重みはロード時に **BFPX（ブロックごとに BF16 スケールと int8 の係数）** へ変換し、ホストメモリ上にのみ保持します。GGUF への mmap は、この変換が終わってから解放します。NPU が使えないときの CPU 側のフォールバックでは **`mm_bfpx`** が用いられ、活性値は単精度浮動小数点数のまま、BFPX 形式の重みとの一般行列ベクトル積を計算します。**`xdna2/qwen3-xdna2` とビット単位で完全一致するとは限りません**。量子化に加えブロック近似の誤差があります。**GEMV で量子化 mmap から直接 BF16 へ展開する `xdna2/qwen3-xdna2`** とは経路も誤差の立ち方も異なるため、品質の優劣はケースによります。
 
 ```bash
-cd qwen3-8b
-make build.xdna2-bfp16
-XDNA_FORCE_CPU=1 ./xdna2-bfp16/qwen3-xdna2-bfpx Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
-XDNA_GEMV_DIR=xdna2/xdna-gemv/kernels ./xdna2-bfp16/qwen3-xdna2-bfpx \
-  Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+cd qwen3-8b/xdna2-bfp16
+make build
+XDNA_FORCE_CPU=1 ./qwen3-xdna2-bfpx ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
+XDNA_GEMV_DIR=../xdna2/xdna-gemv/kernels ./qwen3-xdna2-bfpx \
+  ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 8
 ```
 
 ```bash
-make run.xdna2-bfp16 PROMPT="日本語で短く説明してください。"
+cd qwen3-8b/xdna2-bfp16
+make run PROMPT="日本語で短く説明してください。"
 ```
 
 ### 注意
@@ -692,13 +707,15 @@ make run.xdna2-bfp16 PROMPT="日本語で短く説明してください。"
 まずは次のように短めに試すのがおすすめです。
 
 ```bash
-./cpu/qwen3-cpu Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+cd qwen3-8b/cpu
+./qwen3-cpu ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 慣れてきたら `-n` を増やします。
 
 ```bash
-./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で詩を書いてください。" -n 128
+cd qwen3-8b/gpu-rocm
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "日本語で詩を書いてください。" -n 128
 ```
 
 ## 生成を安定させたいとき
@@ -706,7 +723,8 @@ make run.xdna2-bfp16 PROMPT="日本語で短く説明してください。"
 同じ入力で結果を比較したい場合は、温度を下げたり seed を固定します。
 
 ```bash
-./gpu-rocm/qwen3-rocm Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
+cd qwen3-8b/gpu-rocm
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf \
   -p "1文で説明してください: GGUFとは？" \
   -n 32 \
   -t 0.2 \
@@ -717,11 +735,17 @@ make run.xdna2-bfp16 PROMPT="日本語で短く説明してください。"
 
 ## 片付け
 
-ビルド生成物を消すには:
+各バリアントのビルド生成物は、対応するサブディレクトリで `make clean` します。
 
 ```bash
-cd qwen3-8b
-make clean
+cd qwen3-8b/cpu && make clean
+cd qwen3-8b/cpu-multicore && make clean
+cd qwen3-8b/cpu-blas && make clean
+cd qwen3-8b/gpu-rocm && make clean
+cd qwen3-8b/xdna2 && make clean
+cd qwen3-8b/xdna2-bfp16 && make clean
+cd qwen3-8b/gpu-cuda && make clean
+cd qwen3-8b/gpu-cuda-nvfp4 && make clean
 ```
 
 削除される主なファイル:
@@ -732,15 +756,10 @@ make clean
 - `gpu-rocm/qwen3-rocm`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
+- `gpu-cuda/qwen3-gpu-cuda`
+- `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4`
 
-**CUDA 版**（`gpu-cuda/qwen3-gpu-cuda`、`gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` 等）は集約 `make clean` の対象外です。消す場合:
-
-```bash
-cd qwen3-8b/gpu-cuda && make clean
-cd qwen3-8b/gpu-cuda-nvfp4 && make clean
-```
-
-モデルファイルは `make clean` では削除されません。
+`make clean` では GGUF モデルファイルは削除されません。
 
 ## よくあるトラブル
 
@@ -755,7 +774,8 @@ ls -lh qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 見つからない場合は、モデルを `qwen3-8b/` に置くか、実行時に絶対パスを指定してください。
 
 ```bash
-./cpu/qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
+cd qwen3-8b/cpu
+./qwen3-cpu /data/models/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 4
 ```
 
 ### CPU 版が遅い
@@ -818,7 +838,8 @@ ls /opt/rocm/bin/hipcc
 別の場所にある場合:
 
 ```bash
-make build.gpu-rocm ROCM=/path/to/rocm
+cd qwen3-8b/gpu-rocm
+make build ROCM=/path/to/rocm
 ```
 
 ### GPU_ARCH が合わない / 検出に失敗する
@@ -827,7 +848,8 @@ make build.gpu-rocm ROCM=/path/to/rocm
 
 ```bash
 rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
-make build.gpu-rocm GPU_ARCH=gfx1100
+cd qwen3-8b/gpu-rocm
+make build GPU_ARCH=gfx1100
 ```
 
 ### ROCm Prefill が遅い（~30 tok/s 程度）
@@ -969,4 +991,4 @@ thinking 対応 GGUF をそのまま動かすと、**reasoning テキストが�
 - 設計仕様: `doc/design.md`
 - 変更履歴: `doc/ChangeLog.md`
 
-困ったときは、まず `qwen3-8b/Makefile` のターゲット名と、実行時に渡しているモデルパスを確認してください。ビルドと実行の大半の問題は、この 2 つの不一致から起きます。
+困ったときは、まず `qwen3-8b/` で **`make model`** 済みか、各バリアント配下でビルドしたバイナリと、実行時に渡しているモデルパスが一致しているかを確認してください。
