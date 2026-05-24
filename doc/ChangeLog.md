@@ -4,6 +4,48 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-25 01:43:44
+
+**`qwen3-8b/gpu-cuda-nvfp4/`** / 共有 **`gpu-cuda/main.c`** — **NVFP4 オフラインキャッシュ**（`make pack-cache` / `--pack-nvfp4-cache`）と **GGUF 行単位融合デ量子化**。**`gpu-cuda/main.c`** / **`gpu-rocm/main.c`** — 重み H2D 進捗に **レイヤーあたり秒数・GB/sec** を追加。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_cache.h` / `fp4_cache_io.c`（新規）
+
+- **`FP4HostWeight`**: ホスト側 NVFP4 重み（パディング済み **`N`/`K`**、実形状 **`N_act`/`K_act`**、**`h_fp4`/`h_sf`**）。
+- **`.fp4bin` ファイル**: ヘッダ（magic **`NFAQ`**、version **1**、形状・**`sf_elems`**）+ FP4 ペイロード + スケールファクタ。
+- **キャッシュディレクトリ**: 既定 **`<model>.gguf.nvfp4`**（**`fp4_cache_dir_path`**）。各 tensor は **`<cache_dir>/<tensor_name>.fp4bin`**（**`fp4_cache_tensor_path`**）。
+- **`manifest`**: **`FP4_CACHE_VERSION`**、**`gguf_size`**、**`gguf_mtime`**。GGUF が変わると無効化（**`fp4_cache_manifest_valid`**）。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_gemm.cu` / `fp4_gemm.h` / `fp4_qwen3.cu` / `fp4_qwen3.h`
+
+- **`fp4_host_weight_build`**: 行コールバック（**`fp4_dequant_row_fn`**）からホスト NVFP4 を構築（F16 全行列ステージング不要）。
+- **`fp4_weight_cache_upload`**: **`FP4HostWeight`** → デバイス **`FP4WeightCache`**。
+- **`fp4_qwen3_host_weight_from_rows`** / **`fp4_qwen3_weight_from_host`**: パック・ロード・H2D 用 API。
+
+#### `qwen3-8b/gpu-cuda/main.c`（**`BONSAI_FP4=1`** 時）
+
+- **`dequant_tensor_row`**: GGUF mmap 上の **IQ2_S / IQ3_S / Q4_K / Q5_K / F16 / F32** を行単位 F32 復号。
+- **`upload_linear_fp4`**: オフラインキャッシュ有効時は **`.fp4bin`** から H2D。ミス時は GGUF 行デ量子化 → NVFP4 量子化にフォールバック。
+- **`upload_embd_gpu_streaming`**: **`token_embd`** を量子化 GGUF から行単位で FP16 VRAM へ（全 tensor ステージング不要）。
+- **`pack_nvfp4_cache`**: 全線形 tensor（**`L×7 + output.weight`**）をキャッシュへ書き出し。
+- CLI: **`--pack-nvfp4-cache [dir]`**（パックのみで終了）、**`--no-nvfp4-cache`**（常に GGUF から再量子化）。
+- 重み H2D: 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**（**`layer_device_bytes`** ベース）。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/Makefile`
+
+- **`fp4_cache_io.o`** をリンク。**`pack-cache`**: **`./qwen3-gpu-cuda-nvfp4 "$(MODEL)" --pack-nvfp4-cache`**。
+
+#### `qwen3-8b/gpu-rocm/main.c`
+
+- 重み H2D: 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**（CUDA FP16 版と同形式）。
+
+#### ドキュメント
+
+**`doc/design.md`**: ファイル一覧（**`fp4_cache.*`**）、Make ターゲット（**`pack-cache`**）、NVFP4 ロード節（オフラインキャッシュ・融合デ量子化・CLI）、実行時挙動（H2D 進捗）、トラブルシュートを上記に同期。
+
+**`README.md`** / **`README.en.md`**: 実行経路表・CUDA クイックリファレンス・NVFP4 ビルド節（**`make pack-cache`** / CLI）・起動ログ・トラブルシュート・「実装を読む順序」を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-25 00:53:36
 
 **`qwen3-8b/Makefile`** — トップ Makefile を **`make model` のみ**に整理。ビルド・実行・クリーンは各サブディレクトリの **`Makefile`** に一本化。

@@ -32,6 +32,8 @@
 #include <cuda_runtime.h>
 #ifdef BONSAI_FP4
 #include "fp4_qwen3.h"
+#include "fp4_cache.h"
+#include "fp4_gemm.h"
 #endif
 
 #define CUDACHECK(x) do { \
@@ -1082,6 +1084,253 @@ static const void *raw_tensor_ptr(Model *m, const TensorInfo *ti) {
     return m->fdata + m->doff + ti->offset;
 }
 
+#ifdef BONSAI_FP4
+static const char *g_gguf_path_for_cache;
+static int g_use_nvfp4_cache = 1;
+static int g_no_nvfp4_cache = 0;
+static char g_nvfp4_cache_dir[1024];
+
+typedef struct {
+    const void *raw;
+    int type;
+    int K;
+} TensorRowDequantCtx;
+
+static int tensor_row_width(const TensorInfo *ti) {
+    return (int)((ti->ne[0] <= ti->ne[1]) ? ti->ne[0] : ti->ne[1]);
+}
+
+static int tensor_n_rows(const TensorInfo *ti) {
+    return (int)((ti->ne[0] <= ti->ne[1]) ? ti->ne[1] : ti->ne[0]);
+}
+
+static void dequant_tensor_row(void *vctx, int row, float *row_out, int K_act) {
+    TensorRowDequantCtx *ctx = (TensorRowDequantCtx *)vctx;
+    int K = ctx->K;
+    int blocks_per_row = K / QK_K;
+
+    switch (ctx->type) {
+    case DT_F32:
+        memcpy(row_out, (const float *)ctx->raw + (size_t)row * (size_t)K,
+               (size_t)K_act * sizeof(float));
+        break;
+    case DT_F16: {
+        const uint16_t *src = (const uint16_t *)ctx->raw;
+        for (int k = 0; k < K_act; k++)
+            row_out[k] = host_f16f32(src[(size_t)row * (size_t)K + (size_t)k]);
+        break;
+    }
+    case DT_Q4_K: {
+        const BlockQ4_K *blocks = (const BlockQ4_K *)ctx->raw;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float tmp[QK_K];
+            dequant_q4_k(blocks + row * blocks_per_row + b, tmp, 1);
+            memcpy(row_out + b * QK_K, tmp, (size_t)QK_K * sizeof(float));
+        }
+        break;
+    }
+    case DT_Q5_K: {
+        const BlockQ5_K *blocks = (const BlockQ5_K *)ctx->raw;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float tmp[QK_K];
+            dequant_q5_k(blocks + row * blocks_per_row + b, tmp, 1);
+            memcpy(row_out + b * QK_K, tmp, (size_t)QK_K * sizeof(float));
+        }
+        break;
+    }
+    case DT_IQ2_S: {
+        const BlockIQ2_S *blocks = (const BlockIQ2_S *)ctx->raw;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float tmp[QK_K];
+            dequant_iq2_s(blocks + row * blocks_per_row + b, tmp, 1);
+            memcpy(row_out + b * QK_K, tmp, (size_t)QK_K * sizeof(float));
+        }
+        break;
+    }
+    case DT_IQ3_S: {
+        const BlockIQ3_S *blocks = (const BlockIQ3_S *)ctx->raw;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float tmp[QK_K];
+            dequant_iq3_s(blocks + row * blocks_per_row + b, tmp, 1);
+            memcpy(row_out + b * QK_K, tmp, (size_t)QK_K * sizeof(float));
+        }
+        break;
+    }
+    default:
+        fprintf(stderr, "Error: unsupported dtype %d for row dequant\n", ctx->type);
+        exit(1);
+    }
+}
+
+static void *linear_fp4_from_gguf(Model *m, TensorInfo *ti, int n_out, int n_in) {
+    TensorRowDequantCtx ctx = { raw_tensor_ptr(m, ti), ti->type, n_in };
+    void *cache = fp4_qwen3_weight_from_rows(n_out, n_in, dequant_tensor_row, &ctx);
+    if (!cache)
+        fprintf(stderr, "NVFP4 quantize failed for %s (%dx%d)\n", ti->name, n_out, n_in);
+    return cache;
+}
+
+static FP4HostWeight *linear_fp4_host_from_gguf(Model *m, TensorInfo *ti,
+                                                int n_out, int n_in) {
+    TensorRowDequantCtx ctx = { raw_tensor_ptr(m, ti), ti->type, n_in };
+    FP4HostWeight *hw = fp4_qwen3_host_weight_from_rows(n_out, n_in,
+                                                          dequant_tensor_row, &ctx);
+    if (!hw)
+        fprintf(stderr, "NVFP4 pack failed for %s (%dx%d)\n", ti->name, n_out, n_in);
+    return hw;
+}
+
+static void *linear_fp4_from_cache_file(const char *cache_dir, const char *name,
+                                        int n_out, int n_in) {
+    char path[1024];
+    fp4_cache_tensor_path(cache_dir, name, path, sizeof(path));
+    FP4HostWeight *hw = fp4_host_weight_load(path);
+    if (!hw || hw->N_act != n_out || hw->K_act != n_in) {
+        if (hw) fp4_host_weight_free(hw);
+        return NULL;
+    }
+    void *cache = fp4_qwen3_weight_from_host(hw);
+    fp4_host_weight_free(hw);
+    return cache;
+}
+
+static int linear_fp4_save_cache(Model *m, const char *cache_dir, const char *name,
+                                 int n_out, int n_in) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) return -1;
+    FP4HostWeight *hw = linear_fp4_host_from_gguf(m, ti, n_out, n_in);
+    if (!hw) return -1;
+    char path[1024];
+    fp4_cache_tensor_path(cache_dir, name, path, sizeof(path));
+    int rc = fp4_host_weight_save(hw, path);
+    fp4_host_weight_free(hw);
+    return rc;
+}
+
+static void *upload_embd_gpu_streaming(Model *m, int *out_type) {
+    TensorInfo *ti = ti_find(m, "token_embd.weight");
+    if (!ti) return NULL;
+
+    int row_w = tensor_row_width(ti);
+    int n_rows = tensor_n_rows(ti);
+    size_t nel = ti_nelements(ti);
+    if ((size_t)row_w * (size_t)n_rows != nel) {
+        fprintf(stderr, "Error: token_embd.weight shape mismatch\n");
+        exit(1);
+    }
+
+    if (ti->type == DT_F32) {
+        if (out_type) *out_type = DT_F32;
+        void *dptr;
+        CUDACHECK(cudaMalloc(&dptr, nel * sizeof(float)));
+        CUDACHECK(cudaMemcpy(dptr, raw_tensor_ptr(m, ti), nel * sizeof(float),
+                             cudaMemcpyHostToDevice));
+        return dptr;
+    }
+    if (ti->type == DT_F16) {
+        if (out_type) *out_type = DT_F16;
+        void *dptr;
+        CUDACHECK(cudaMalloc(&dptr, nel * sizeof(uint16_t)));
+        CUDACHECK(cudaMemcpy(dptr, raw_tensor_ptr(m, ti), nel * sizeof(uint16_t),
+                             cudaMemcpyHostToDevice));
+        return dptr;
+    }
+
+    if (out_type) *out_type = DT_F16;
+    void *dptr;
+    CUDACHECK(cudaMalloc(&dptr, nel * sizeof(uint16_t)));
+    uint16_t *row_f16 = (uint16_t *)malloc((size_t)row_w * sizeof(uint16_t));
+    float *row_f32 = (float *)malloc((size_t)row_w * sizeof(float));
+    if (!row_f16 || !row_f32) {
+        fprintf(stderr, "Error: failed to allocate embedding row buffer\n");
+        exit(1);
+    }
+
+    TensorRowDequantCtx ctx = { raw_tensor_ptr(m, ti), ti->type, row_w };
+    for (int r = 0; r < n_rows; r++) {
+        dequant_tensor_row(&ctx, r, row_f32, row_w);
+        for (int k = 0; k < row_w; k++)
+            row_f16[k] = host_f32f16(row_f32[k]);
+        CUDACHECK(cudaMemcpy((uint16_t *)dptr + (size_t)r * (size_t)row_w, row_f16,
+                             (size_t)row_w * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    }
+    free(row_f16);
+    free(row_f32);
+    return dptr;
+}
+
+static void upload_linear_fp4(Model *m, const char *name, void **out_fp4,
+                              int n_out, int n_in, const char *cache_dir,
+                              int use_cache) {
+    TensorInfo *ti = ti_find(m, name);
+    if (!ti) {
+        fprintf(stderr, "missing tensor %s\n", name);
+        exit(1);
+    }
+    if (use_cache) {
+        *out_fp4 = linear_fp4_from_cache_file(cache_dir, name, n_out, n_in);
+        if (*out_fp4) return;
+        fprintf(stderr, "Warning: NVFP4 cache miss for %s, falling back to GGUF\n", name);
+    }
+    *out_fp4 = linear_fp4_from_gguf(m, ti, n_out, n_in);
+    if (!*out_fp4) exit(1);
+}
+
+static int pack_nvfp4_cache(Model *m, const char *cache_dir) {
+    Config *c = &m->cfg;
+    int L = c->n_layers;
+    char name[128];
+    int n_saved = 0;
+    int n_total = L * 7 + 1;
+
+    printf("Packing NVFP4 cache to %s ...\n", cache_dir);
+    if (fp4_cache_write_manifest(cache_dir, g_gguf_path_for_cache) != 0) {
+        fprintf(stderr, "Error: failed to write NVFP4 cache manifest\n");
+        return -1;
+    }
+
+    for (int l = 0; l < L; l++) {
+        struct { const char *fmt; int n_out; int n_in; } specs[] = {
+            { "blk.%d.attn_q.weight", c->dim, c->dim },
+            { "blk.%d.attn_k.weight", c->kv_dim, c->dim },
+            { "blk.%d.attn_v.weight", c->kv_dim, c->dim },
+            { "blk.%d.attn_output.weight", c->dim, c->dim },
+            { "blk.%d.ffn_gate.weight", c->hidden_dim, c->dim },
+            { "blk.%d.ffn_up.weight", c->hidden_dim, c->dim },
+            { "blk.%d.ffn_down.weight", c->dim, c->hidden_dim },
+        };
+        for (int i = 0; i < 7; i++) {
+            sprintf(name, specs[i].fmt, l);
+            if (linear_fp4_save_cache(m, cache_dir, name, specs[i].n_out, specs[i].n_in) != 0) {
+                fprintf(stderr, "Error: failed to pack %s\n", name);
+                return -1;
+            }
+            n_saved++;
+            if (n_saved % 8 == 0)
+                printf("  packed %d/%d tensors\n", n_saved, n_total);
+        }
+    }
+
+    {
+        const char *out_name = "output.weight";
+        if (!ti_find(m, out_name)) out_name = "token_embd.weight";
+        if (!ti_find(m, out_name)) {
+            fprintf(stderr, "Error: missing output.weight\n");
+            return -1;
+        }
+        if (linear_fp4_save_cache(m, cache_dir, out_name, c->vocab_size, c->dim) != 0) {
+            fprintf(stderr, "Error: failed to pack %s\n", out_name);
+            return -1;
+        }
+        n_saved++;
+    }
+
+    printf("NVFP4 cache written: %s (%d tensors)\n", cache_dir, n_saved);
+    return 0;
+}
+#endif
+
+#ifndef BONSAI_FP4
 static void materialize_host_f16(Model *m, const TensorInfo *ti,
                                  float *f32_buf, uint16_t *f16_buf) {
     size_t nel = ti_nelements(ti);
@@ -1159,23 +1408,6 @@ static void *upload_fp16_dequant(Model *m, const char *name,
     CUDACHECK(cudaMemcpy(dptr, f16_buf, nel * sizeof(uint16_t), cudaMemcpyHostToDevice));
     return dptr;
 }
-
-#ifdef BONSAI_FP4
-static void upload_linear_fp4(Model *m, const char *name,
-                              float *f32_buf, uint16_t *f16_buf,
-                              void **out_fp4, int n_out, int n_in) {
-    TensorInfo *ti = ti_find(m, name);
-    if (!ti) {
-        fprintf(stderr, "missing tensor %s\n", name);
-        exit(1);
-    }
-    materialize_host_f16(m, ti, f32_buf, f16_buf);
-    *out_fp4 = fp4_qwen3_weight_from_f16_host(f16_buf, n_out, n_in);
-    if (!*out_fp4) {
-        fprintf(stderr, "NVFP4 quantize failed for %s (%dx%d)\n", name, n_out, n_in);
-        exit(1);
-    }
-}
 #endif
 
 static void *upload_f32(Model *m, const char *name) {
@@ -1192,6 +1424,7 @@ static void *upload_f32(Model *m, const char *name) {
     return dptr;
 }
 
+#ifndef BONSAI_FP4
 static size_t max_tensor_nelements(Model *m) {
     size_t mx = 0;
     for (int i = 0; i < m->nti; i++) {
@@ -1200,22 +1433,88 @@ static size_t max_tensor_nelements(Model *m) {
     }
     return mx;
 }
+#endif
+
+static double timespec_elapsed_sec(const struct timespec *t0, const struct timespec *t1) {
+    return (double)(t1->tv_sec - t0->tv_sec)
+         + (double)(t1->tv_nsec - t0->tv_nsec) * 1e-9;
+}
+
+static size_t ti_dev_upload_bytes(const TensorInfo *ti) {
+    if (!ti) return 0;
+    size_t nel = ti_nelements(ti);
+    if (ti->type == DT_F32)
+        return nel * sizeof(float);
+    return nel * sizeof(uint16_t);
+}
+
+#ifdef BONSAI_FP4
+static size_t layer_device_bytes(Model *m, WeightsDev *wd, int l) {
+    char name[128];
+    size_t b = 0;
+    static const char *f32_suffix[] = {
+        "attn_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight", "ffn_norm.weight"
+    };
+    for (int i = 0; i < 4; i++) {
+        sprintf(name, "blk.%d.%s", l, f32_suffix[i]);
+        b += ti_dev_upload_bytes(ti_find(m, name));
+    }
+    b += fp4_weight_cache_device_bytes(wd->wq_fp4[l]);
+    b += fp4_weight_cache_device_bytes(wd->wk_fp4[l]);
+    b += fp4_weight_cache_device_bytes(wd->wv_fp4[l]);
+    b += fp4_weight_cache_device_bytes(wd->wo_fp4[l]);
+    b += fp4_weight_cache_device_bytes(wd->gate_fp4[l]);
+    b += fp4_weight_cache_device_bytes(wd->up_fp4[l]);
+    b += fp4_weight_cache_device_bytes(wd->down_fp4[l]);
+    return b;
+}
+#else
+static size_t layer_device_bytes(Model *m, int l) {
+    char name[128];
+    size_t b = 0;
+    static const char *suffix[] = {
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+        "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+        "ffn_norm.weight", "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
+    };
+    for (int i = 0; i < (int)(sizeof(suffix) / sizeof(suffix[0])); i++) {
+        sprintf(name, "blk.%d.%s", l, suffix[i]);
+        b += ti_dev_upload_bytes(ti_find(m, name));
+    }
+    return b;
+}
+#endif
 
 static void upload_weights_gpu(Model *m) {
     Config *c = &m->cfg;
     int L = c->n_layers;
     WeightsDev *wd = &m->wd;
 
+#ifdef BONSAI_FP4
+    char cache_dir[1024];
+    if (g_nvfp4_cache_dir[0])
+        snprintf(cache_dir, sizeof(cache_dir), "%s", g_nvfp4_cache_dir);
+    else
+        fp4_cache_dir_path(g_gguf_path_for_cache, cache_dir, sizeof(cache_dir));
+
+    int use_cache = g_use_nvfp4_cache && !g_no_nvfp4_cache &&
+                    fp4_cache_manifest_valid(cache_dir, g_gguf_path_for_cache);
+    if (use_cache)
+        printf("Loading NVFP4 cache from %s ...\n", cache_dir);
+    else
+        printf("Uploading weights (fused dequant -> NVFP4 linear layers)...\n");
+#else
     size_t max_nel = max_tensor_nelements(m);
     printf("Allocating dequant staging: max tensor = %zu elements (%.1f MiB F32 + %.1f MiB F16)\n",
            max_nel, (max_nel * 4.0) / (1024.0 * 1024.0), (max_nel * 2.0) / (1024.0 * 1024.0));
 
-    float    *f32 = (float    *)malloc(max_nel * sizeof(float));
+    float *f32 = (float *)malloc(max_nel * sizeof(float));
     uint16_t *f16 = (uint16_t *)malloc(max_nel * sizeof(uint16_t));
     if (!f32 || !f16) {
         fprintf(stderr, "Error: failed to allocate dequant staging buffers\n");
         exit(1);
     }
+#endif
 
     wd->norm_att = (float **)calloc(L, sizeof(float *));
     wd->wq       = (void  **)calloc(L, sizeof(void *));
@@ -1239,26 +1538,28 @@ static void upload_weights_gpu(Model *m) {
 #endif
 
 #ifdef BONSAI_FP4
-    printf("Uploading weights to device (dequant -> NVFP4 linear layers)...\n");
+    wd->embd = upload_embd_gpu_streaming(m, &wd->embd_t);
 #else
     printf("Uploading weights to device (dequantizing IQ2_S / IQ3_S / Q4_K / Q5_K -> FP16)...\n");
-#endif
-
     wd->embd = upload_fp16_dequant(m, "token_embd.weight", f32, f16, &wd->embd_t);
+#endif
     if (!wd->embd) { fprintf(stderr, "missing token_embd.weight\n"); exit(1); }
 
     char name[128];
     for (int l = 0; l < L; l++) {
+        struct timespec t_layer0, t_layer1;
+        clock_gettime(CLOCK_MONOTONIC, &t_layer0);
+
         sprintf(name, "blk.%d.attn_norm.weight", l);     wd->norm_att[l] = (float *)upload_f32(m, name);
 #ifdef BONSAI_FP4
         sprintf(name, "blk.%d.attn_q.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->wq_fp4[l], c->dim, c->dim);
+        upload_linear_fp4(m, name, &wd->wq_fp4[l], c->dim, c->dim, cache_dir, use_cache);
         sprintf(name, "blk.%d.attn_k.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->wk_fp4[l], c->kv_dim, c->dim);
+        upload_linear_fp4(m, name, &wd->wk_fp4[l], c->kv_dim, c->dim, cache_dir, use_cache);
         sprintf(name, "blk.%d.attn_v.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->wv_fp4[l], c->kv_dim, c->dim);
+        upload_linear_fp4(m, name, &wd->wv_fp4[l], c->kv_dim, c->dim, cache_dir, use_cache);
         sprintf(name, "blk.%d.attn_output.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->wo_fp4[l], c->dim, c->dim);
+        upload_linear_fp4(m, name, &wd->wo_fp4[l], c->dim, c->dim, cache_dir, use_cache);
 #else
         sprintf(name, "blk.%d.attn_q.weight", l);        wd->wq[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.attn_k.weight", l);        wd->wk[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
@@ -1270,11 +1571,11 @@ static void upload_weights_gpu(Model *m) {
         sprintf(name, "blk.%d.ffn_norm.weight", l);      wd->norm_ffn[l] = (float *)upload_f32(m, name);
 #ifdef BONSAI_FP4
         sprintf(name, "blk.%d.ffn_gate.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->gate_fp4[l], c->hidden_dim, c->dim);
+        upload_linear_fp4(m, name, &wd->gate_fp4[l], c->hidden_dim, c->dim, cache_dir, use_cache);
         sprintf(name, "blk.%d.ffn_up.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->up_fp4[l], c->hidden_dim, c->dim);
+        upload_linear_fp4(m, name, &wd->up_fp4[l], c->hidden_dim, c->dim, cache_dir, use_cache);
         sprintf(name, "blk.%d.ffn_down.weight", l);
-        upload_linear_fp4(m, name, f32, f16, &wd->down_fp4[l], c->dim, c->hidden_dim);
+        upload_linear_fp4(m, name, &wd->down_fp4[l], c->dim, c->hidden_dim, cache_dir, use_cache);
 #else
         sprintf(name, "blk.%d.ffn_gate.weight", l);      wd->gate[l]     = upload_fp16_dequant(m, name, f32, f16, NULL);
         sprintf(name, "blk.%d.ffn_up.weight", l);        wd->up[l]       = upload_fp16_dequant(m, name, f32, f16, NULL);
@@ -1292,22 +1593,28 @@ static void upload_weights_gpu(Model *m) {
             fprintf(stderr, "Error: layer %d missing weight tensor\n", l);
             exit(1);
         }
-        if ((l + 1) % 8 == 0)
-            printf("  layer %d/%d uploaded\n", l + 1, L);
+        clock_gettime(CLOCK_MONOTONIC, &t_layer1);
+        if ((l + 1) % 8 == 0) {
+            double sec = timespec_elapsed_sec(&t_layer0, &t_layer1);
+#ifdef BONSAI_FP4
+            size_t nbytes = layer_device_bytes(m, wd, l);
+#else
+            size_t nbytes = layer_device_bytes(m, l);
+#endif
+            double gbps = sec > 0.0
+                ? ((double)nbytes / (1024.0 * 1024.0 * 1024.0)) / sec : 0.0;
+            printf("  layer %d/%d uploaded: %.2f sec, %.2f GB/sec\n",
+                   l + 1, L, sec, gbps);
+        }
     }
 
     wd->norm_out = (float *)upload_f32(m, "output_norm.weight");
 #ifdef BONSAI_FP4
     {
-        TensorInfo *ti = ti_find(m, "output.weight");
-        if (!ti) ti = ti_find(m, "token_embd.weight");
-        if (!ti) { fprintf(stderr, "missing output.weight\n"); exit(1); }
-        materialize_host_f16(m, ti, f32, f16);
-        wd->out_fp4 = fp4_qwen3_weight_from_f16_host(f16, c->vocab_size, c->dim);
-        if (!wd->out_fp4) {
-            fprintf(stderr, "NVFP4 quantize failed for output.weight\n");
-            exit(1);
-        }
+        const char *out_name = "output.weight";
+        if (!ti_find(m, out_name)) out_name = "token_embd.weight";
+        if (!ti_find(m, out_name)) { fprintf(stderr, "missing output.weight\n"); exit(1); }
+        upload_linear_fp4(m, out_name, &wd->out_fp4, c->vocab_size, c->dim, cache_dir, use_cache);
         wd->out = NULL;
         wd->out_t = DT_F16;
     }
@@ -1317,8 +1624,10 @@ static void upload_weights_gpu(Model *m) {
 #endif
     if (!wd->norm_out) { fprintf(stderr, "missing output_norm.weight\n"); exit(1); }
 
+#ifndef BONSAI_FP4
     free(f32);
     free(f16);
+#endif
     printf("Upload complete.\n");
 }
 
@@ -1624,6 +1933,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  -k <topp>     Top-p sampling (default: 0.9)\n");
         fprintf(stderr, "  -s <seed>     Random seed (default: time)\n");
         fprintf(stderr, "  -l <len>      Max sequence length (default: 512)\n");
+#ifdef BONSAI_FP4
+        fprintf(stderr, "  --pack-nvfp4-cache [dir]  Offline NVFP4 cache (default: <model>.gguf.nvfp4)\n");
+        fprintf(stderr, "  --no-nvfp4-cache          Force GGUF dequant (ignore offline cache)\n");
+#endif
         return 1;
     }
 
@@ -1634,20 +1947,42 @@ int main(int argc, char *argv[]) {
     float topp       = 0.9f;
     uint64_t seed    = (uint64_t)time(NULL);
     int   max_seq    = 512;
+#ifdef BONSAI_FP4
+    int pack_nvfp4 = 0;
+    g_nvfp4_cache_dir[0] = '\0';
+    g_no_nvfp4_cache = 0;
+#endif
 
-    for (int i = 2; i + 1 < argc; i += 2) {
-        if      (!strcmp(argv[i], "-p")) prompt     = argv[i + 1];
-        else if (!strcmp(argv[i], "-n")) max_tokens = atoi(argv[i + 1]);
-        else if (!strcmp(argv[i], "-t")) temp       = (float)atof(argv[i + 1]);
-        else if (!strcmp(argv[i], "-k")) topp       = (float)atof(argv[i + 1]);
-        else if (!strcmp(argv[i], "-s")) seed       = (uint64_t)strtoull(argv[i + 1], NULL, 10);
-        else if (!strcmp(argv[i], "-l")) max_seq    = atoi(argv[i + 1]);
+    for (int i = 2; i < argc; i++) {
+#ifdef BONSAI_FP4
+        if (!strcmp(argv[i], "--pack-nvfp4-cache")) {
+            pack_nvfp4 = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                snprintf(g_nvfp4_cache_dir, sizeof(g_nvfp4_cache_dir), "%s", argv[++i]);
+            }
+            continue;
+        }
+        if (!strcmp(argv[i], "--no-nvfp4-cache")) {
+            g_no_nvfp4_cache = 1;
+            continue;
+        }
+#endif
+        if (i + 1 >= argc) break;
+        if      (!strcmp(argv[i], "-p")) { prompt     = argv[++i]; }
+        else if (!strcmp(argv[i], "-n")) { max_tokens = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "-t")) { temp       = (float)atof(argv[++i]); }
+        else if (!strcmp(argv[i], "-k")) { topp       = (float)atof(argv[++i]); }
+        else if (!strcmp(argv[i], "-s")) { seed       = (uint64_t)strtoull(argv[++i], NULL, 10); }
+        else if (!strcmp(argv[i], "-l")) { max_seq    = atoi(argv[++i]); }
     }
 
-    /*
-     * NVIDIA GPU + cuBLAS。重みは起動時に VRAM へアップロード。
-     */
+#ifdef BONSAI_FP4
+    g_gguf_path_for_cache = model_path;
+    if (!pack_nvfp4)
+        gpu_print_device_info();
+#else
     gpu_print_device_info();
+#endif
 
     printf("Loading %s ...\n", model_path);
 
@@ -1679,6 +2014,21 @@ int main(int argc, char *argv[]) {
            c->dim, c->hidden_dim, c->n_layers, c->n_heads, c->n_kv_heads, c->vocab_size);
     printf("       head_dim=%d kv_dim=%d kv_mul=%d rope_theta=%g max_seq=%d\n",
            c->head_dim, c->kv_dim, c->kv_mul, (double)c->rope_theta, c->max_seq);
+
+#ifdef BONSAI_FP4
+    if (pack_nvfp4) {
+        char cache_dir[1024];
+        if (g_nvfp4_cache_dir[0])
+            snprintf(cache_dir, sizeof(cache_dir), "%s", g_nvfp4_cache_dir);
+        else
+            fp4_cache_dir_path(model_path, cache_dir, sizeof(cache_dir));
+        int rc = pack_nvfp4_cache(&model, cache_dir);
+        free(model.ti);
+        munmap(model.fdata, model.fsz);
+        close(model.fd);
+        return rc != 0;
+    }
+#endif
 
     upload_weights_gpu(&model);
     init_tokenizer(&model.tok, merges, n_merges);
