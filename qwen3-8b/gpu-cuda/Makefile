@@ -60,18 +60,21 @@ KERNELS_OBJ := kernels.fabr$(FA_BR_VAL).pq$(BONSAI_POLARQUANT).o
 MAIN_OBJ    := main.pq$(BONSAI_POLARQUANT).o
 BIN         := qwen3-gpu-cuda
 
-.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push
+.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache
 
 .DEFAULT_GOAL := run
 
-build: $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) $(LDFLAGS)
+build: $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) fp16_cache_io.o
+	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) fp16_cache_io.o $(LDFLAGS)
 
 build.polarquant:
 	$(MAKE) build BONSAI_POLARQUANT=1
 
-$(MAIN_OBJ): main.c gpu.h polarquant.h
+$(MAIN_OBJ): main.c gpu.h polarquant.h fp16_cache.h
 	$(CC) $(CFLAGS) $(PQ_FLAG) -c main.c -o $@
+
+fp16_cache_io.o: fp16_cache_io.c fp16_cache.h
+	$(CC) $(CFLAGS) -c fp16_cache_io.c -o fp16_cache_io.o
 
 $(KERNELS_OBJ): kernels.cu gpu.h polarquant.h
 	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(PQ_FLAG) -c kernels.cu -o $@
@@ -89,9 +92,12 @@ run: build
 run.polarquant: build.polarquant
 	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
+pack-cache: build
+	./$(BIN) "$(MODEL)" --pack-fp16-cache
+
 clean:
 	rm -f $(BIN) polarquant_verify \
-	      main.o main.pq*.o kernels.*.o polarquant.o
+	      main.o main.pq*.o kernels.*.o polarquant.o fp16_cache_io.o
 
 # -----------------------------------------------------------------------------
 # Benchmark log (make log / make log.push)
