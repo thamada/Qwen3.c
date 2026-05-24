@@ -4,9 +4,49 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-25 02:11:54
+
+**`qwen3-8b/gpu-cuda/`** — **FP16 オフラインキャッシュ**（`make pack-cache` / `--pack-fp16-cache`）と **GGUF 行単位融合逆量子化**（全 tensor ステージング廃止）。**`.gitignore`** — **`*.gguf.fp16/`** を追加（**`*.gguf.nvfp4/`** は **`b20a4d7`** で追加済み）。
+
+#### `qwen3-8b/gpu-cuda/fp16_cache.h` / `fp16_cache_io.c`（新規）
+
+- **`FP16HostWeight`**: ホスト側 FP16 重み（**`n_rows`/`n_cols`**、**`h_f16`**）。
+- **`.fp16bin` ファイル**: ヘッダ（magic **`FPH1`**、version **1**、形状）+ FP16 ペイロード。
+- **キャッシュディレクトリ**: 既定 **`<model>.gguf.fp16`**（**`fp16_cache_dir_path`**）。各 tensor は **`<cache_dir>/<tensor_name>.fp16bin`**。
+- **`manifest`**: **`FP16_CACHE_VERSION`**、**`gguf_size`**、**`gguf_mtime`**（NVFP4 キャッシュと同形式）。
+
+#### `qwen3-8b/gpu-cuda/main.c`（**`BONSAI_FP4` 無し＝FP16 版**）
+
+- **`dequant_tensor_row`**: NVFP4 版と共有。GGUF mmap 上の量子化 tensor を行単位 F32 復号。
+- **`upload_fp16_tensor_streaming`**: 行単位逆量子化 → FP16 → 逐次 H2D（**`max_tensor_nelements` ステージング不要**）。
+- **`upload_fp16_linear`**: オフラインキャッシュ有効時は **`.fp16bin`** から H2D。ミス時は **`upload_fp16_tensor_streaming`** にフォールバック。
+- **`pack_fp16_cache`**: 全線形 + **`output.weight`**（**`L×7 + 1`**）をキャッシュへ書き出し。
+- CLI: **`--pack-fp16-cache [dir]`**、**`--no-fp16-cache`**。
+- 起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (fused dequant -> FP16)...`**。
+
+#### `qwen3-8b/gpu-cuda/Makefile`
+
+- **`fp16_cache_io.o`** をリンク。**`pack-cache`**: **`./qwen3-gpu-cuda "$(MODEL)" --pack-fp16-cache`**。
+
+#### NVFP4 版 `main.c` リファクタ
+
+- **`upload_embd_gpu_streaming`** を **`upload_fp16_tensor_streaming`** の薄いラッパに統合（コード重複削減）。
+
+#### `.gitignore`
+
+- **`*.gguf.fp16/`**: **`make pack-cache`**（FP16 版）の出力を Git 対象外に。
+
+#### ドキュメント
+
+**`doc/design.md`**: ファイル一覧（**`fp16_cache.*`**）、Make ターゲット（**`gpu-cuda` の `pack-cache`**）、FP16 ロード節・CLI・トラブルシュート・**`.gitignore`** を上記に同期。
+
+**`README.md`** / **`README.en.md`**: 実行経路表・CUDA クイックリファレンス・FP16/NVFP4 ビルド節（**`make pack-cache`** / CLI）・起動ログ・トラブルシュート・「実装を読む順序」を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-25 01:43:44
 
-**`qwen3-8b/gpu-cuda-nvfp4/`** / 共有 **`gpu-cuda/main.c`** — **NVFP4 オフラインキャッシュ**（`make pack-cache` / `--pack-nvfp4-cache`）と **GGUF 行単位融合デ量子化**。**`gpu-cuda/main.c`** / **`gpu-rocm/main.c`** — 重み H2D 進捗に **レイヤーあたり秒数・GB/sec** を追加。
+**`qwen3-8b/gpu-cuda-nvfp4/`** / 共有 **`gpu-cuda/main.c`** — **NVFP4 オフラインキャッシュ**（`make pack-cache` / `--pack-nvfp4-cache`）と **GGUF 行単位融合逆量子化**。**`gpu-cuda/main.c`** / **`gpu-rocm/main.c`** — 重み H2D 進捗に **レイヤーあたり秒数・GB/sec** を追加。
 
 #### `qwen3-8b/gpu-cuda-nvfp4/fp4_cache.h` / `fp4_cache_io.c`（新規）
 
@@ -24,7 +64,7 @@
 #### `qwen3-8b/gpu-cuda/main.c`（**`BONSAI_FP4=1`** 時）
 
 - **`dequant_tensor_row`**: GGUF mmap 上の **IQ2_S / IQ3_S / Q4_K / Q5_K / F16 / F32** を行単位 F32 復号。
-- **`upload_linear_fp4`**: オフラインキャッシュ有効時は **`.fp4bin`** から H2D。ミス時は GGUF 行デ量子化 → NVFP4 量子化にフォールバック。
+- **`upload_linear_fp4`**: オフラインキャッシュ有効時は **`.fp4bin`** から H2D。ミス時は GGUF 行逆量子化 → NVFP4 量子化にフォールバック。
 - **`upload_embd_gpu_streaming`**: **`token_embd`** を量子化 GGUF から行単位で FP16 VRAM へ（全 tensor ステージング不要）。
 - **`pack_nvfp4_cache`**: 全線形 tensor（**`L×7 + output.weight`**）をキャッシュへ書き出し。
 - CLI: **`--pack-nvfp4-cache [dir]`**（パックのみで終了）、**`--no-nvfp4-cache`**（常に GGUF から再量子化）。
@@ -40,7 +80,7 @@
 
 #### ドキュメント
 
-**`doc/design.md`**: ファイル一覧（**`fp4_cache.*`**）、Make ターゲット（**`pack-cache`**）、NVFP4 ロード節（オフラインキャッシュ・融合デ量子化・CLI）、実行時挙動（H2D 進捗）、トラブルシュートを上記に同期。
+**`doc/design.md`**: ファイル一覧（**`fp4_cache.*`**）、Make ターゲット（**`pack-cache`**）、NVFP4 ロード節（オフラインキャッシュ・融合逆量子化・CLI）、実行時挙動（H2D 進捗）、トラブルシュートを上記に同期。
 
 **`README.md`** / **`README.en.md`**: 実行経路表・CUDA クイックリファレンス・NVFP4 ビルド節（**`make pack-cache`** / CLI）・起動ログ・トラブルシュート・「実装を読む順序」を上記に同期。
 
@@ -900,6 +940,6 @@ XDNA_FORCE_CPU=1 ./xdna2/qwen3-xdna2 path/to/model.gguf -p "Hi" -n 8  # CPU 強�
 
 ### ドキュメント
 
-- **`doc/design.md`**: 概要に **`qwen3-8b/`** を現行ツリーとして明記。**[Qwen3-8B（`qwen3-8b/`）](#qwen3-8bqwen3-8b)** 節を追加（スコープ、`qwen3vl.*`、IQ デ量子化方針、Q/K norm、ChatML、`main.c` / `main-omp.c` / `main-rocm*.c`、Make ターゲットとバイナリ、ビルド例）。**ビルドと実行**に `qwen3-8b` 向け CPU/OpenMP/ROCm のサブ節を追加。
+- **`doc/design.md`**: 概要に **`qwen3-8b/`** を現行ツリーとして明記。**[Qwen3-8B（`qwen3-8b/`）](#qwen3-8bqwen3-8b)** 節を追加（スコープ、`qwen3vl.*`、IQ 逆量子化方針、Q/K norm、ChatML、`main.c` / `main-omp.c` / `main-rocm*.c`、Make ターゲットとバイナリ、ビルド例）。**ビルドと実行**に `qwen3-8b` 向け CPU/OpenMP/ROCm のサブ節を追加。
 - **`doc/ChangeLog.md`**: 本エントリ。
 
