@@ -4,6 +4,46 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-27 18:55:19
+
+**`qwen3-8b/`** — **IQ2_S / IQ3_S グリッドテーブル**（**`kmask_iq2xs`** / **`iq2s_grid`** / **`iq3s_grid`**）に日本語コメントを追加。対象は **`cpu/`**・**`cpu-multicore/`**・**`cpu-blas/`**・**`gpu-rocm/`**・**`gpu-cuda/`** の各 **`main.c`**（**`xdna2*`** は未対象）。
+
+#### 各 `main.c`
+
+- **`kmask_iq2xs`**: 8 重み分の ±1 符号を **`signs[l]`** 1 バイトから取り出すビットマスク（**`1 << j`**）。
+- **`iq2s_grid[1024]`**: IQ2_S 用コードブック（**uint64_t** = 8 重みの符号なし大きさ、インデックス **10 bit** = **`qs` 8 + `qh` 2**）。
+- **`iq3s_grid[512]`**: IQ3_S 用コードブック（**uint32_t** = 4 重み、インデックス **9 bit** = **`qs` 8 + `qh` 1**）。8 重みは **grid1 + grid2** の 2 ルックアップ。
+
+#### ドキュメント
+
+**`doc/design.md`**: **「IQ2_S / IQ3_S グリッドテーブル」** 節を新設し、上記 3 配列のレイアウト・インデックス合成・逆量子化式を記載。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
+## 2026-05-27 18:43:46
+
+**`qwen3-8b/gpu-rocm/`** — ベンチマーク結果を **構造化ログファイル**へ出力し、**`make log.push`** が stdout パースに依存しないよう変更。
+
+#### `qwen3-8b/gpu-rocm/main.c`
+
+- **`write_benchmark_log`**: 推論終了時に **`BENCH_LOG_FILE`**（未設定時 **`/tmp/benchmark.log`**）へ key=value 形式で書き出し（**`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`** 等 + プロンプト全文）。
+- **`throughput_summary`**: stdout の **`--- benchmark ---`** / **`prefill_tps:`** 行を廃止。stderr のスループット要約は維持。
+- **`BenchLogInfo`**: **`main`** でモデルパス・プロンプト・GPU 名・CLI パラメータを **`generate`** 経由でログへ渡す。
+
+#### `qwen3-8b/gpu-rocm/Makefile`
+
+- **`BENCH_LOG_FILE ?= /tmp/benchmark.log`**: **`log.push`** 実行時に子プロセスへ渡す。
+- **`log.push`**: 終了後 **`$(BENCH_LOG_FILE)`** から **`prompt_tokens=`** / **`prefill_tps=`** 等を **`sed`** で抽出（stdout キャプチャ廃止）。
+- **`BENCH_LOG`**: gfx1201 計測 2 件追加（**`2026-05-27T18:41:38|…|103.51|28.90|80.92`**、**`18:42:13|…|101.94|28.84|80.01`**）。
+
+#### ドキュメント
+
+**`doc/design.md`**: ROCm バリアント表・**`gpu-rocm/Makefile`** 行・ROCm ビルド節（**`BENCH_LOG_FILE`**・ベンチログファイル形式）・実行時挙動を上記に同期。
+
+**`README.md`** / **`README.en.md`**: 実行経路表・クイックリファレンス・ROCm/CUDA ベンチマーク節・「実装を読む順序」（**`BENCH_LOG_FILE`** と CUDA stdout の違い）を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-27 05:26:20
 
 **`qwen3-8b/gpu-rocm/`** — **FP16 オフラインキャッシュ**（`make pack-cache` / **`make build`** 自動 pack / **`--pack-fp16-cache`**）と **GGUF 行単位融合逆量子化**（全 tensor ステージング廃止）。**`.gitignore`** — **`gpu-rocm/*.o`** を追加。

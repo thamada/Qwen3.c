@@ -14,6 +14,7 @@ PROMPT  ?= Hello, how are you?
 BENCH_PROMPT ?= Artificial intelligence has transformed many industries over the past decade. Machine learning models can now understand natural language, recognize images, and generate creative content with remarkable fluency. Large language models are trained on vast corpora of text and learn statistical patterns that enable them to predict the next token in a sequence. This capability powers applications ranging from virtual assistants and code completion tools to scientific research and education. However, deploying these models efficiently remains a challenge because they require substantial compute resources during both training and inference. Researchers explore quantization and specialized hardware to reduce latency while preserving quality.
 BENCH_N      ?= 128
 BENCH_SEED   ?= 42
+BENCH_LOG_FILE ?= /tmp/benchmark.log
 
 FP16_CACHE_MANIFEST := $(MODEL).fp16/manifest
 
@@ -139,6 +140,8 @@ BENCH_LOG += 2026-05-23T16:37:12|gfx1100|7d630c88a170|132|16|549.94|25.67|171.41
 BENCH_LOG += 2026-05-24T04:56:58|gfx1100|7d630c88a170|132|16|556.77|25.78|172.56
 BENCH_LOG += 2026-05-24T05:05:36|gfx1100|7d630c88a170|132|16|556.95|25.77|172.50
 BENCH_LOG += 2026-05-27T05:25:28|gfx1201|1d3a7600de2a|132|16|147.79|29.03|102.47
+BENCH_LOG += 2026-05-27T18:41:38|gfx1201|5ae102a9321e|132|16|103.51|28.90|80.92
+BENCH_LOG += 2026-05-27T18:42:13|gfx1201|5ae102a9321e|132|16|101.94|28.84|80.01
 # BENCH_LOG_END
 
 log:
@@ -170,15 +173,19 @@ log.push: build
 		exit 1; \
 	fi
 	@echo "Running benchmark (prompt=\"$(BENCH_PROMPT)\", -n $(BENCH_N), -t 0, -s $(BENCH_SEED)) ..."
-	@out=$$(./qwen3-rocm "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED) 2>&1); \
-	np=$$(echo "$$out" | sed -n 's/^--- \([0-9][0-9]*\) prompt tokens + \([0-9][0-9]*\) generated tokens ---/\1/p' | tail -1); \
-	ng=$$(echo "$$out" | sed -n 's/^--- \([0-9][0-9]*\) prompt tokens + \([0-9][0-9]*\) generated tokens ---/\2/p' | tail -1); \
-	pf=$$(echo "$$out" | sed -n 's/^prefill_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
-	dc=$$(echo "$$out" | sed -n 's/^decode_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
-	tt=$$(echo "$$out" | sed -n 's/^total_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
+	@BENCH_LOG_FILE="$(BENCH_LOG_FILE)" ./qwen3-rocm "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED); \
+	if [ ! -f "$(BENCH_LOG_FILE)" ]; then \
+		echo "error: benchmark log not found: $(BENCH_LOG_FILE)" >&2; \
+		exit 1; \
+	fi; \
+	np=$$(sed -n 's/^prompt_tokens=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	ng=$$(sed -n 's/^gen_tokens=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	pf=$$(sed -n 's/^prefill_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	dc=$$(sed -n 's/^decode_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	tt=$$(sed -n 's/^total_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
 	if [ -z "$$np" ] || [ -z "$$pf" ] || [ -z "$$dc" ] || [ -z "$$tt" ]; then \
-		echo "error: failed to parse benchmark output" >&2; \
-		echo "$$out" >&2; \
+		echo "error: failed to parse $(BENCH_LOG_FILE)" >&2; \
+		cat "$(BENCH_LOG_FILE)" >&2; \
 		exit 1; \
 	fi; \
 	entry="BENCH_LOG += $$(date +%Y-%m-%dT%H:%M:%S)|$(GPU_ARCH)|$$(hostname -s)|$$np|$$ng|$$pf|$$dc|$$tt"; \

@@ -46,9 +46,9 @@
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、当ディレクトリ **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS。**Q8_K GEMV**（全型 AVX2 整数内積・層内 Q8 共有）、**RoPE キャッシュ**、**lm_mode**（prefill LM スキップ / greedy argmax）、**F16 emb F16C**。詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**。**Prefill progress bar** を stderr に出力。 |
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
-| `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。 |
+| `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（**`make log.push`** がパース。推論区間のみ）。 |
 | `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-cuda/`** と同 API。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ（pack-cache 省略）。**`pack-cache`**: **`--pack-fp16-cache`**。**`make log`** / **`make log.push`** でベンチマーク履歴。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`clean`** は **`qwen3-rocm`**・**`wmma-probe`**・**`main.o`**・**`fp16_cache_io.o`** を削除。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ（pack-cache 省略）。**`pack-cache`**: **`--pack-fp16-cache`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`log.push`** は **`BENCH_LOG_FILE`** から **`prompt_tokens=`** 等を読み取り **`BENCH_LOG`** に追記）。**`BENCH_LOG_FILE`** 既定 **`/tmp/benchmark.log`**。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`clean`** は **`qwen3-rocm`**・**`wmma-probe`**・**`main.o`**・**`fp16_cache_io.o`** を削除。 |
 | `qwen3-8b/gpu-rocm/wmma_probe.c` | gfx11 向け **WMMA 校正用**最小 HIP プローブ（**`__builtin_amdgcn_wmma_*`**）。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
 | `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（gfx11）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3`** カーネル trace。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（**`BONSAI_FP4=0`** 時 FP16 線形 + オフラインキャッシュ。**`BONSAI_FP4=1`** 時 NVFP4 ロード・**`--pack-nvfp4-cache`** も本ファイル）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。重み H2D 時、8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。**`gpu-cuda-nvfp4`** も共有参照。 |
@@ -217,6 +217,7 @@ make wmma-probe                     # 校正用 wmma-probe のみビルド
 | `BENCH_PROMPT` | **`log.push`** のプロンプト文字列（~128 token 想定） | 英語長文（Makefile 内） |
 | `BENCH_N` | **`log.push`** の **`-n`**（生成トークン上限） | `128` |
 | `BENCH_SEED` | **`log.push`** の **`-s`** | `42` |
+| `BENCH_LOG_FILE` | 推論終了時に **`qwen3-rocm`** が書き込むベンチログ（**`log.push`** が読み取り） | `/tmp/benchmark.log` |
 | `WMMA_PROMPT` | **`make wmma`** 実行時プロンプト | `Hello` |
 | `WMMA_N` | **`make wmma`** の **`-n`**（0 で prefill のみ短時間） | `0` |
 | `WMMA_SKIP_RUN` | **`1`** で実行時チェック省略（静的 ISA のみ） | `0` |
@@ -224,6 +225,22 @@ make wmma-probe                     # 校正用 wmma-probe のみビルド
 | `LLVM_OBJDUMP` | WMMA 命令カウント用 **`llvm-objdump`** | **`$(ROCM)/llvm/bin/llvm-objdump`** |
 
 **`log.push`** の 1 行形式（パイ区切り）: **`YYYY-MM-DDTHH:MM:SS|GPU_ARCH|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**（**`date +%Y-%m-%dT%H:%M:%S`**、タイムゾーンオフセットなし）。**`make log`** は上記を表表示（列幅調整。旧エントリに **`+00:00`** 等が付いていても表示時に除去）。スループットは推論のみ（prefill+decode）。モデル重み H2D は含まない。
+
+**ベンチログファイル**（**`qwen3-rocm`** が推論終了時に上書き。環境変数 **`BENCH_LOG_FILE`** でパス変更可。既定 **`/tmp/benchmark.log`**）:
+
+| キー | 意味 |
+|------|------|
+| `timestamp` | ローカル日時 **`YYYY-MM-DDTHH:MM:SS`** |
+| `hostname` | **`gethostname`** |
+| `model` | GGUF パス |
+| `gpu` | **`hipGetDeviceProperties`** の device 名 + **`gcnArchName`** |
+| `max_new` / `temperature` / `top_p` / `seed` / `max_seq` | CLI 相当 |
+| `prompt_tokens` / `gen_tokens` | プロンプト長・生成トークン数 |
+| `prefill_sec` / `decode_sec` / `total_sec` | 区間秒数 |
+| `prefill_tps` / `decode_tps` / `total_tps` | 推論スループット（H2D 除外） |
+| `--- prompt ---` … `--- end prompt ---` | プロンプト全文 |
+
+**`make log.push`** は実行時に **`BENCH_LOG_FILE="$(BENCH_LOG_FILE)"`** を子プロセスへ渡し、終了後に上記ファイルから **`prompt_tokens=`** 等を **`sed`** で抽出して **`Makefile` の `BENCH_LOG`** に 1 行追記する。stdout の **`prefill_tps:`** 行は **ROCm 版では出力しない**（CUDA 版は従来どおり stdout）。
 
 ### CUDA（NVIDIA GPU）
 
@@ -328,7 +345,7 @@ make build
 
 **CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロック逆量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積と Attention を **`cblas_sgemv`** に集約。量子化 GEMV は **Q8_K + 全型 AVX2 整数内積**（詳細は **「量子化と行列積」** 参照）。**prefill** 中（最終プロンプト token 以外）は **LM head をスキップ**。**`-t 0`（greedy）** では **全 vocab logits を確保せず `mm_argmax_row`**。**RoPE** は起動時 **cos/sin キャッシュ**参照。プロンプト区間は **1 トークンずつ teacher forcing**。**Prefill progress bar** と tok/s 要約を stderr に出力。
 
-**ROCm（`qwen3-rocm`）**: 量子化重みを **行単位融合逆量子化** → **F16 VRAM**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`.fp16bin`** + **`manifest`** 一致時）から H2D。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。**`max_tensor_nelements` の F32/F16 全テンソルステージングは廃止**。H2D 進捗は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** を stdout に出力。**Prefill**（**`n_prompt > 1`**）は **`forward_prefill_gpu`** で全プロンプトトークンを **1 回の batched forward** で処理する。線形層（Q/K/V/O、gate/up/down）は **hipBLAS `hipblasGemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) HIP バックエンドが **rocBLAS / hipBLAS** を使うのと同趣旨。内部は **`ggml_cuda_op_mul_mat_cublas`** と同一の **`OP_T, OP_N`** 行列レイアウト）。活性化は **`f32_to_f16_batch_kernel`** で **`d_scratch_f16`** に変換してから GEMM し、出力は **FP32**（**`HIPBLAS_COMPUTE_32F`**）。同一入力を共有する q/k/v や gate/up では **FP16 変換を 1 回**にまとめる。**`n_tokens < 2`** または hipBLAS 未使用時は **`mm_f16_gemv_batch_kernel`** にフォールバック。Attention 以降（RoPE、**`attn_flash_prefill_kernel`**、残差、SiLU 等）はカスタム HIP カーネルのまま。最終プロンプト token のみ **LM head** で logits を計算。**Decode** は **`forward_gpu`**（1 トークンずつ **`mm_f16_gemv_kernel`** + Flash decode）。**`n_prompt == 1`** は単一 **`forward_gpu`**。**`0 < top-p < 1`** の nucleus は **logits 全語彙 D2H** して CPU 処理する場合がある。それ以外は GPU で argmax / softmax＋多項サンプル等。stderr に **Prefill progress bar**（バッチ prefill は **0 → 完了**）と prefill / decode / total の **スループット要約**（**`cpu-blas`** 同形式）。stdout には **`--- N prompt tokens + M generated tokens ---`** と **`make log.push`** 用 **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ。重み H2D は計測外）。
+**ROCm（`qwen3-rocm`）**: 量子化重みを **行単位融合逆量子化** → **F16 VRAM**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`.fp16bin`** + **`manifest`** 一致時）から H2D。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。**`max_tensor_nelements` の F32/F16 全テンソルステージングは廃止**。H2D 進捗は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** を stdout に出力。**Prefill**（**`n_prompt > 1`**）は **`forward_prefill_gpu`** で全プロンプトトークンを **1 回の batched forward** で処理する。線形層（Q/K/V/O、gate/up/down）は **hipBLAS `hipblasGemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) HIP バックエンドが **rocBLAS / hipBLAS** を使うのと同趣旨。内部は **`ggml_cuda_op_mul_mat_cublas`** と同一の **`OP_T, OP_N`** 行列レイアウト）。活性化は **`f32_to_f16_batch_kernel`** で **`d_scratch_f16`** に変換してから GEMM し、出力は **FP32**（**`HIPBLAS_COMPUTE_32F`**）。同一入力を共有する q/k/v や gate/up では **FP16 変換を 1 回**にまとめる。**`n_tokens < 2`** または hipBLAS 未使用時は **`mm_f16_gemv_batch_kernel`** にフォールバック。Attention 以降（RoPE、**`attn_flash_prefill_kernel`**、残差、SiLU 等）はカスタム HIP カーネルのまま。最終プロンプト token のみ **LM head** で logits を計算。**Decode** は **`forward_gpu`**（1 トークンずつ **`mm_f16_gemv_kernel`** + Flash decode）。**`n_prompt == 1`** は単一 **`forward_gpu`**。**`0 < top-p < 1`** の nucleus は **logits 全語彙 D2H** して CPU 処理する場合がある。それ以外は GPU で argmax / softmax＋多項サンプル等。stderr に **Prefill progress bar**（バッチ prefill は **0 → 完了**）と prefill / decode / total の **スループット要約**（**`cpu-blas`** 同形式）。stdout には **`--- N prompt tokens + M generated tokens ---`** のみ。推論メトリクスは **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value で書き出し（**`make log.push`** が読み取り。推論区間のみ。重み H2D は計測外）。
 
 **CUDA（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: プロンプトは **`gpu_forward_prefill`**、生成は **`gpu_forward`**（1 トークン）。Attention・RoPE・残差は **`kernels.cu`**（**`../gpu-cuda/kernels.cu`** を **`gpu-cuda-nvfp4`** が参照）。**サンプリングはホスト**（logits D2H）。重み H2D 進捗は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**（ROCm 版と同形式）。stderr に **Prefill progress bar** と prefill / decode / total の **スループット要約**（**`cpu-blas`** / ROCm 同形式）。stdout には **`--- N prompt tokens + M generated tokens ---`** と **`make log.push`** 用 **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ。重み H2D は計測外）。
 
@@ -366,7 +383,7 @@ make build
 各実装ファイルは、外部ライブラリに分割せず、ほぼ同じ順序で機能を持つ。
 
 1. **GGUF と量子化形式の定義**: GGUF の値型、GGML tensor dtype、`QK_K=256` の K-quant / IQ ブロック構造を定義する。`BlockQ4_K`、`BlockQ5_K`、`BlockIQ2_S`、`BlockIQ3_S` は GGML の packed layout に合わせて `#pragma pack(push, 1)` で定義する。
-2. **IQ2_S / IQ3_S の復元テーブル**: `iq2s_grid`、`iq3s_grid` などを持ち、GGML 側の小さな格子表現を `float` に戻す。
+2. **IQ2_S / IQ3_S の復元テーブル**: `kmask_iq2xs`、`iq2s_grid`、`iq3s_grid` などを持ち、GGML 側の小さな格子表現を `float` に戻す（詳細は **「量子化と行列積」→「IQ2_S / IQ3_S グリッドテーブル」**）。
 3. **モデル構造体**: `Config` がモデル形状、`TensorInfo` が GGUF 内 tensor descriptor、`Tok` が tokenizer、`Weights` / `WeightsDev` が重み、`State` が実行時バッファ、`Model` がそれらをまとめる。
 4. **ロード処理**: `mmap` した GGUF からメタデータと tensor descriptor を読み、CPU 版は tensor へのポインタを保持し、ROCm / CUDA 版は重みを GPU にアップロードする。
 5. **推論処理**: CPU 版は 1 トークン単位の forward を teacher forcing で繰り返し、生成区間は logits から次トークンを選ぶ。ROCm / CUDA GPU 版はプロンプトを **Prefill バッチ**（**`forward_prefill_gpu`** / **`gpu_forward_prefill`**）で先に処理し、以降 decode を 1 トークンずつ行う。
@@ -464,6 +481,56 @@ bsums[k] = Σ_{j=0}^{15} qs[k*16 + j]
 | **`BlockQ5_K`** | 176 B | 上記 + **`qh[32]`**（第 5 bit） |
 | **`BlockIQ2_S`** | 82 B | **`d` FP16**, grid lookup + signs + 4-bit scales |
 | **`BlockIQ3_S`** | 110 B | IQ2 系 + **`signs[32]`**, 64 要素ペア scale |
+
+#### IQ2_S / IQ3_S グリッドテーブル
+
+各 **`main.c`**（**`cpu`** / **`cpu-multicore`** / **`cpu-blas`** / **`gpu-rocm`** / **`gpu-cuda`**）は **`ggml-common.h`** 由来の静的配列 3 つを **`dequant_iq2_s`** / **`dequant_iq3_s`**（および **`cpu-blas`** の **`vec_dot_*_q8_K`**）で参照する。いずれも **符号なしの大きさ** を格子ルックアップで復元し、**±1 の符号** は別フィールド + **`kmask_iq2xs`** で復元する。
+
+##### `kmask_iq2xs[8]`
+
+| `j` | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|-----|---|---|---|---|---|---|---|---|
+| mask (hex) | 01 | 02 | 04 | 08 | 10 | 20 | 40 | 80 |
+
+**`kmask_iq2xs[j] = 1 << j`**。**`(signs[l] & kmask_iq2xs[j])`** が非ゼロなら **`-1`**、ゼロなら **`+1`** を重みに掛ける。
+
+- **`dequant_iq2_s`**: **`signs[l]`** 1 バイトが **8 重み**分。
+- **`dequant_iq3_s`**: 同一バイトの **下位 4 bit** が **grid1**（4 重み）、**上位 4 bit** が **grid2**（4 重み）。
+
+##### `iq2s_grid[1024]`（IQ2_S、2.5 bpw）
+
+| 項目 | 内容 |
+|------|------|
+| エントリ型 | **`uint64_t`** 1 個 = **`uint8_t` 8 個**の符号なし大きさ（リトルエンディアン） |
+| 例 | **`0x0808080808080808`** → 8 重みすべて大きさ **8** |
+| インデックス | **0..1023**（**2^10**）= **`qs[l]`** 下位 8 bit \| **`((qh[ib32] << (8-2*l)) & 0x300)`** 上位 2 bit |
+| スケール | **`dl = d * (0.5 + 4bit_scale) * 0.25`**（32 要素サブブロックごとに **`db[0]`/`db[1]`** の 2 段） |
+| 逆量子化 | **`y[j] = dl * grid[j] * (signs[l] の j 番目ビット ? -1 : +1)`** |
+| 格子値 | 量子化時 **L∈{0,1,2}**（**q = 2L+1 → 1,3,5**）の **8 個組み合わせ**のうち on-grid のみ。典型バイト値 **0x08(8), 0x19(25), 0x2b(43) ≈ 8×{1,3,5}** |
+| 符号 | **`BlockIQ2_S.qs[]` 後半**（**`signs = qs + QK_K/8`**） |
+
+##### `iq3s_grid[512]`（IQ3_S、3.44 bpw）
+
+| 項目 | 内容 |
+|------|------|
+| エントリ型 | **`uint32_t`** 1 個 = **`uint8_t` 4 個**の符号なし大きさ（リトルエンディアン） |
+| 例 | **`0x01010101`** → 4 重みすべて大きさ **1** |
+| インデックス | **0..511**（**2^9**）。**grid1**: **`qs[2*l+0] \| ((qh[k] << (8-2*l)) & 256)`**。**grid2**: **`qs[2*l+1] \| ((qh[k] << (7-2*l)) & 256)`** |
+| 8 重みの構成 | **grid1 の 4 個 + grid2 の 4 個**（**`dequant_iq3_s`** で 2 ルックアップ） |
+| スケール | **`db = d * (1 + 2 * 4bit_scale)`**（64 要素ペアごとに **`db1`/`db2`**） |
+| 逆量子化 | **`y[j+0] = db * grid1[j] * (sign ±1)`**、**`y[j+4] = db * grid2[j] * (sign ±1)`**（**`j=0..3`**） |
+| 格子値 | **L∈{0..7}**（**q = 2L+1 → 1,3,5,7,9,11,13,15**）の **4 個組み合わせ**のうち on-grid のみ。各バイトは **q そのもの**（**0x01, 0x03, … 0x0f**） |
+| 符号 | **`BlockIQ3_S.signs[]`**（専用 32 バイト） |
+
+##### IQ2_S と IQ3_S の比較
+
+| | IQ2_S | IQ3_S |
+|---|-------|-------|
+| コードブック | **`iq2s_grid[1024]`** | **`iq3s_grid[512]`** |
+| 1 ルックアップあたり | 8 重み | 4 重み |
+| インデックス幅 | 10 bit | 9 bit |
+| 8 重みの復元 | grid **1 回** | grid1 + grid2 **2 回** |
+| スケール式 | **`d * (0.5+s) * 0.25`** | **`d * (1 + 2*s)`** |
 
 **`row_bytes_quant(type, n)`** = **`(n / QK_K) * sizeof(Block*)`**。GEMV **`y = W·x`**（**`W`** は **`[d, n]`** 行 major、mmap 上）では出力 **`i`** の **`y[i] = dot(row_i, x)`** を **`vec_dot_row_q8_K(n, row_i, type, q8_blocks)`** で求める。
 

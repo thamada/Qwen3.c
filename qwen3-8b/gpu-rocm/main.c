@@ -148,8 +148,40 @@ typedef struct {
  * IQ2_S / IQ3_S grid tables (verbatim from ggml-common.h)
  * ================================================================ */
 
+/* IQ2_S / IQ3_S 逆量子化用の符号ビットマスク (ggml-common.h よりそのまま).
+ *
+ * IQ2_S / IQ3_S は大きさをグリッドルックアップ表に持ち、±1 の符号を 1 バイト
+ * (signs[l]) に 8 個まとめて格納する.  kmask_iq2xs[j] = 1 << j なので
+ * (signs[l] & kmask_iq2xs[j]) で j 番目のビットを取り出せる:
+ * 非ゼロなら grid[j] に -1、ゼロなら +1 を掛ける.
+ *
+ *   j:           0   1   2   3   4   5   6   7
+ *   mask (hex):  01  02  04  08  10  20  40  80
+ *
+ * dequant_iq2_s() では 1 バイトが 8 重み分、dequant_iq3_s() では同一バイトの
+ * 下位 4 ビット (grid1) と上位 4 ビット (grid2) でそれぞれ 4 重みずつ制御する. */
 static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 
+/* IQ2_S 逆量子化用グリッドコードブック (ggml-common.h よりそのまま, 1024 エントリ).
+ *
+ * IQ2_S は 2.5 bpw の格子量子化で、8 重み分の「符号なしの大きさ」を 1 つの
+ * ルックアップで復元する.  各エントリは uint64_t 1 個 = uint8_t 8 個分の大きさ
+ * をリトルエンディアンで詰めたもの (例: 0x0808080808080808 → 8 重みすべて 8).
+ *
+ * インデックス (0..1023 = 2^10) の構成:
+ *   qs[l]           … 下位 8 bit  (BlockIQ2_S.qs の先頭半分)
+ *   qh[ib32]        … 上位 2 bit  (同一 32 要素サブブロック内の l 番目に 2 bit ずつ割当)
+ *   index = qs[l] | ((qh[ib32] << (8 - 2*l)) & 0x300)
+ *
+ * 逆量子化 (dequant_iq2_s):
+ *   y[j] = dl * grid[j] * (signs[l] の j 番目ビット ? -1 : +1)
+ *   dl = d * (0.5 + 4bit scale) * 0.25
+ *   grid = (uint8_t*)(iq2s_grid + index)  … 8 バイト連続が 8 重みの大きさ
+ *
+ * 格子の中身は量子化時に L∈{0,1,2} (実質 2 bit/重み, q=2L+1 → 1,3,5) の
+ * 8 個組み合わせのうち「有効(on-grid)」なものだけを列挙したもの.
+ * 各バイトの典型値は 0x08(8), 0x19(25), 0x2b(43) ≈ 8×{1,3,5}.  ±1 の符号は
+ * qs[] 後半の signs[] + kmask_iq2xs で別途復元する. */
 static const uint64_t iq2s_grid[1024] = {
     0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
     0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x080808080819192bULL,
@@ -409,6 +441,29 @@ static const uint64_t iq2s_grid[1024] = {
     0x2b2b2b2b082b082bULL, 0x2b2b2b2b082b2b08ULL, 0x2b2b2b2b2b082b08ULL, 0x2b2b2b2b2b2b2b2bULL,
 };
 
+/* IQ3_S 逆量子化用グリッドコードブック (ggml-common.h よりそのまま, 512 エントリ).
+ *
+ * IQ3_S は 3.44 bpw の格子量子化.  iq2s_grid が 8 重み/エントリ (uint64_t) なのに対し、
+ * こちらは 4 重み/エントリ (uint32_t) で大きさを復元する.
+ * 各エントリは uint8_t 4 個をリトルエンディアンで詰めたもの
+ * (例: 0x01010101 → 4 重みすべて 1).
+ *
+ * インデックス (0..511 = 2^9) の構成:
+ *   qs[2*l+0/1]  … 下位 8 bit  (4 重み分の grid ルックアップごとに 1 バイト)
+ *   qh[0/1]      … 上位 1 bit   (grid1/grid2 それぞれに 1 bit ずつ割当)
+ *   grid1: qs[2*l+0] | ((qh[k] << (8 - 2*l)) & 256)
+ *   grid2: qs[2*l+1] | ((qh[k] << (7 - 2*l)) & 256)
+ *
+ * 逆量子化 (dequant_iq3_s):
+ *   8 重み = grid1 の 4 個 + grid2 の 4 個 (同一 signs[l] の下位/上位 4 bit で符号)
+ *   y[j+0] = db * grid1[j] * (signs[l] bit j ? -1 : +1)   j=0..3
+ *   y[j+4] = db * grid2[j] * (signs[l] bit j+4 ? -1 : +1) j=0..3
+ *   db = d * (1 + 2 * 4bit scale)
+ *
+ * 格子の中身は L∈{0..7} (実質 3 bit/重み, q=2L+1 → 1,3,5,7,9,11,13,15) の
+ * 4 個組み合わせのうち「有効(on-grid)」なものだけを列挙.
+ * 各バイトは q そのもの (0x01, 0x03, 0x05, … 0x0f).  ±1 の符号は
+ * BlockIQ3_S.signs[] + kmask_iq2xs で別途復元する. */
 static const uint32_t iq3s_grid[512] = {
     0x01010101u, 0x01010103u, 0x01010105u, 0x0101010bu, 0x0101010fu, 0x01010301u, 0x01010303u, 0x01010305u,
     0x01010309u, 0x0101030du, 0x01010501u, 0x01010503u, 0x0101050bu, 0x01010707u, 0x01010901u, 0x01010905u,
@@ -3038,7 +3093,76 @@ static void decode_progress_done(int n_tokens, double elapsed_sec) {
             n_tokens, elapsed_sec, tps);
 }
 
-static void throughput_summary(int n_prefill, double prefill_sec,
+#define BENCH_LOG_DEFAULT "/tmp/benchmark.log"
+
+typedef struct {
+    const char *model_path;
+    const char *prompt_text;
+    const char *gpu_desc;
+    int   max_new;
+    float temp;
+    float topp;
+    uint64_t seed;
+    int   max_seq;
+    int   n_prefill;
+    int   n_decode;
+    double prefill_sec;
+    double decode_sec;
+    double total_sec;
+    double prefill_tps;
+    double decode_tps;
+    double total_tps;
+} BenchLogInfo;
+
+static void write_benchmark_log(const BenchLogInfo *info) {
+    const char *path = getenv("BENCH_LOG_FILE");
+    if (!path || !path[0]) path = BENCH_LOG_DEFAULT;
+
+    time_t now = time(NULL);
+    struct tm tm_local;
+    localtime_r(&now, &tm_local);
+    char timestamp[32];
+    strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", &tm_local);
+
+    char hostname[256];
+    hostname[0] = '\0';
+    if (gethostname(hostname, sizeof hostname) != 0)
+        snprintf(hostname, sizeof hostname, "unknown");
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "warning: could not write benchmark log: %s\n", path);
+        return;
+    }
+
+    fprintf(f, "# qwen3-rocm benchmark log\n");
+    fprintf(f, "timestamp=%s\n", timestamp);
+    fprintf(f, "hostname=%s\n", hostname);
+    fprintf(f, "model=%s\n", info->model_path ? info->model_path : "");
+    fprintf(f, "max_new=%d\n", info->max_new);
+    fprintf(f, "temperature=%.6g\n", (double)info->temp);
+    fprintf(f, "top_p=%.6g\n", (double)info->topp);
+    fprintf(f, "seed=%llu\n", (unsigned long long)info->seed);
+    fprintf(f, "max_seq=%d\n", info->max_seq);
+    fprintf(f, "gpu=%s\n", info->gpu_desc ? info->gpu_desc : "");
+    fprintf(f, "\n");
+    fprintf(f, "prompt_tokens=%d\n", info->n_prefill);
+    fprintf(f, "gen_tokens=%d\n", info->n_decode);
+    fprintf(f, "prefill_sec=%.4f\n", info->prefill_sec);
+    fprintf(f, "decode_sec=%.4f\n", info->decode_sec);
+    fprintf(f, "total_sec=%.4f\n", info->total_sec);
+    fprintf(f, "prefill_tps=%.2f\n", info->prefill_tps);
+    fprintf(f, "decode_tps=%.2f\n", info->decode_tps);
+    fprintf(f, "total_tps=%.2f\n", info->total_tps);
+    fprintf(f, "\n");
+    fprintf(f, "--- prompt ---\n");
+    fprintf(f, "%s\n", info->prompt_text ? info->prompt_text : "");
+    fprintf(f, "--- end prompt ---\n");
+    fclose(f);
+}
+
+static void throughput_summary(const BenchLogInfo *meta,
+                             int n_prefill, double prefill_sec,
                              int n_decode, double decode_sec,
                              double total_sec) {
     double prefill_tps = (prefill_sec > 0.0) ? (double)n_prefill / prefill_sec : 0.0;
@@ -3049,11 +3173,19 @@ static void throughput_summary(int n_prefill, double prefill_sec,
     fprintf(stderr, "  prefill: %.2f tok/s\n", prefill_tps);
     fprintf(stderr, "  decode:  %.2f tok/s\n", decode_tps);
     fprintf(stderr, "  total:   %.2f tok/s\n", total_tps);
-    /* Inference-only lines for make log.push (excludes model weight H2D). */
-    printf("--- benchmark ---\n");
-    printf("prefill_tps: %.2f\n", prefill_tps);
-    printf("decode_tps: %.2f\n", decode_tps);
-    printf("total_tps: %.2f\n", total_tps);
+
+    if (meta) {
+        BenchLogInfo info = *meta;
+        info.n_prefill = n_prefill;
+        info.n_decode = n_decode;
+        info.prefill_sec = prefill_sec;
+        info.decode_sec = decode_sec;
+        info.total_sec = total_sec;
+        info.prefill_tps = prefill_tps;
+        info.decode_tps = decode_tps;
+        info.total_tps = total_tps;
+        write_benchmark_log(&info);
+    }
 }
 
 /* ================================================================
@@ -3061,7 +3193,8 @@ static void throughput_summary(int n_prefill, double prefill_sec,
  * ================================================================ */
 
 static void generate(Model *m, int *prompt, int n_prompt,
-                     int max_new, float temp, float topp, uint64_t seed) {
+                     int max_new, float temp, float topp, uint64_t seed,
+                     const BenchLogInfo *meta) {
     uint64_t rng = seed;
     if (rng == 0) rng = 1;
     HIPCHK(hipMemcpy(m->d_rng, &rng, sizeof(uint64_t), hipMemcpyHostToDevice));
@@ -3127,7 +3260,7 @@ static void generate(Model *m, int *prompt, int n_prompt,
     printf("\n\n--- %d prompt tokens + %d generated tokens ---\n", n_prompt, gen);
     printf("--- %.1fs total ---\n", elapsed);
     if (prefill_reported || decode_timing)
-        throughput_summary(n_prompt, prefill_sec, gen, decode_sec, elapsed);
+        throughput_summary(meta, n_prompt, prefill_sec, gen, decode_sec, elapsed);
 }
 
 /* ================================================================
@@ -3232,9 +3365,11 @@ int main(int argc, char *argv[]) {
     upload_weights_gpu(&model);
     alloc_state_gpu(&model);
 
+    char gpu_desc[256];
     {
         hipDeviceProp_t prop;
         HIPCHK(hipGetDeviceProperties(&prop, 0));
+        snprintf(gpu_desc, sizeof gpu_desc, "%s (%s)", prop.name, prop.gcnArchName);
         printf("ROCm HIP device 0: %s (gcnArchName: %s)\n", prop.name, prop.gcnArchName);
     }
     if (model.hipblas)
@@ -3244,7 +3379,18 @@ int main(int argc, char *argv[]) {
     int *prompt_tokens = chat_encode(&model.tok, prompt, &n_prompt_tokens);
     printf("Prompt: \"%s\" (%d tokens)\n\n", prompt, n_prompt_tokens);
 
-    generate(&model, prompt_tokens, n_prompt_tokens, max_tokens, temp, topp, seed);
+    BenchLogInfo bench_meta;
+    memset(&bench_meta, 0, sizeof bench_meta);
+    bench_meta.model_path = model_path;
+    bench_meta.prompt_text = prompt;
+    bench_meta.gpu_desc = gpu_desc;
+    bench_meta.max_new = max_tokens;
+    bench_meta.temp = temp;
+    bench_meta.topp = topp;
+    bench_meta.seed = seed;
+    bench_meta.max_seq = max_seq;
+    generate(&model, prompt_tokens, n_prompt_tokens, max_tokens, temp, topp, seed,
+               &bench_meta);
 
     free(prompt_tokens);
     free_state_gpu(&model);
