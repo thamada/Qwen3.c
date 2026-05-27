@@ -28,7 +28,7 @@
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**に逆量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。量子化 GEMV は **Q8_K 活性化 + 全型 `vec_dot_*_q8_K` 整数内積**（**`__AVX2__`** で IQ2_S/IQ3_S/Q4_K/Q5_K）。**層内 Q8 共有**（**`mm(..., q8_ready)`**）。**RoPE cos/sin キャッシュ**、**prefill 中 LM head スキップ**（**`FWD_NO_LM`**）、**greedy 時 `mm_argmax_row`**（**`FWD_LM_ARGMAX`**）。**F16 埋め込み**は **F16C+AVX2** で 8 要素 SIMD 変換。**Prefill progress bar** とスループット要約を stderr に出力。**`-march=native`** 既定。 |
-| `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | ロード時に量子化重みを CPU で **F16** に展開して VRAM に載せ、**フル GPU** パスで推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 全プロンプトを 1 回 forward。線形層は **hipBLAS `GemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の `cublasGemmEx` 経路と同趣旨）。フォールバック **`mm_f16_gemv_batch_kernel`**）+ **Decode 1 トークン**（**`forward_gpu`** — **`mm_f16_gemv_kernel`** + Flash decode）。**Flash 系 Prefill/Decode 注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等。**Prefill progress bar** と prefill / decode / total の **スループット要約**を stderr に出力。**`gpu-rocm/` で `make build`** が AMD GPU 向け既定エントリ。ビルド時 **`GPU_ARCH`** は **`gpu-rocm/Makefile`** が **`rocminfo`** から自動検出。**リンク**: `-lhipblas -lrocblas`。 |
+| `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | 量子化重みを **行単位融合逆量子化** → **F16 VRAM**（**`max_tensor_nelements` ステージング廃止**）。任意で **`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**。**`make build`** は MODEL 存在時にキャッシュ自動生成）。**Prefill バッチ**（**`forward_prefill_gpu`** — 全プロンプトを 1 回 forward。線形層は **hipBLAS `GemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の `cublasGemmEx` 経路と同趣旨）。フォールバック **`mm_f16_gemv_batch_kernel`**）+ **Decode 1 トークン**（**`forward_gpu`** — **`mm_f16_gemv_kernel`** + Flash decode）。**Flash 系 Prefill/Decode 注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等。**Prefill progress bar** と prefill / decode / total の **スループット要約**を stderr に出力。**`gpu-rocm/` で `make build`** が AMD GPU 向け既定エントリ（**`make run`** はバイナリのみ）。ビルド時 **`GPU_ARCH`** は **`gpu-rocm/Makefile`** が **`rocminfo`** から自動検出。**リンク**: `-lhipblas -lrocblas -lstdc++`（**`fp16_cache_io.o`** リンクのため **g++ / libstdc++-dev** 要）。 |
 | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA（FP16）** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。全線形 **FP16 VRAM**。GGUF **行単位融合逆量子化**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`gpu-cuda/` の `make pack-cache`** / **`--pack-fp16-cache`**）。任意で **`build.polarquant`**: KV キャッシュ **PolarQuant-R**（64 B/head、F32 比 ~8×）。サンプリング **logits D2H**。**Prefill progress bar** とスループット要約。**`make log` / `make log.push`** ベンチ履歴。**`gpu-cuda/` で単体ビルド**。 |
 | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | **NVIDIA CUDA（NVFP4）** | 上記と同じ Prefill / Decode / Flash Attention。線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**、**`BONSAI_FP4=1`** 固定）。GGUF 行単位融合逆量子化、または **`<model>.gguf.nvfp4`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-nvfp4-cache`**）。**`token_embd`** は **FP16**（量子化 GGUF から行単位 H2D）、norm は **F32**。線形は **`fp4_qwen3_mm`**（M=1→**FP4 GEMV**、M≥128→CUTLASS GEMM）。任意で **`build.polarquant`**: NVFP4 線形 + PolarQuant-R KV（Blackwell 向け最大 VRAM 節約）。**`make log` / `make log.push`** ベンチ履歴。要 **CUDA 13 + CUTLASS + sm_120 系 GPU**。**`gpu-cuda-nvfp4/` で単体ビルド**。 |
 | `qwen3-8b/xdna2/main.c` | **AMD Ryzen AI NPU (XDNA2)** | **CPU OpenMP 版と同様**に線形ウェイトは **GGUF mmap 上の量子化形式を参照**。埋め込みは行単位ブロック復号。各 **GEMV ごとに**当該重み行列を **`AMDXDNA_BO_SHMEM` の単一 BF16 スクラッチ**へ展開して NPU が DMA、`scratch_f32` で逆量子化～BF16 を兼用。rmsnorm などの小型 F32 も mmap 指す。`DRM ioctl` と **`ERT_START_NPU`** 経路、`/dev/accel/accelN` 不可／制御コード未配置時の **OpenMP BF16 CPU フォールバック（NPU と bit-identical）**は従来どおり。XRT 不要・UAPI inline 持ち運びは不変。**スクラッチサイズはテキスト経路 GEMV に必要な最大要素数のみ**（パーサ済み名前走査、`TensorInfo` は推論前に開放しうる）。**起動時レポートと `--xdna-status` / `-X`** で各形状の **`bf16-gemv-<n>x<d>.bin`** 可否・推論後の NPU/CPU GEMV カウンタを確認できる。 |
@@ -46,8 +46,9 @@
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、当ディレクトリ **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS。**Q8_K GEMV**（全型 AVX2 整数内積・層内 Q8 共有）、**RoPE キャッシュ**、**lm_mode**（prefill LM スキップ / greedy argmax）、**F16 emb F16C**。詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**。**Prefill progress bar** を stderr に出力。 |
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
-| `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D 時、8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** でビルド（**`-lhipblas -lrocblas`**）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`make log`** / **`make log.push`** でベンチマーク履歴。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`clean`** は **`qwen3-rocm`** と **`wmma-probe`** を削除。 |
+| `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。 |
+| `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-cuda/`** と同 API。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ（pack-cache 省略）。**`pack-cache`**: **`--pack-fp16-cache`**。**`make log`** / **`make log.push`** でベンチマーク履歴。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`clean`** は **`qwen3-rocm`**・**`wmma-probe`**・**`main.o`**・**`fp16_cache_io.o`** を削除。 |
 | `qwen3-8b/gpu-rocm/wmma_probe.c` | gfx11 向け **WMMA 校正用**最小 HIP プローブ（**`__builtin_amdgcn_wmma_*`**）。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
 | `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（gfx11）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3`** カーネル trace。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（**`BONSAI_FP4=0`** 時 FP16 線形 + オフラインキャッシュ。**`BONSAI_FP4=1`** 時 NVFP4 ロード・**`--pack-nvfp4-cache`** も本ファイル）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界。重み H2D 時、8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。**`make log.push`** 用に stdout へ **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ）。**`gpu-cuda-nvfp4`** も共有参照。 |
@@ -74,7 +75,7 @@
 | `qwen3-8b/xdna2/xdna-gemv/kernels/README.md` | **ctrlcode**（**`bf16-gemv-<n>x<d>.bin`**）と GEMV 形状、ホスト／NPU 分担、用語ミニ辞典、スタブ **`GQF3XDNA`** と **`--xdna-status`**、8B 対応表、差し替え・再生成。**§3 で ROCm/HIP の GPU カーネルとの対比と「ユーザーが HIP のように書けるか」** の整理を含む入門。 |
 | `qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py` | **`qwen3-8b/xdna2/xdna-gemv/kernels/`** のスタブ `.bin` を生成（リポジトリルートから **`python3 qwen3-8b/xdna2/xdna-gemv/gen-xdna-gemv-stubs.py qwen3-8b/xdna2/xdna-gemv/kernels`**）。 |
 | `qwen3-8b/xdna2/xdna-gemv/toolchain/README.md` | **NPU 用 `bf16-gemv-*.bin` を自前生成する手引き**（Xilinx **mlir-aie**／**AMD IRON**／**Peano**／**`aiecc`** の公式手順に沿ったコマンド、Qwen-VL-8B と **IRON `GEMV(M,K)`** の対応、`--aie-generate-npu-insts` と `qwen3-xdna2` 統合時の注意）。**冒頭**で Linux カーネル文書 **AMD NPU** における **`ctrlcode`** と本リポジトリ実装の対応、**`qwen3-xdna2`（XRT 非依存）と公式サンプル（XRT 経由）の違い**を整理。**東京科学大学（2026年現在の名称。旧・東京工業大学）ACRi** ルーム公開の日本語チュートリアル（外部リンク・vadd 題材）への導線あり。本文は日本語（です・ます調）。 |
-| `.gitignore` | ビルド生成バイナリ・**`*.gguf`**・オフラインキャッシュ **`*.gguf.nvfp4/`** / **`*.gguf.fp16/`** 等に加え、**Python の `__pycache__/` と `*.py[cod]`** を除外。 |
+| `.gitignore` | ビルド生成バイナリ・**`*.gguf`**・オフラインキャッシュ **`*.gguf.nvfp4/`** / **`*.gguf.fp16/`** 等に加え、**`gpu-rocm/*.o`**・**`gpu-cuda/*.o`** 等のオブジェクト、**Python の `__pycache__/` と `*.py[cod]`** を除外。 |
 | `qwen3-8b/gguf.txt` | 既定 GGUF の取得元 URL 参照。Hugging Face の `blob/main` URL を `resolve/main` に置換して **`wget`** する（**`make model`** が同処理を実行）。 |
 | `qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum` | 既定 GGUF の SHA256 参照（**`make model`** および手動 **`sha256sum -c`** 用）。 |
 
@@ -95,7 +96,7 @@
 | **`cpu/`** | `qwen3-cpu` | `cpu/main.c` |
 | **`cpu-multicore/`** | `qwen3-cpu-omp` | `cpu-multicore/main.c`（`-fopenmp`、`OMP_NUM_THREADS`） |
 | **`cpu-blas/`** | `qwen3-cpu-blas` | `cpu-blas/main.c`（`-fopenmp`、**`-march=native`**、**`-lopenblas`**。OpenBLAS は実行時 1 スレッド固定） |
-| **`gpu-rocm/`** | `qwen3-rocm` | `gpu-rocm/main.c` |
+| **`gpu-rocm/`** | `qwen3-rocm` | `gpu-rocm/main.c` + **`fp16_cache_io.c`**。**`pack-cache`** で FP16 オフラインキャッシュ（**`make build`** は MODEL 存在時に自動 pack） |
 | **`gpu-cuda/`** | `qwen3-gpu-cuda` | FP16 のみ（PTX 既定可）。**`build.polarquant`** で PolarQuant-R KV。**`pack-cache`** で FP16 オフラインキャッシュ |
 | **`gpu-cuda-nvfp4/`** | `qwen3-gpu-cuda-nvfp4` | **`sm_120a`** + **`BONSAI_FP4=1`**。**`build.polarquant`** / **`blackwell`** / **`cutlass`** / **`fp4-test`** / **`pack-cache`** |
 | **`xdna2/`** | `qwen3-xdna2` | `xdna2/main.c`（`-fopenmp`。`amdxdna` カーネルモジュール） |
@@ -107,7 +108,8 @@ make model                   # 既定 GGUF を gguf.txt から取得し .sha256s
 cd cpu && make build
 cd ../cpu-multicore && make build
 cd ../cpu-blas && make build               # libopenblas-dev 等が必要
-cd ../gpu-rocm && make build               # hipcc・ROCm 必須（GPU_ARCH は rocminfo 自動検出）
+cd ../gpu-rocm && make build               # hipcc・ROCm 必須（GPU_ARCH は rocminfo 自動検出。MODEL あれば FP16 cache pack）
+cd ../gpu-rocm && make pack-cache          # オフライン FP16 キャッシュ生成（<model>.gguf.fp16）
 cd ../gpu-cuda && make build               # 汎用 NVIDIA GPU（FP16・PTX 可）
 cd ../gpu-cuda && make pack-cache          # オフライン FP16 キャッシュ生成（<model>.gguf.fp16）
 cd ../gpu-cuda && make build.polarquant    # PolarQuant-R KV キャッシュ（FP16 線形重み・任意 GPU）
@@ -181,12 +183,15 @@ make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 
 ### ROCm
 
-**`GPU_ARCH`** はビルド前に **`gpu-rocm/Makefile`** が **`$(ROCM)/bin/rocminfo`** から自動検出する（**`make -C gpu-rocm detect-gpu-arch`** で確認）。検出に失敗する環境や別 ISA 向けビルドでは **`GPU_ARCH=gfx1100`** 等を明示する。ビルドは **`-lhipblas -lrocblas`** をリンクする（Prefill 線形層の **hipBLAS GemmEx** 用。ROCm 標準インストールに同梱）。
+**`GPU_ARCH`** はビルド前に **`gpu-rocm/Makefile`** が **`$(ROCM)/bin/rocminfo`** から自動検出する（**`make -C gpu-rocm detect-gpu-arch`** で確認）。検出に失敗する環境や別 ISA 向けビルドでは **`GPU_ARCH=gfx1100`** 等を明示する。ビルドは **`-lhipblas -lrocblas -lstdc++`** をリンクする（Prefill 線形層の **hipBLAS GemmEx** 用。**`fp16_cache_io.o`** のため **g++ / libstdc++-dev** が必要）。**`make build`**: **`qwen3-rocm`** + **`$(MODEL).fp16/manifest`**（**`MODEL`** が存在する場合）。**`make run`**: バイナリのみ（pack-cache をスキップ）。**`make pack-cache`**: オフライン FP16 キャッシュを明示生成。
 
 ```bash
 cd qwen3-8b/gpu-rocm
 make build
 make run PROMPT="Hello"
+# オフライン FP16 キャッシュ（2 回目以降の起動を高速化）:
+make pack-cache
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 # 手動上書きの例:
 make build GPU_ARCH=gfx1100
 make detect-gpu-arch
@@ -323,7 +328,7 @@ make build
 
 **CPU（`qwen3-cpu` / `qwen3-cpu-omp` / `qwen3-cpu-blas`）**: 重みは mmap 上の GGUF を参照。KV・活性は主に float32。サンプリングはホスト上の logits に対して実施。**`qwen3-cpu`** / **`qwen3-cpu-omp`** は量子化行を都度ブロック逆量子化してから内積。**`qwen3-cpu-blas`** は F32 行列積と Attention を **`cblas_sgemv`** に集約。量子化 GEMV は **Q8_K + 全型 AVX2 整数内積**（詳細は **「量子化と行列積」** 参照）。**prefill** 中（最終プロンプト token 以外）は **LM head をスキップ**。**`-t 0`（greedy）** では **全 vocab logits を確保せず `mm_argmax_row`**。**RoPE** は起動時 **cos/sin キャッシュ**参照。プロンプト区間は **1 トークンずつ teacher forcing**。**Prefill progress bar** と tok/s 要約を stderr に出力。
 
-**ROCm（`qwen3-rocm`）**: ロード時に F16 重みを VRAM に配置。H2D 進捗は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** を stdout に出力。**Prefill**（**`n_prompt > 1`**）は **`forward_prefill_gpu`** で全プロンプトトークンを **1 回の batched forward** で処理する。線形層（Q/K/V/O、gate/up/down）は **hipBLAS `hipblasGemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) HIP バックエンドが **rocBLAS / hipBLAS** を使うのと同趣旨。内部は **`ggml_cuda_op_mul_mat_cublas`** と同一の **`OP_T, OP_N`** 行列レイアウト）。活性化は **`f32_to_f16_batch_kernel`** で **`d_scratch_f16`** に変換してから GEMM し、出力は **FP32**（**`HIPBLAS_COMPUTE_32F`**）。同一入力を共有する q/k/v や gate/up では **FP16 変換を 1 回**にまとめる。**`n_tokens < 2`** または hipBLAS 未使用時は **`mm_f16_gemv_batch_kernel`** にフォールバック。Attention 以降（RoPE、**`attn_flash_prefill_kernel`**、残差、SiLU 等）はカスタム HIP カーネルのまま。最終プロンプト token のみ **LM head** で logits を計算。**Decode** は **`forward_gpu`**（1 トークンずつ **`mm_f16_gemv_kernel`** + Flash decode）。**`n_prompt == 1`** は単一 **`forward_gpu`**。**`0 < top-p < 1`** の nucleus は **logits 全語彙 D2H** して CPU 処理する場合がある。それ以外は GPU で argmax / softmax＋多項サンプル等。stderr に **Prefill progress bar**（バッチ prefill は **0 → 完了**）と prefill / decode / total の **スループット要約**（**`cpu-blas`** 同形式）。stdout には **`--- N prompt tokens + M generated tokens ---`** と **`make log.push`** 用 **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ。重み H2D は計測外）。
+**ROCm（`qwen3-rocm`）**: 量子化重みを **行単位融合逆量子化** → **F16 VRAM**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`.fp16bin`** + **`manifest`** 一致時）から H2D。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。**`max_tensor_nelements` の F32/F16 全テンソルステージングは廃止**。H2D 進捗は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** を stdout に出力。**Prefill**（**`n_prompt > 1`**）は **`forward_prefill_gpu`** で全プロンプトトークンを **1 回の batched forward** で処理する。線形層（Q/K/V/O、gate/up/down）は **hipBLAS `hipblasGemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) HIP バックエンドが **rocBLAS / hipBLAS** を使うのと同趣旨。内部は **`ggml_cuda_op_mul_mat_cublas`** と同一の **`OP_T, OP_N`** 行列レイアウト）。活性化は **`f32_to_f16_batch_kernel`** で **`d_scratch_f16`** に変換してから GEMM し、出力は **FP32**（**`HIPBLAS_COMPUTE_32F`**）。同一入力を共有する q/k/v や gate/up では **FP16 変換を 1 回**にまとめる。**`n_tokens < 2`** または hipBLAS 未使用時は **`mm_f16_gemv_batch_kernel`** にフォールバック。Attention 以降（RoPE、**`attn_flash_prefill_kernel`**、残差、SiLU 等）はカスタム HIP カーネルのまま。最終プロンプト token のみ **LM head** で logits を計算。**Decode** は **`forward_gpu`**（1 トークンずつ **`mm_f16_gemv_kernel`** + Flash decode）。**`n_prompt == 1`** は単一 **`forward_gpu`**。**`0 < top-p < 1`** の nucleus は **logits 全語彙 D2H** して CPU 処理する場合がある。それ以外は GPU で argmax / softmax＋多項サンプル等。stderr に **Prefill progress bar**（バッチ prefill は **0 → 完了**）と prefill / decode / total の **スループット要約**（**`cpu-blas`** 同形式）。stdout には **`--- N prompt tokens + M generated tokens ---`** と **`make log.push`** 用 **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ。重み H2D は計測外）。
 
 **CUDA（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: プロンプトは **`gpu_forward_prefill`**、生成は **`gpu_forward`**（1 トークン）。Attention・RoPE・残差は **`kernels.cu`**（**`../gpu-cuda/kernels.cu`** を **`gpu-cuda-nvfp4`** が参照）。**サンプリングはホスト**（logits D2H）。重み H2D 進捗は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**（ROCm 版と同形式）。stderr に **Prefill progress bar** と prefill / decode / total の **スループット要約**（**`cpu-blas`** / ROCm 同形式）。stdout には **`--- N prompt tokens + M generated tokens ---`** と **`make log.push`** 用 **`prefill_tps:` / `decode_tps:` / `total_tps:`**（推論区間のみ。重み H2D は計測外）。
 
@@ -349,8 +354,8 @@ make build
 | `-k <topp>` | Top-p サンプリング | `0.9` |
 | `-s <seed>` | 乱数シード | `time(NULL)` |
 | `-l <len>` | 最大シーケンス長 | `512` |
-| `--pack-fp16-cache [dir]` | **FP16 版（`gpu-cuda`）のみ**。全線形 tensor をオフライン FP16 キャッシュへ書き出して終了。省略時 **`dir=<model>.gguf.fp16`** | — |
-| `--no-fp16-cache` | **FP16 版のみ**。オフラインキャッシュを無視し GGUF から再逆量子化 | 既定はキャッシュ利用（`manifest` 有効時） |
+| `--pack-fp16-cache [dir]` | **FP16 版（`gpu-cuda` / `gpu-rocm`）**。全 FP16 対象 tensor をオフライン FP16 キャッシュへ書き出して終了。省略時 **`dir=<model>.gguf.fp16`** | — |
+| `--no-fp16-cache` | **FP16 版（`gpu-cuda` / `gpu-rocm`）**。オフラインキャッシュを無視し GGUF から再逆量子化 | 既定はキャッシュ利用（`manifest` 有効時） |
 | `--pack-nvfp4-cache [dir]` | **NVFP4 版のみ**。全線形 tensor をオフライン NVFP4 キャッシュへ書き出して終了。省略時 **`dir=<model>.gguf.nvfp4`** | — |
 | `--no-nvfp4-cache` | **NVFP4 版のみ**。オフラインキャッシュを無視し GGUF から再量子化 | 既定はキャッシュ利用（`manifest` 有効時） |
 
@@ -671,7 +676,7 @@ Q4_K / Q5_K 混在テンソルでは **AVX2 Q4/Q5 dot** も有効。
 
 変更履歴: **`doc/ChangeLog.md`**（**2026-05-23 04:53:10**、**04:34:38**）。
 
-ROCm 版はロード時に一度だけホスト上で量子化 tensor を F16 に展開して **全線形を FP16 VRAM** に載せる。norm は F32 のまま GPU。Decode 時 GEMV は FP16 カーネル（**`mm_f16_gemv_kernel`**）。**ROCm Prefill** の線形層は **hipBLAS `hipblasGemmEx`**（FP16 重み × FP16 活性 → FP32 出力）。CUDA Prefill は **`mm_f16_gemv_batch_kernel`** 相当のカスタムカーネル。
+ROCm 版は **GGUF 行単位融合逆量子化**（**`dequant_tensor_row`** → **`upload_fp16_tensor_streaming`**）で **全線形を FP16 VRAM** に載せる（**`max_tensor_nelements` ステージング廃止**）。**`<model>.gguf.fp16`** に **`manifest`** と **`.fp16bin`** がある場合は **`fp16_host_weight_load`** → H2D を省略（**`make pack-cache`** / **`--pack-fp16-cache`**）。norm は F32 のまま GPU。Decode 時 GEMV は FP16 カーネル（**`mm_f16_gemv_kernel`**）。**ROCm Prefill** の線形層は **hipBLAS `hipblasGemmEx`**（FP16 重み × FP16 活性 → FP32 出力）。CUDA Prefill は **`mm_f16_gemv_batch_kernel`** 相当のカスタムカーネル。
 
 CUDA **`gpu-cuda`（FP16）** は **GGUF 行単位融合逆量子化**（**`dequant_tensor_row`** → **`upload_fp16_tensor_streaming`**）で **全線形を FP16 VRAM** に載せる（**`max_tensor_nelements` の F32/F16 ステージングは廃止**）。**`<model>.gguf.fp16`** に **`manifest`** と **`.fp16bin`** がある場合は **`fp16_host_weight_load`** → H2D を省略（**`make pack-cache`** / **`--pack-fp16-cache`**）。norm 系は **F32 VRAM**。実行時の線形は **`mm_f16_gemv_kernel`** / Prefill バッチ。推論中の GGUF 逐次逆量子化は行わない。
 
@@ -908,7 +913,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 ## 制約・既知の制限
 
 - **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え量子化 GEMV を **Q8_K + 全型 AVX2 整数内積**（層内 Q8 共有）に置き換え、**RoPE キャッシュ**・**prefill LM スキップ**・**greedy `mm_argmax_row`** でオーバーヘッドを削るため **`cpu-multicore` より速くなることが多い**。**`-ffast-math`** を付けると IQ / Q8_K 量子化で出力が壊れる。**`-march=native`** は **AVX2/F16C** 等を有効化（移植性より当該 CPU 向け最適化）。
-- **ROCm 版**: AMD GPU・ROCm・**`hipcc`**。**Prefill** 線形層は **hipBLAS / rocBLAS**（**`-lhipblas -lrocblas`**）。通常は **`rocminfo` による `GPU_ARCH` 自動検出**だが、検出失敗時やクロスビルド時は手動 **`GPU_ARCH`** が必要。**Prefill Attention** の **`attn_flash_prefill_kernel`** は **`FA_BR=32`** 固定（gfx1100 等で 64 だと shared memory 65 KiB 上限超過）。Prefill 高速化の詳細は **「ROCm Prefill 高速化の詳細（3 段階）」**。
+- **ROCm 版**: AMD GPU・ROCm・**`hipcc`**・**g++ / libstdc++-dev`**（**`fp16_cache_io.o`** リンク用）。**Prefill** 線形層は **hipBLAS / rocBLAS**（**`-lhipblas -lrocblas -lstdc++`**）。重み H2D は **オフライン FP16 キャッシュ**または **GGUF 行単位融合逆量子化**（**`make pack-cache`** / **`make build`** で事前 pack 可）。通常は **`rocminfo` による `GPU_ARCH` 自動検出**だが、検出失敗時やクロスビルド時は手動 **`GPU_ARCH`** が必要。**Prefill Attention** の **`attn_flash_prefill_kernel`** は **`FA_BR=32`** 固定（gfx1100 等で 64 だと shared memory 65 KiB 上限超過）。Prefill 高速化の詳細は **「ROCm Prefill 高速化の詳細（3 段階）」**。
 - **CUDA 版（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。**`gpu-cuda/`** または **`gpu-cuda-nvfp4/`** で単体ビルド。**汎用 GPU** は **`gpu-cuda`**（PTX 可）。**Blackwell NVFP4** は **`gpu-cuda-nvfp4`**（**CUDA 13**・CUTLASS・**`sm_120a`**）。**`build.polarquant`** は KV のみ PolarQuant-R（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**、任意 GPU 可／NVFP4 併用可）。**`gpu-cuda-nvfp4/third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。**`gpu-cuda-nvfp4`** では線形重みは NVFP4 のみ VRAM に載り、**`gpu-cuda` 比で線形 FP16 分（8B 級で約 15 GiB 相当）を節約**できる（代わりに **`token_embd`** は FP16 のまま）。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
 - **テキストのみ**: Vision・マルチモーダル入力は未対応。
@@ -958,6 +963,9 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 |------|----------|------------|
 | `hipcc` not found | `ROCM` 誤り | `make ROCM=/opt/rocm` 等 |
 | **`undefined reference to hipblas*`** / **`-lhipblas` リンク失敗** | ROCm の hipBLAS / rocBLAS 未インストール・不完全 | **`$(ROCM)/lib`** に **`libhipblas.so`** / **`librocblas.so`** があるか確認。ROCm 再インストールまたは **`ROCM=`** パス修正 |
+| **ROCm 初回起動が遅い** | GGUF 行逆量子化を毎回実行 | **`cd gpu-rocm && make pack-cache`** で **`<model>.gguf.fp16`** を事前生成。2 回目以降は **`Loading FP16 cache from …`** |
+| **ROCm FP16 キャッシュ miss 警告** | **`.fp16bin`** 欠落・形状不一致・**`manifest`** 無効 | **`make pack-cache`** を再実行。**`--no-fp16-cache`** で強制再逆量子化 |
+| **`gpu-rocm` ビルド失敗（C++ headers not found）** | **g++ / libstdc++-dev** 未導入 | **`apt install g++ libstdc++-dev`** |
 | **ROCm Prefill が遅い（~30 tok/s 程度）** | 古いバイナリ・hipBLAS 未リンク | 起動ログに **`Prefill linear: hipBLAS GemmEx`** があるか確認。**`make -C gpu-rocm clean build`**。詳細は **「ROCm Prefill 高速化の詳細（3 段階）」** |
 | **`make wmma` が FAIL** | **`qwen3-rocm` に WMMA 命令**・hipBLAS 経路未報告・**`wmma-probe` 校正失敗** | **`make -C gpu-rocm wmma WMMA_SKIP_RUN=1`** で静的のみ確認。**`llvm-objdump`** パス（**`LLVM_OBJDUMP=`**）。MODEL 未配置時は **`WMMA_SKIP_RUN=1`** |
 | ISA 不一致 / `GPU_ARCH not detected` | 自動検出失敗・手動指定の誤り | **`cd qwen3-8b/gpu-rocm && make detect-gpu-arch`**。失敗時は **`rocminfo`** の **`Name: gfx*`** を確認し **`make build GPU_ARCH=…`** |
@@ -1003,6 +1011,34 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 2. **`Makefile`** の変更と本書を同期する。  
 3. 仕様変更は **`doc/ChangeLog.md`** にも記載する。  
 4. 利用者向け手順や方針を **`README.md`** で変えたら、 **`README.en.md`** も同趣旨に揃える（またはその逆）。
+
+## 補足：ROCm FP16（`gpu-rocm`）オフラインキャッシュ
+
+**`qwen3-8b/gpu-rocm/`** の FP16 経路。**`gpu-cuda/fp16_cache.h`** / **`fp16_cache_io.c`** と同 API（本ディレクトリに **`fp16_cache_io.c`** を同梱）。
+
+### ロード（H2D）
+
+1. **`upload_weights_gpu`**（**`main.c`**）: **`max_tensor_nelements` の F32/F16 ステージングは使わない**。
+2. **オフラインキャッシュ**（任意）: 既定 **`dir=<model>.gguf.fp16`**。**`manifest`** が一致すれば **`Loading FP16 cache from …`**。各 tensor は **`<dir>/<name>.fp16bin`**（magic **`FPH1`**、version **1**）を **`fp16_host_weight_load`** → H2D。ミス時は GGUF フォールバック（警告 **`FP16 cache miss for …`**）。
+3. **GGUF 融合逆量子化**（キャッシュ無効・ミス時）: **`dequant_tensor_row`** → **`upload_fp16_tensor_streaming`**（行単位 FP16 化 → 逐次 H2D）。起動ログ: **`Uploading weights (row dequant -> FP16)...`**。
+4. **`token_embd`** と線形 tensor（Q/K/V/O、gate/up/down、LM head）: **`upload_fp16_linear`** が (2) または (3) で **FP16 VRAM** へ。norm 系は **F32 VRAM**。
+
+### オフラインキャッシュ（`pack-cache`）
+
+```bash
+cd qwen3-8b/gpu-rocm
+make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
+# または（MODEL 存在時 make build が自動 pack）:
+make build
+# または:
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --pack-fp16-cache
+./qwen3-rocm ../model.gguf --pack-fp16-cache /path/to/cache
+./qwen3-rocm ../model.gguf --no-fp16-cache -p "Hello" -n 64
+```
+
+- 出力: **`token_embd` + L×7 + `output.weight`**（計 **L×7 + 2**）個の **`.fp16bin`** と **`manifest`**。
+- **`make run`** は pack-cache をスキップ（バイナリのみ）。**`make build`** は **`MODEL`** が存在すると **`$(MODEL).fp16/manifest`** まで生成。
+- **`.gitignore`**: **`*.gguf.fp16/`**（**`gpu-cuda`** と共有形式）。
 
 ## 補足：CUDA FP16（`gpu-cuda`）オフラインキャッシュ
 
