@@ -15,7 +15,9 @@ BENCH_PROMPT ?= Artificial intelligence has transformed many industries over the
 BENCH_N      ?= 128
 BENCH_SEED   ?= 42
 
-.PHONY: build run clean detect-gpu-arch log log.push wmma wmma-probe
+FP16_CACHE_MANIFEST := $(MODEL).fp16/manifest
+
+.PHONY: run clean detect-gpu-arch log log.push pack-cache wmma wmma-probe
 
 LLVM_OBJDUMP ?= $(ROCM)/llvm/bin/llvm-objdump
 
@@ -45,18 +47,66 @@ detect-gpu-arch:
 # Build / run
 # -----------------------------------------------------------------------------
 
-build: detect-gpu-arch
-	$(HIPCC) -O3 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
-		--offload-arch=$(GPU_ARCH) \
-		-I$(ROCM)/include \
-		-o qwen3-rocm -x hip main.c \
-		-L$(ROCM)/lib -lamdhip64 -lhipblas -lrocblas -Wl,-rpath,$(ROCM)/lib
+CXX ?= g++
 
-run: build
+# hipcc (ROCm clang) does not search GCC libstdc++ headers/libs by default.
+CXX_INC_DIRS := $(shell $(CXX) -E -x c++ - -v </dev/null 2>&1 | \
+	awk '/#include <\.\.\.> search starts here:/,/^End of search list\./{gsub(/^ /,""); if ($$0 ~ /^\//) print $$0}')
+ifeq ($(CXX_INC_DIRS),)
+  GCC_VER := $(shell $(CXX) -dumpversion 2>/dev/null | cut -d. -f1)
+  CXX_INC_DIRS := /usr/include/c++/$(GCC_VER) /usr/include/x86_64-linux-gnu/c++/$(GCC_VER)
+endif
+HIP_CXXFLAGS := $(foreach d,$(CXX_INC_DIRS),-isystem$(d))
+
+# libstdc++.so symlink lives under gcc's lib dir (not only libstdc++.so.6 in /usr/lib/...-gnu).
+STDCXX_LIBDIR ?= $(shell dirname "$$($(CXX) -print-file-name=libstdc++.a 2>/dev/null)" 2>/dev/null)
+LDFLAGS_STDCXX := $(if $(STDCXX_LIBDIR),-L$(STDCXX_LIBDIR),-L/usr/lib/gcc/x86_64-linux-gnu/$(shell $(CXX) -dumpversion | cut -d. -f1)) -lstdc++
+
+HIP_CFLAGS := -O3 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+	--offload-arch=$(GPU_ARCH) -I$(ROCM)/include $(HIP_CXXFLAGS)
+HIP_LDFLAGS := -L$(ROCM)/lib -lamdhip64 -lhipblas -lrocblas -Wl,-rpath,$(ROCM)/lib $(LDFLAGS_STDCXX)
+
+ifeq ($(GPU_ARCH),)
+$(error GPU_ARCH not detected. Ensure $(ROCMININFO) reports a GPU, or: make GPU_ARCH=gfx1100 build)
+endif
+
+# run: binary only (skip pack-cache). build: binary + FP16 cache when MODEL exists.
+ifneq ($(wildcard $(MODEL)),)
+BUILD_PREREQS := qwen3-rocm $(FP16_CACHE_MANIFEST)
+else
+BUILD_PREREQS := qwen3-rocm
+endif
+
+qwen3-rocm: main.o fp16_cache_io.o
+	@test -n "$(CXX_INC_DIRS)" || (echo "error: C++ headers not found. Install: apt install g++ libstdc++-dev" >&2; exit 1)
+	@echo ""
+	@echo "==============================================="
+	@echo "  Detected GPU arch: $(GPU_ARCH)"
+	@echo "==============================================="
+	@echo ""
+	$(HIPCC) $(HIP_CFLAGS) -o qwen3-rocm main.o fp16_cache_io.o $(HIP_LDFLAGS)
+
+# Offline FP16 cache (<model>.gguf.fp16/). Rebuilt when MODEL or binary is newer than manifest.
+$(FP16_CACHE_MANIFEST): $(MODEL) qwen3-rocm
+	@test -f "$(MODEL)" || (echo "error: model not found: $(MODEL)" >&2; echo "  run: make -C .. model" >&2; exit 1)
+	./qwen3-rocm "$(MODEL)" --pack-fp16-cache
+
+pack-cache: $(FP16_CACHE_MANIFEST)
+
+build: $(BUILD_PREREQS)
+
+main.o: main.c fp16_cache.h
+	@test -n "$(CXX_INC_DIRS)" || (echo "error: C++ headers not found. Install: apt install g++ libstdc++-dev" >&2; exit 1)
+	$(HIPCC) $(HIP_CFLAGS) -c -x hip main.c -o main.o
+
+fp16_cache_io.o: fp16_cache_io.c fp16_cache.h
+	$(HIPCC) -O3 -Wall -Wextra -x c -c fp16_cache_io.c -o fp16_cache_io.o
+
+run: qwen3-rocm
 	./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
 
 clean:
-	rm -f qwen3-rocm wmma-probe
+	rm -f qwen3-rocm wmma-probe main.o fp16_cache_io.o
 
 # -----------------------------------------------------------------------------
 # WMMA usage check (make wmma)
@@ -69,7 +119,7 @@ wmma-probe: detect-gpu-arch
 		-o wmma-probe -x hip wmma_probe.c \
 		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib
 
-wmma: build wmma-probe
+wmma: qwen3-rocm wmma-probe
 	@GPU_ARCH=$(GPU_ARCH) MODEL="$(MODEL)" ROCM=$(ROCM) \
 		LLVM_OBJDUMP="$(LLVM_OBJDUMP)" \
 		WMMA_PROMPT="$(WMMA_PROMPT)" WMMA_N=$(WMMA_N) \
@@ -88,6 +138,7 @@ BENCH_LOG += 2026-05-23T16:22:01|gfx1100|7d630c88a170|132|16|53.95|25.49|48.14
 BENCH_LOG += 2026-05-23T16:37:12|gfx1100|7d630c88a170|132|16|549.94|25.67|171.41
 BENCH_LOG += 2026-05-24T04:56:58|gfx1100|7d630c88a170|132|16|556.77|25.78|172.56
 BENCH_LOG += 2026-05-24T05:05:36|gfx1100|7d630c88a170|132|16|556.95|25.77|172.50
+BENCH_LOG += 2026-05-27T05:25:28|gfx1201|1d3a7600de2a|132|16|147.79|29.03|102.47
 # BENCH_LOG_END
 
 log:

@@ -38,7 +38,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
 | CPU 単スレッド | `qwen3-8b/cpu/main.c` | `cpu/qwen3-cpu` | 仕組みを追う、最小構成で動かす。**Prefill progress bar** とスループット要約を stderr に出力 |
 | CPU OpenMP 並列 | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | CPU で少しでも速く試す |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | F32 GEMV と Attention を BLAS 化。量子化 GEMV は **Q8_K 活性化 + 全型 AVX2 整数内積**（層内 Q8 共有）。**RoPE キャッシュ**、prefill 中 **LM head スキップ**、greedy 時 **`mm_argmax_row`**。**F16 埋め込み F16C**。stderr に **Prefill progress bar** |
-| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。重み H2D 時、8 レイヤーごとに **秒数・GB/sec** を表示。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴。**`make wmma`** で hipBLAS 経路・WMMA 非埋め込みを確認 |
+| ROCm/HIP GPU | `qwen3-8b/gpu-rocm/main.c` | `gpu-rocm/qwen3-rocm` | AMD GPU。**Prefill** は全プロンプトを 1 回 forward + **hipBLAS GemmEx**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の cublas 経路同趣旨）。**Decode** は 1 トークン GEMV。GGUF **行単位融合逆量子化**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**。**`make build`** は MODEL 存在時に自動 pack）。重み H2D 時、8 レイヤーごとに **秒数・GB/sec** を表示。**Prefill progress bar** と prefill / decode / total スループット要約。**`make log` / `make log.push`** ベンチ履歴。**`make wmma`** で hipBLAS 経路・WMMA 非埋め込みを確認 |
 | CUDA GPU（FP16） | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | `gpu-cuda/qwen3-gpu-cuda` | NVIDIA GPU。Prefill バッチ + Flash Attention。全線形 **FP16 VRAM**。GGUF **行単位融合逆量子化**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**）。重み H2D 時、8 レイヤーごとに **秒数・GB/sec** を表示。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head）。**Prefill progress bar** とスループット要約。**`make log` / `make log.push`** ベンチ履歴。`gpu-cuda/` で単体ビルド |
 | CUDA GPU（NVFP4） | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | `gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4` | Blackwell（RTX 50 系等）。線形層は H2D 時 **NVFP4 のみ**（CUTLASS）。GGUF **行単位融合逆量子化**、または **`<model>.gguf.nvfp4`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-nvfp4-cache`**）。埋め込みは量子化 GGUF から行単位 FP16 H2D。任意で **`build.polarquant`**: NVFP4 + PolarQuant-R 同時（最大 VRAM 節約）。**`make log` / `make log.push`** ベンチ履歴。`gpu-cuda-nvfp4/` で単体ビルド |
 | AMD Ryzen AI XDNA2 NPU（mmap＋GEMV単一BF16スクラッチ） | `qwen3-8b/xdna2/main.c` | `xdna2/qwen3-xdna2` | `amdxdna` ioctl 直通。ウェイトは **GGUF mmap**（CPU OpenMP 版と同様）。各 GEMV 直前のみ **単一 BF16 SHMEM** に復号展開して NPU へ載せる |
@@ -72,6 +72,7 @@ Qwen3系GGUFモデルを、**Cの単一ソース群**から直接動かす小さ
     ├── gpu-rocm/
     │   ├── Makefile
     │   ├── main.c
+    │   ├── fp16_cache.h / fp16_cache_io.c
     │   ├── wmma_probe.c          （`make wmma-probe` — WMMA 検出器校正）
     │   └── scripts/
     │       └── check_wmma.sh     （`make wmma`）
@@ -170,7 +171,11 @@ make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 
 ### ROCm/HIP 版を使う場合
 
-AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。`GPU_ARCH`（`hipcc --offload-arch`）は **`rocminfo` から自動検出**されます。
+AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。`GPU_ARCH`（`hipcc --offload-arch`）は **`rocminfo` から自動検出**されます。**`fp16_cache_io.o`** リンクのため **g++ / libstdc++-dev** も必要です。
+
+```bash
+sudo apt install -y g++ libstdc++-dev   # C++ ヘッダ／libstdc++ リンク用
+```
 
 確認例:
 
@@ -199,6 +204,7 @@ nvidia-smi
 
 | 用途 | コマンド |
 |------|----------|
+| **ROCm FP16 オフラインキャッシュ**（2 回目以降の起動を高速化） | `cd qwen3-8b/gpu-rocm` → `make pack-cache`（**`make build`** は MODEL 存在時に自動 pack） |
 | **FP16 のみ**（Ampere/Ada 等・PTX 可） | `cd qwen3-8b/gpu-cuda` → `make build` / `make run` |
 | **FP16 オフラインキャッシュ**（2 回目以降の起動を高速化） | `cd qwen3-8b/gpu-cuda` → `make pack-cache` |
 | **PolarQuant-R KV キャッシュ**（FP16 線形・任意 GPU） | `cd qwen3-8b/gpu-cuda` → `make build.polarquant` / `make run.polarquant` |
@@ -408,6 +414,8 @@ cd qwen3-8b/gpu-rocm
 make build
 ```
 
+**`make build`**: **`qwen3-rocm`** をビルドし、**`MODEL`** が存在する場合は **`<model>.gguf.fp16/manifest`** まで生成（オフライン FP16 キャッシュ）。**`make run`**: バイナリのみ（pack-cache をスキップ）。
+
 ROCm が `/opt/rocm` 以外にある場合:
 
 ```bash
@@ -415,7 +423,30 @@ cd qwen3-8b/gpu-rocm
 make build ROCM=/path/to/rocm
 ```
 
-成功すると **`qwen3-rocm`** ができます。リンクには **`-lhipblas -lrocblas`** が含まれます（Prefill 線形層の GEMM 用）。
+成功すると **`qwen3-rocm`** ができます。リンクには **`-lhipblas -lrocblas -lstdc++`** が含まれます（Prefill 線形層の GEMM 用 + **`fp16_cache_io.o`**）。
+
+起動ログに **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`** が出れば FP16 ロード経路が有効です。
+
+### オフライン FP16 キャッシュ（`make pack-cache`）
+
+初回起動の GGUF 逆量子化を省略するため、事前に FP16 キャッシュを生成します。出力先は既定で **`<model>.gguf.fp16`**（各 tensor の **`.fp16bin`** + **`manifest`**）。**`gpu-cuda`** と同形式です。
+
+```bash
+cd qwen3-8b/gpu-rocm
+make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+# MODEL が既にある場合、make build でも自動 pack されます
+```
+
+バイナリから直接:
+
+```bash
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --pack-fp16-cache
+./qwen3-rocm ../model.gguf --pack-fp16-cache /path/to/cache
+./qwen3-rocm ../model.gguf --no-fp16-cache -p "Hello" -n 64
+```
+
+GGUF を更新した場合は **`make pack-cache`** を再実行してください（**`manifest`** が GGUF のサイズ・mtime と一致しないとキャッシュは無効化されます）。
 
 ### Prefill 高速化（概要）
 
@@ -467,7 +498,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="日本語で短く説明してください。"
 ```
 
-プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。終了時 stdout には **`prefill_tps:` / `decode_tps:` / `total_tps:`** も出力され、**`make log.push`** がパースします（**推論区間のみ**。モデル重み H2D は計測外）。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** も共有 **`main.c`** により同形式です。
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。終了時 stdout には **`prefill_tps:` / `decode_tps:` / `total_tps:`** も出力され、**`make log.push`** がパースします（**推論区間のみ**。モデル重み H2D は計測外）。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** も同形式です。
 
 ### ベンチマーク履歴（`gpu-rocm/Makefile`）
 
@@ -507,12 +538,13 @@ NVIDIA GPU と CUDA が使える環境向けです。**`qwen3-8b/Makefile` は�
 
 | ディレクトリ | ロード時の重み | 線形層 / KV キャッシュの実行 |
 |--------------|----------------|------------------------------|
+| **`gpu-rocm`** | オフラインキャッシュ（**`<model>.gguf.fp16`**）があれば **`.fp16bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → FP16 | hipBLAS GemmEx（Prefill）+ カスタム GEMV（Decode）。KV は **F32** |
 | **`gpu-cuda`** | オフラインキャッシュ（**`<model>.gguf.fp16`**）があれば **`.fp16bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → FP16 | FP16 GEMV カーネル。KV は **F32**（既定） |
 | **`gpu-cuda`** + **`build.polarquant`** | 線形は FP16（上と同じ） | KV は **PolarQuant-R**（64 B/head）。Attention タイル読み出し時に F32 復号 |
 | **`gpu-cuda-nvfp4`** | オフラインキャッシュ（**`<model>.gguf.nvfp4`**）があれば **`.fp4bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → NVFP4。**`token_embd`** は行単位 FP16 H2D | **`fp4_qwen3_mm`** — decode / 短 Prefill は **FP4 GEMV**、長 Prefill は CUTLASS GEMM |
 | **`gpu-cuda-nvfp4`** + **`build.polarquant`** | 線形は NVFP4 のみ（上と同じ） | 線形は FP4 GEMV/GEMM。KV は PolarQuant-R |
 
-**`gpu-cuda`**（FP16）も初回起動は GGUF 行逆量子化に時間がかかります。**`make pack-cache`**（または **`--pack-fp16-cache`**）で **`<model>.gguf.fp16`** を事前生成すると、2 回目以降は **`Loading FP16 cache from …`** から H2D できます。**`--no-fp16-cache`** でキャッシュを無視して毎回再逆量子化します。
+**`gpu-rocm`** / **`gpu-cuda`**（FP16）も初回起動は GGUF 行逆量子化に時間がかかります。**`make pack-cache`**（または **`--pack-fp16-cache`**）で **`<model>.gguf.fp16`** を事前生成すると、2 回目以降は **`Loading FP16 cache from …`** から H2D できます。**`--no-fp16-cache`** でキャッシュを無視して毎回再逆量子化します。**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack されます。
 
 **`gpu-cuda-nvfp4`** は CUTLASS **NVFP4** を使い、**CUDA 13 + sm_120 系 GPU**（Blackwell / RTX 50 系等）向けです。初回起動は GGUF から NVFP4 へ量子化するため時間がかかります。**`make pack-cache`**（または **`--pack-nvfp4-cache`**）で **`<model>.gguf.nvfp4`** を事前生成すると、2 回目以降は **`Loading NVFP4 cache from …`** から H2D できます。**`--no-nvfp4-cache`** でキャッシュを無視して毎回再量子化します。
 
@@ -532,7 +564,9 @@ make build CUDA_GENCODE=arch=compute_89,code=sm_89
 
 ### オフライン FP16 キャッシュ（`make pack-cache`）
 
-初回起動の GGUF 逆量子化を省略するため、事前に FP16 キャッシュを生成します。出力先は既定で **`<model>.gguf.fp16`**（各 tensor の **`.fp16bin`** + **`manifest`**）。
+初回起動の GGUF 逆量子化を省略するため、事前に FP16 キャッシュを生成します。出力先は既定で **`<model>.gguf.fp16`**（各 tensor の **`.fp16bin`** + **`manifest`**）。**`gpu-rocm`** と **`gpu-cuda`** で同形式です。
+
+**`gpu-cuda`**:
 
 ```bash
 cd qwen3-8b/gpu-cuda
@@ -540,10 +574,19 @@ make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-バイナリから直接:
+**`gpu-rocm`**:
+
+```bash
+cd qwen3-8b/gpu-rocm
+make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+```
+
+バイナリから直接（**`gpu-cuda`** / **`gpu-rocm`** 共通 CLI）:
 
 ```bash
 ./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --pack-fp16-cache
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --pack-fp16-cache
 ./qwen3-gpu-cuda ../model.gguf --pack-fp16-cache /path/to/cache
 ./qwen3-gpu-cuda ../model.gguf --no-fp16-cache -p "Hello" -n 64
 ```
@@ -856,9 +899,9 @@ nvcc --version
 
 PTX のみのビルドで極端に遅い場合は、実機の `sm_XX` を `CUDA_GENCODE` で指定して再ビルドしてください。
 
-### FP16 初回起動が遅い／キャッシュ miss（`gpu-cuda`）
+### FP16 初回起動が遅い／キャッシュ miss（`gpu-rocm` / `gpu-cuda`）
 
-初回は GGUF 行逆量子化が走ります。**`cd gpu-cuda && make pack-cache`** で **`<model>.gguf.fp16`** を事前生成してください。起動時に **`Warning: FP16 cache miss for …`** が出る場合は **`.fp16bin`** 欠落・形状不一致・**`manifest`** 無効です。**`make pack-cache`** を再実行するか、**`--no-fp16-cache`** で強制再逆量子化します。
+初回は GGUF 行逆量子化が走ります。**`cd gpu-rocm && make pack-cache`** または **`cd gpu-cuda && make pack-cache`** で **`<model>.gguf.fp16`** を事前生成してください（**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack）。起動時に **`Warning: FP16 cache miss for …`** が出る場合は **`.fp16bin`** 欠落・形状不一致・**`manifest`** 無効です。**`make pack-cache`** を再実行するか、**`--no-fp16-cache`** で強制再逆量子化します。
 
 ### NVFP4 初回起動が遅い／キャッシュ miss
 
@@ -883,6 +926,15 @@ PTX のみのビルドで極端に遅い場合は、実機の `sm_XX` を `CUDA_
 ### PolarQuant が有効にならない
 
 起動ログに **`PolarQuant-R: KV cache enabled`** が無い場合、**`build.polarquant`** でビルドしたバイナリか確認してください（`gpu-cuda` または `gpu-cuda-nvfp4`）。**`head_dim=128`** 以外のモデルでは PolarQuant は無効化されます。
+
+### `gpu-rocm` ビルド失敗（C++ headers not found）
+
+**g++ / libstdc++-dev** が未導入の可能性があります。
+
+```bash
+sudo apt install -y g++ libstdc++-dev
+cd qwen3-8b/gpu-rocm && make clean build
+```
 
 ### `hipcc` が見つからない
 
@@ -954,8 +1006,8 @@ make build GPU_ARCH=gfx1100
 5. `qwen3-8b/cpu-blas/main.c`  
    OpenBLAS（`cblas_sgemv`）による F32 GEMV と Attention 集約。量子化 GEMV は Q8_K 活性化 + 全型 AVX2 整数内積（層内 Q8 共有）。RoPE キャッシュ、**`lm_mode`**（prefill LM スキップ / greedy **`mm_argmax_row`**）、F16 emb F16C。詳細は **`doc/design.md`** の **「`cpu-blas`：Q8_K 活性化 GEMV」** 節。
 
-6. `qwen3-8b/gpu-rocm/main.c`  
-   GPU メモリ、HIP カーネル、GPU サンプリング。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx** + バッチ Attention/Norm 等。**`attn_flash_prefill_kernel`** は **`(int)threadIdx.x`** による符号付き比較）。**Decode** は **`forward_gpu`**。重み H2D 時 **8 レイヤーごとの秒数・GB/sec**。**Prefill progress bar** とスループット要約。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴、**`make wmma`**（**`wmma_probe.c`** / **`scripts/check_wmma.sh`**）で hipBLAS 経路確認。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細（3 段階）」**。
+6. `qwen3-8b/gpu-rocm/fp16_cache_io.c` / `main.c`  
+   AMD GPU。**`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**。**`make build`** は MODEL 存在時に自動 pack）、GGUF 行単位融合逆量子化。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx** + バッチ Attention/Norm 等。**`attn_flash_prefill_kernel`** は **`(int)threadIdx.x`** による符号付き比較）。**Decode** は **`forward_gpu`**。重み H2D 時 **8 レイヤーごとの秒数・GB/sec**。**Prefill progress bar** とスループット要約。**`gpu-rocm/Makefile`** の **`make log` / `make log.push`** ベンチ履歴、**`make wmma`**（**`wmma_probe.c`** / **`scripts/check_wmma.sh`**）で hipBLAS 経路確認。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細（3 段階）」**。
 
 7. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu`  
    CUDA FP16 版。**`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**）、GGUF 行単位融合逆量子化、Prefill／Decode、Flash Attention。任意で **`build.polarquant`**: PolarQuant-R KV（**`pq_decode_head`** でタイル復号）。重み H2D 時 **8 レイヤーごとの秒数・GB/sec**。**Prefill progress bar** とスループット要約。**`gpu-cuda/Makefile`** の **`make log` / `make log.push`** ベンチ履歴。

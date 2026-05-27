@@ -4,6 +4,42 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-27 05:26:20
+
+**`qwen3-8b/gpu-rocm/`** — **FP16 オフラインキャッシュ**（`make pack-cache` / **`make build`** 自動 pack / **`--pack-fp16-cache`**）と **GGUF 行単位融合逆量子化**（全 tensor ステージング廃止）。**`.gitignore`** — **`gpu-rocm/*.o`** を追加。
+
+#### `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c`（新規）
+
+- **`gpu-cuda/`** と同 API。**`FP16HostWeight`**、**`.fp16bin`**（magic **`FPH1`**）、**`<model>.gguf.fp16`**、**`manifest`**（GGUF サイズ・mtime 検証）。
+
+#### `qwen3-8b/gpu-rocm/main.c`
+
+- **`dequant_tensor_row`**: GGUF mmap 上の **IQ2_S / IQ3_S / Q4_K / Q5_K / F16 / F32** を行単位 F32 復号。
+- **`upload_fp16_tensor_streaming`**: 行単位逆量子化 → FP16 → 逐次 H2D（**`max_tensor_nelements` ステージング不要**）。
+- **`upload_fp16_linear`**: オフラインキャッシュ有効時は **`.fp16bin`** から H2D。ミス時は **`upload_fp16_tensor_streaming`** にフォールバック。
+- **`pack_fp16_cache`**: **`token_embd` + L×7 + `output.weight`**（**L×7 + 2**）をキャッシュへ書き出し。
+- CLI: **`--pack-fp16-cache [dir]`**、**`--no-fp16-cache`**。
+- 起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。
+
+#### `qwen3-8b/gpu-rocm/Makefile`
+
+- **`main.o` + `fp16_cache_io.o`** をリンク（**`-lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパス検出）。
+- **`build`**: **`qwen3-rocm`** + **`$(MODEL).fp16/manifest`**（**`MODEL`** 存在時）。**`run`**: バイナリのみ。
+- **`pack-cache`**: **`./qwen3-rocm "$(MODEL)" --pack-fp16-cache`**。
+- **`BENCH_LOG`**: gfx1201 計測 1 件追加（**`2026-05-27T05:25:28|…|147.79|29.03|102.47`**）。
+
+#### `.gitignore`
+
+- **`qwen3-8b/gpu-rocm/*.o`**: 分割コンパイルの **`main.o`** / **`fp16_cache_io.o`** を Git 対象外に。
+
+#### ドキュメント
+
+**`doc/design.md`**: バリアント表・ディレクトリ表（**`fp16_cache.*`**）・Make ターゲット（**`gpu-rocm` の `pack-cache` / `build` vs `run`**）・ROCm ビルド節・実行時挙動・CLI・量子化節・制約・トラブルシュート・**「ROCm FP16 オフラインキャッシュ」** 節を上記に同期。
+
+**`README.md`** / **`README.en.md`**: 実行経路表・ROCm 節（**`make build` / `make run` / `make pack-cache`**、起動ログ、要件 **g++**）・CUDA クイックリファレンス・FP16 キャッシュ節・トラブルシュート・「実装を読む順序」を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-25 02:11:54
 
 **`qwen3-8b/gpu-cuda/`** — **FP16 オフラインキャッシュ**（`make pack-cache` / `--pack-fp16-cache`）と **GGUF 行単位融合逆量子化**（全 tensor ステージング廃止）。**`.gitignore`** — **`*.gguf.fp16/`** を追加（**`*.gguf.nvfp4/`** は **`b20a4d7`** で追加済み）。
