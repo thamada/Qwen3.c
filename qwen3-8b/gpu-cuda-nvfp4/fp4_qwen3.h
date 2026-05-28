@@ -25,6 +25,9 @@ FP4HostWeight *fp4_qwen3_host_weight_from_rows(int N, int K,
 void  fp4_qwen3_free_weight(void *cache);
 size_t fp4_qwen3_vram_bytes(void);
 
+/* Set GEMM batch row for decode (sequence position); prefill uses 0. */
+void fp4_qwen3_set_gemm_row(int row);
+
 /* y[M*d] = W[d,n] @ x[M*n]  (W is cached NVFP4, x/y are F32). */
 void fp4_qwen3_mm(const void *weight_cache,
                   const float *x, float *y,

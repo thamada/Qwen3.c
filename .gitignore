@@ -19,6 +19,7 @@ qwen3-8b/gpu-rocm/*.o
 qwen3-8b/gpu-cuda/qwen3-gpu-cuda
 qwen3-8b/gpu-cuda/polarquant_verify
 qwen3-8b/gpu-cuda/*.o
+qwen3-8b/gpu-cuda/.build_config.stamp
 qwen3-8b/gpu-cuda-nvfp4/qwen3-gpu-cuda-nvfp4
 qwen3-8b/gpu-cuda-nvfp4/fp4_verify
 qwen3-8b/gpu-cuda-nvfp4/polarquant_verify

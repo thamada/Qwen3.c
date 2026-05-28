@@ -908,8 +908,7 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
         if (!gm->out.ptr) exit(1);
         gm->out_t = host->out_t;
         gm->use_fp4 = 1;
-        printf("GPU: FP4 Tensor Core path enabled (GEMM M>=%d, GEMV decode)\n",
-               128);
+        printf("GPU: FP4 GEMV path enabled (prefill + decode)\n");
     }
 #else
     gm->wq       = dev_adopt_layers(L, host->wq);
