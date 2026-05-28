@@ -4,6 +4,45 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 04:06:32
+
+**NVFP4 推論を prefill / decode とも FP4 GEMV に統一**、**SFB LUT 格納**、**キャッシュ v2**、**VRAM 計測更新**。
+
+#### 背景
+
+長プロンプト（M≥128）で **CUTLASS GEMM prefill**（活性をその場 FP4 量子化）と **FP4 GEMV decode**（F32 活性）が混在し、同文繰り返し・「LLM」連発等の異常出力が発生。短プロンプト（M&lt;128）は両方 GEMV のため正常に見えた。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu` / `fp4_qwen3.h`
+
+- **`fp4_qwen3_mm`**: 全 M で **`fp4_gemv_cached`** / **`fp4_gemv_batch_cached`** のみ（GEMM prefill 分岐を削除）。
+- **`fp4_qwen3_set_gemm_row`**: no-op（互換 API 維持）。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_gemm.cu` / `fp4_gemm.h`
+
+- 重み SFB を CUTLASS **`layout_SFB`** 互換の **LUT（`d_sf_lut`）** で格納・GEMV 参照。
+- CUTLASS **`fp4_gemm_run_cached`** は **`fp4_qwen3_init`** smoke GEMM と **`make fp4-test`** 用に残置。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_cache.h`
+
+- **`FP4_CACHE_VERSION`**: **1 → 2**（SFB + LUT レイアウト）。旧 **`.fp4bin`** は **`make pack-cache`** で再生成必須。
+
+#### `qwen3-8b/gpu-cuda/kernels.cu`
+
+- 起動ログ: **`GPU: FP4 GEMV path enabled (prefill + decode)`**（旧 **`GEMM M>=128, GEMV decode`** を置換）。
+
+#### 性能・VRAM（`Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`・RTX 5090・`-l 512`）
+
+- 長 prefill: **~30 tok/s**（旧 GEMM prefill **~600 tok/s** より遅いが品質優先）。decode: **~65 tok/s**。
+- **`vram_total`**: **8446.43 MiB**（旧 GEMM 経路 **~6655 MiB**）。**`vram_weights_fp4`**: **5864.22 MiB**（LUT 含む。旧 **~4060 MiB**）。
+
+#### ドキュメント
+
+**`README.md`**: VRAM 表・GEMV 統一路線・トラブルシュートを同期。
+
+**`doc/design.md`**: 構成表・実行時挙動・NVFP4 補足節・トラブルシュートを同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 02:07:34
 
 **CUDA ベンチログ統一・VRAM プロファイル・GPU 自動検出**、**NVFP4 量子化／GEMM 修正**、**README CPU 主眼化**。

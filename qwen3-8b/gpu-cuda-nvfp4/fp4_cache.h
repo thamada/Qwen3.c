@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define FP4_CACHE_MAGIC   0x5141464eu  /* "NFAQ" little-endian */
-#define FP4_CACHE_VERSION 1
+#define FP4_CACHE_VERSION 2
 
 typedef struct FP4HostWeight {
     int N, K;

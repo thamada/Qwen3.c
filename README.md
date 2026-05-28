@@ -774,8 +774,8 @@ FP16 ビルド（`gpu-cuda`）の既定は **`nvidia-smi` による GPU 自動�
 | **`gpu-rocm`** | オフラインキャッシュ（**`<model>.gguf.fp16`**）があれば **`.fp16bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → FP16 | hipBLAS GemmEx（Prefill）+ カスタム GEMV（Decode）。KV は **F32** |
 | **`gpu-cuda`** | オフラインキャッシュ（**`<model>.gguf.fp16`**）があれば **`.fp16bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → FP16 | FP16 GEMV カーネル。KV は **F32**（既定） |
 | **`gpu-cuda`** + **`build.polarquant`** | 線形は FP16（上と同じ） | KV は **PolarQuant-R**（64 B/head）。Attention タイル読み出し時に F32 復号 |
-| **`gpu-cuda-nvfp4`** | オフラインキャッシュ（**`<model>.gguf.nvfp4`**）があれば **`.fp4bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → NVFP4。**`token_embd`** は行単位 FP16 H2D | **`fp4_qwen3_mm`** — decode / 短 Prefill は **FP4 GEMV**、長 Prefill は CUTLASS GEMM |
-| **`gpu-cuda-nvfp4`** + **`build.polarquant`** | 線形は NVFP4 のみ（上と同じ） | 線形は FP4 GEMV/GEMM。KV は PolarQuant-R |
+| **`gpu-cuda-nvfp4`** | オフラインキャッシュ（**`<model>.gguf.nvfp4`**）があれば **`.fp4bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → NVFP4。**`token_embd`** は行単位 FP16 H2D | **`fp4_qwen3_mm`** — prefill / decode とも **FP4 GEMV**（GEMV-batch / GEMV）。CUTLASS GEMM は起動検証・`fp4-test` 用 |
+| **`gpu-cuda-nvfp4`** + **`build.polarquant`** | 線形は NVFP4 のみ（上と同じ） | 線形は FP4 GEMV。KV は PolarQuant-R |
 
 **`gpu-rocm`** / **`gpu-cuda`**（FP16）も初回起動は GGUF 行逆量子化に時間がかかります。**`make pack-cache`**（または **`--pack-fp16-cache`**）で **`<model>.gguf.fp16`** を事前生成すると、2 回目以降は **`Loading FP16 cache from …`** から H2D できます。**`--no-fp16-cache`** でキャッシュを無視して毎回再逆量子化します。**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack されます。
 
@@ -844,7 +844,7 @@ make build            # sm_120a + BONSAI_FP4=1 + FA_BR=32
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-成功すると **`qwen3-gpu-cuda-nvfp4`** ができます。起動ログに **`Loading NVFP4 cache from …`** または **`Uploading weights (fused dequant -> NVFP4 linear layers)...`** と **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`** が出れば FP4 経路が有効です。
+成功すると **`qwen3-gpu-cuda-nvfp4`** ができます。起動ログに **`Loading NVFP4 cache from …`** または **`Uploading weights (fused dequant -> NVFP4 linear layers)...`** と **`GPU: FP4 GEMV path enabled (prefill + decode)`** が出れば FP4 経路が有効です。
 
 ### オフライン NVFP4 キャッシュ（`make pack-cache`）
 
@@ -1006,24 +1006,26 @@ Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳
 |---|---|---:|---:|---:|---|
 | 2026-05-24 15:03 | **sm_120a** | **622.60** | **66.71** | **122.03** | 132+128 トークン（**`make log.push`**・旧 stdout パース） |
 | 2026-05-28 22:44 | **sm_120a** | **595.27** | **66.71** | **121.47** | 同上（**`BENCH_LOG_FILE`**） |
-| 2026-05-29 02:02 | **sm_120a** | **619.62** | **66.81** | **122.13** | 同上（NVFP4 GEMM 修正後・正常生成） |
+| 2026-05-29 02:02 | **sm_120a** | **619.62** | **66.81** | **122.13** | 同上（旧 GEMM prefill 経路・正常生成） |
 
-**VRAM 内訳**（**2026-05-29 02:02** 計測。**`BENCH_LOG_FILE`** の **`[vram_breakdown]`**。上表 tok/s 行と同一実行。`-l` 既定 **`max_seq=512`** 条件）:
+**VRAM 内訳**（**最新実装**・**`BENCH_LOG_FILE`** の **`[vram_breakdown]`**。`-l` 既定 **`max_seq=512`** 条件。モデル **`Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**・RTX 5090）:
 
 | 項目 | bytes | MiB | 備考 |
 |---|---:|---:|---|
-| **`vram_total`**（理論合計） | 6,978,059,776 | **6654.80** | 下記カテゴリの合計 |
-| **`vram_device_used`** | 7,758,675,968 | **7399.25** | **`cudaMemGetInfo`**（CUDA ランタイム等を含む場合あり） |
+| **`vram_total`**（理論合計） | 8,856,722,944 | **8446.43** | 下記カテゴリの合計 |
+| **`vram_device_used`** | 9,639,821,312 | **9193.25** | **`cudaMemGetInfo`**（CUDA ランタイム等を含む場合あり） |
 | **`vram_device_total`** | 33,669,513,216 | **32109.75** | GPU 全体 VRAM |
 | `vram_weights_embd` | 1,244,659,712 | **1187.00** | FP16 **`token_embd`** |
 | `vram_weights_f32_norm` | 1,232,896 | **1.18** | F32 norm 重み |
-| `vram_weights_fp4` | 4,257,054,720 | **4059.84** | NVFP4 線形重みキャッシュ（**`wq`〜`down`** + LM head） |
+| `vram_weights_fp4` | 6,149,079,040 | **5864.22** | NVFP4 線形重み（packed FP4 + スケール因子 + デバイス側 LUT） |
 | `vram_kv_cache` | 150,994,944 | **144.00** | **`kc` / `vc`**（`-l` 依存） |
 | `vram_decode_activations` | 779,776 | **0.74** | 単トークン decode 用バッファ |
 | `vram_prefill_batch` | 88,082,432 | **84.00** | prefill バッチ（**`batch_cap = max_seq`**） |
-| `vram_fp4_gemm_scratch` | 1,235,255,296 | **1178.03** | BF16 活性／出力 + CUTLASS workspace 等 |
+| `vram_fp4_gemm_scratch` | 1,221,894,144 | **1165.29** | BF16 活性／出力バッファ + CUTLASS workspace（**`fp4_qwen3_init`** 時確保） |
 
-NVFP4 線形キャッシュ（**~4060 MiB**）と GEMM スクラッチ（**~1178 MiB**）が理論 VRAM の大半。**FP16 経路**（上記 **`gpu-cuda`** 長プロンプト表・理論 **~15852 MiB**）より小さいが、Tensor Core GEMM 用の作業領域を含む。embedding・KV・prefill バッチは FP16 版と同程度。
+NVFP4 線形重み（**~5864 MiB**）と GEMM スクラッチ（**~1165 MiB**）が理論 VRAM の大半。**FP16 経路**（上記 **`gpu-cuda`** 長プロンプト表・理論 **~15852 MiB**）より小さい。embedding（**~1187 MiB**）・KV（**~144 MiB**）・prefill バッチ（**~84 MiB**）は FP16 版と同程度。**`vram_device_used`** は **`vram_total`** より大きいことがあります（ドライバ／CUDA 割当の差）。
+
+**旧計測（2026-05-29 02:02・GEMM prefill 経路）**: 理論 **`vram_total` ~6655 MiB**（**`vram_weights_fp4` ~4060 MiB**、**`vram_fp4_gemm_scratch` ~1178 MiB**）。推論は prefill/decode とも **FP4 GEMV** に統一済み（長プロンプトでも生成品質を優先）。
 
 ### ソースを読む場合
 
@@ -1060,9 +1062,11 @@ nvcc --version
 
 **`fp4_gemm`** を **`compute_86` PTX** のみでビルドした古い **`fp4_gemm.o`** を使っている可能性があります。**`gpu-cuda-nvfp4`** で **`make clean`** → **`make fp4-test`** を再実行してください（**`fp4_gemm.sm120a.o`** は **`sm_120a` + C++17** 固定）。**Blackwell GPU 必須**です。
 
-### NVFP4 で decode が極端に遅い
+### NVFP4 で prefill が遅い／decode が極端に遅い
 
-古いバイナリが M=1 を CUTLASS M=128 パディング経路に落としている場合があります。最新 **`fp4_gemv_cached`** 入り **`gpu-cuda-nvfp4`** ビルドか確認し、起動ログに **`GEMM M>=128, GEMV decode`** が出ることを確認してください。
+最新実装は prefill / decode とも **FP4 GEMV** です（起動ログ **`GPU: FP4 GEMV path enabled (prefill + decode)`**）。長プロンプト（**≥128 トークン**）の prefill は **~30 tok/s** 程度になり、旧 **GEMM prefill 経路**（**~600 tok/s**）より遅くなりますが、生成品質を優先しています。decode は **~65 tok/s** 程度です。
+
+古いバイナリが M=1 を CUTLASS **M=128 パディング GEMM** に落としている場合、decode が **~4 tok/s** まで落ちることがあります。**`make clean && make build`** で再ビルドしてください。
 
 ### `gpu-cuda-nvfp4` の PolarQuant ビルドが遅い／`Killed`（OOM）
 

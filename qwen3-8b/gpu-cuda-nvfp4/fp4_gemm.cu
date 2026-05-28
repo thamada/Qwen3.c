@@ -852,10 +852,48 @@ void fp4_gemm_sync() { cudaDeviceSynchronize(); }
 struct FP4WeightCache {
     uint8_t* d_fp4;    // [N, K/2] packed FP4 data on device
     uint8_t* d_sf;     // Scale factors in CUTLASS interleaved layout
+    int *d_sf_lut;     // [N * (K/16)] row/sb -> scale index (matches GEMM layout_SFB)
     int N;
     int K;
     int sf_elems;      // Number of scale factor elements
+    int lut_nsb;       // K / SF_VEC_SIZE
 };
+
+static int build_weight_sf_lut(FP4WeightCache *cache)
+{
+    if (!cache || cache->N <= 0 || cache->K <= 0) return -1;
+
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, cache->N, cache->K, 1));
+    int nsb = cache->K / SF_VEC_SIZE;
+    int n = cache->N * nsb;
+    int *h_lut = (int *)malloc((size_t)n * sizeof(int));
+    if (!h_lut) return -1;
+
+    for (int r = 0; r < cache->N; r++)
+        for (int sb = 0; sb < nsb; sb++)
+            h_lut[r * nsb + sb] = layout_SFB(r, sb * SF_VEC_SIZE, 0);
+
+    cudaError_t err = cudaMalloc(&cache->d_sf_lut, (size_t)n * sizeof(int));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "build_weight_sf_lut: cudaMalloc failed: %s\n",
+                cudaGetErrorString(err));
+        free(h_lut);
+        return -1;
+    }
+    cudaMemcpy(cache->d_sf_lut, h_lut, (size_t)n * sizeof(int), cudaMemcpyHostToDevice);
+    free(h_lut);
+    cache->lut_nsb = nsb;
+    return 0;
+}
+
+static void free_weight_sf_lut(FP4WeightCache *cache)
+{
+    if (!cache) return;
+    if (cache->d_sf_lut) cudaFree(cache->d_sf_lut);
+    cache->d_sf_lut = nullptr;
+    cache->lut_nsb = 0;
+}
 
 static int align128(int x) { return (x + 127) & ~127; }
 
@@ -959,6 +997,8 @@ static FP4WeightCache *upload_weight_cache_from_host(const FP4HostWeight *host)
     cache->N = host->N;
     cache->K = host->K;
     cache->sf_elems = host->sf_elems;
+    cache->d_sf_lut = nullptr;
+    cache->lut_nsb = 0;
 
     size_t fp4_bytes = (size_t)host->N * (size_t)host->K / 2;
     size_t sf_bytes = (size_t)host->sf_elems * sizeof(ScaleFactorType);
@@ -982,6 +1022,12 @@ static FP4WeightCache *upload_weight_cache_from_host(const FP4HostWeight *host)
 
     cudaMemcpy(cache->d_fp4, host->h_fp4, fp4_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(cache->d_sf, host->h_sf, sf_bytes, cudaMemcpyHostToDevice);
+    if (build_weight_sf_lut(cache) != 0) {
+        cudaFree(cache->d_fp4);
+        cudaFree(cache->d_sf);
+        delete cache;
+        return nullptr;
+    }
     return cache;
 }
 
@@ -1007,7 +1053,7 @@ static FP4WeightCache *build_weight_cache_host_bf16(
     return cache;
 }
 
-// Quantize BF16 weights once on GPU (CUTLASS scale layout via compute_sf_index)
+// Quantize BF4 weights once on GPU (CUTLASS SFB layout via per-weight LUT)
 void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     if (N % 128 != 0 || K % 128 != 0) {
         fprintf(stderr, "fp4_quantize_weights: N=%d, K=%d must be multiples of 128\n", N, K);
@@ -1022,6 +1068,8 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     cache->N = N;
     cache->K = K;
     cache->sf_elems = sf_elems;
+    cache->d_sf_lut = nullptr;
+    cache->lut_nsb = 0;
 
     cudaError_t err;
     err = cudaMalloc(&cache->d_fp4, (size_t)N * K / 2);
@@ -1040,6 +1088,13 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
         return nullptr;
     }
 
+    if (build_weight_sf_lut(cache) != 0) {
+        cudaFree(cache->d_fp4);
+        cudaFree(cache->d_sf);
+        delete cache;
+        return nullptr;
+    }
+
     int nsb = K / SF_VEC_SIZE;
     int total_blocks = N * nsb;
     int threads = 256;
@@ -1047,7 +1102,7 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
         (const __nv_bfloat16*)weight_bf16,
         cache->d_fp4, cache->d_sf,
-        N, K, nsb, nullptr);
+        N, K, nsb, cache->d_sf_lut);
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         fprintf(stderr, "fp4_quantize_weights: kernel: %s\n", cudaGetErrorString(err));
@@ -1108,8 +1163,12 @@ int fp4_weight_cache_K(const void* cache_handle) {
 size_t fp4_weight_cache_device_bytes(const void *cache_handle) {
     if (!cache_handle) return 0;
     const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
+    size_t lut_bytes = cache->d_sf_lut
+        ? (size_t)cache->N * (size_t)cache->lut_nsb * sizeof(int)
+        : 0;
     return (size_t)cache->N * (size_t)cache->K / 2
-         + (size_t)cache->sf_elems * sizeof(ScaleFactorType);
+         + (size_t)cache->sf_elems * sizeof(ScaleFactorType)
+         + lut_bytes;
 }
 
 size_t fp4_gemm_vram_bytes(void)
@@ -1143,6 +1202,7 @@ void fp4_weight_cache_free(void* cache_handle) {
     FP4WeightCache* cache = (FP4WeightCache*)cache_handle;
     cudaFree(cache->d_fp4);
     cudaFree(cache->d_sf);
+    free_weight_sf_lut(cache);
     delete cache;
 }
 
@@ -1252,17 +1312,6 @@ int fp4_gemm_run_cached(
 #define FP4_GEMV_ROWS 8
 #define FP4_GEMV_THREADS (FP4_GEMV_WARP * FP4_GEMV_ROWS)
 
-__device__ __forceinline__ int sfb_sf_index(int r, int k_block, int nsb)
-{
-    int r0 = r % 32;
-    int r1 = (r / 32) % 4;
-    int r2 = r / 128;
-    int k1 = k_block % 4;
-    int k2 = k_block / 4;
-    int k_tiles = nsb / 4;
-    return r0 * 16 + r1 * 4 + r2 * (512 * k_tiles) + k1 + k2 * 512;
-}
-
 __device__ __forceinline__ float d_fp4_nibble_to_float(uint8_t nibble)
 {
     int sign = (nibble & 0x8) ? -1 : 1;
@@ -1271,13 +1320,14 @@ __device__ __forceinline__ float d_fp4_nibble_to_float(uint8_t nibble)
 
 __device__ __forceinline__ float fp4_dot_row(
     const float *x, const uint8_t *row_fp4, const uint8_t *w_sf,
-    int row, int n, int K, int nsb)
+    int row, int n, int nsb, const int *sf_lut)
 {
     float val = 0.f;
     for (int sb = 0; sb < nsb; sb++) {
         int k0 = sb * SF_VEC_SIZE;
         if (k0 >= n) break;
-        float scale = d_ue4m3_to_float(w_sf[sfb_sf_index(row, sb, nsb)]);
+        int sf_idx = sf_lut[(size_t)row * nsb + sb];
+        float scale = d_ue4m3_to_float(w_sf[sf_idx]);
         #pragma unroll
         for (int i = 0; i < SF_VEC_SIZE; i += 2) {
             int k = k0 + i;
@@ -1296,7 +1346,7 @@ __global__ void fp4_gemv_kernel(float *__restrict__ o,
     const float *__restrict__ x,
     const uint8_t *__restrict__ w_fp4,
     const uint8_t *__restrict__ w_sf,
-    int n, int d, int K, int nsb)
+    int n, int d, int K, int nsb, const int *__restrict__ sf_lut)
 {
     int local_row = threadIdx.x / FP4_GEMV_WARP;
     int lane      = threadIdx.x % FP4_GEMV_WARP;
@@ -1309,7 +1359,8 @@ __global__ void fp4_gemv_kernel(float *__restrict__ o,
     for (int sb = lane; sb < nsb; sb += FP4_GEMV_WARP) {
         int k0 = sb * SF_VEC_SIZE;
         if (k0 >= n) continue;
-        float scale = d_ue4m3_to_float(w_sf[sfb_sf_index(row, sb, nsb)]);
+        int sf_idx = sf_lut[(size_t)row * nsb + sb];
+        float scale = d_ue4m3_to_float(w_sf[sf_idx]);
         #pragma unroll
         for (int i = 0; i < SF_VEC_SIZE; i += 2) {
             int k = k0 + i;
@@ -1330,7 +1381,7 @@ __global__ void fp4_gemv_batch_kernel(float *__restrict__ o,
     const float *__restrict__ x,
     const uint8_t *__restrict__ w_fp4,
     const uint8_t *__restrict__ w_sf,
-    int n, int d, int K, int nsb, int M)
+    int n, int d, int K, int nsb, int M, const int *__restrict__ sf_lut)
 {
     int flat = blockIdx.x * blockDim.x + threadIdx.x;
     int t = flat / d;
@@ -1340,7 +1391,7 @@ __global__ void fp4_gemv_batch_kernel(float *__restrict__ o,
     const float *xt = x + (size_t)t * n;
     float *ot = o + (size_t)t * d;
     const uint8_t *row_fp4 = w_fp4 + (size_t)row * (K / 2);
-    ot[row] = fp4_dot_row(xt, row_fp4, w_sf, row, n, K, nsb);
+    ot[row] = fp4_dot_row(xt, row_fp4, w_sf, row, n, nsb, sf_lut);
 }
 
 void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
@@ -1348,11 +1399,15 @@ void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
 {
     if (!cache_handle) return;
     const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
+    if (!cache->d_sf_lut) {
+        fprintf(stderr, "fp4_gemv_cached: missing scale LUT\n");
+        return;
+    }
     int K = cache->K;
     int nsb = K / SF_VEC_SIZE;
     int blocks = (d + FP4_GEMV_ROWS - 1) / FP4_GEMV_ROWS;
     fp4_gemv_kernel<<<blocks, FP4_GEMV_THREADS>>>(
-        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb);
+        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb, cache->d_sf_lut);
 }
 
 void fp4_gemv_batch_cached(const void *cache_handle, const float *x, float *y,
@@ -1360,11 +1415,15 @@ void fp4_gemv_batch_cached(const void *cache_handle, const float *x, float *y,
 {
     if (!cache_handle || M <= 0) return;
     const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
+    if (!cache->d_sf_lut) {
+        fprintf(stderr, "fp4_gemv_batch_cached: missing scale LUT\n");
+        return;
+    }
     int K = cache->K;
     int nsb = K / SF_VEC_SIZE;
     int total = M * d;
     fp4_gemv_batch_kernel<<<(total + 255) / 256, 256>>>(
-        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb, M);
+        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb, M, cache->d_sf_lut);
 }
 
 }  // extern "C"
