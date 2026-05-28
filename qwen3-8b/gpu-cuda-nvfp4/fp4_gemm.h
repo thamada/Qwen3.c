@@ -16,6 +16,10 @@ int  fp4_gemm_prealloc(int max_M, int max_N, int max_K);
 int  fp4_gemm_run(const void *A_bf16, const void *B_bf16,
                   const void *C_bf16, void *D_bf16,
                   int M, int N, int K, float alpha, float beta);
+/* Host quantizes with layout_SFA/SFB (reference); for verification only. */
+int  fp4_gemm_run_host(const void *A_bf16, const void *B_bf16,
+                       const void *C_bf16, void *D_bf16,
+                       int M, int N, int K, float alpha, float beta);
 void fp4_gemm_cleanup(void);
 void fp4_gemm_sync(void);
 
@@ -33,11 +37,6 @@ void  fp4_weight_cache_free(void *cache);
 FP4HostWeight *fp4_host_weight_build(int N_act, int K_act,
                                        fp4_dequant_row_fn get_row, void *ctx);
 void *fp4_weight_cache_upload(const FP4HostWeight *host);
-
-void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
-                     int n, int d);
-void fp4_gemv_batch_cached(const void *cache_handle, const float *x, float *y,
-                           int M, int n, int d);
 
 int  fp4_gemm_run_cached(const void *A_bf16, const void *cache_handle,
                           const void *C_bf16, void *D_bf16,

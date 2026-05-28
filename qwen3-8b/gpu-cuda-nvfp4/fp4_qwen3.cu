@@ -1,8 +1,8 @@
 /*
  * Qwen3 FP4 bridge: NVFP4 weight cache, F32 activations in/out.
- * Inference uses FP4 GEMV/GEMV-batch only. CUTLASS NVFP4 GEMM (M>=128) quantizes
- * activations to FP4; GEMV uses F32 activations — mixing them breaks generation
- * when prefill length >= 128 (GEMM prefill + GEMV decode mismatch).
+ * Inference uses CUTLASS NVFP4 Tensor Core GEMM (fp4_gemm_run_cached), same as
+ * Bonsai gpu-cuda-nvfp4: activations are padded to M/K multiples of 128, quantized
+ * to FP4 on the fly, then block-scaled GEMM on Blackwell sm_120a.
  */
 
 #include "fp4_qwen3.h"
@@ -28,6 +28,31 @@ static __nv_bfloat16 *g_out_bf16 = NULL;
 static size_t g_act_cap = 0, g_out_cap = 0;
 
 static int align128(int x) { return (x + 127) & ~127; }
+
+static __global__ void f32_to_bf16_pad_kernel(
+    const float *src, __nv_bfloat16 *dst, int M_act, int M_pad, int n, int K_pad)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M_pad * K_pad;
+    if (idx >= total) return;
+    int m = idx / K_pad;
+    int k = idx - m * K_pad;
+    float v = 0.0f;
+    if (m < M_act && k < n)
+        v = src[(size_t)m * n + k];
+    dst[idx] = __float2bfloat16_rn(v);
+}
+
+static __global__ void bf16_to_f32_trunc_kernel(
+    const __nv_bfloat16 *src, float *dst, int M, int d, int N_pad)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * d;
+    if (idx >= total) return;
+    int m = idx / d;
+    int n = idx - m * d;
+    dst[idx] = __bfloat162float(src[(size_t)m * N_pad + n]);
+}
 
 int fp4_qwen3_init(int max_M, int max_N, int max_K)
 {
@@ -142,8 +167,34 @@ void fp4_qwen3_mm(const void *weight_cache,
     }
     if (M <= 0) return;
 
-    if (M == 1)
-        fp4_gemv_cached(weight_cache, x, y, n, d);
-    else
-        fp4_gemv_batch_cached(weight_cache, x, y, M, n, d);
+    int K_pad = fp4_weight_cache_K(weight_cache);
+    int N_pad = fp4_weight_cache_N(weight_cache);
+    int M_pad = align128(M);
+
+    if (M_pad > g_max_M || N_pad > g_max_N || K_pad > g_max_K) {
+        if (fp4_qwen3_init(M_pad > g_max_M ? M_pad : g_max_M,
+                           N_pad > g_max_N ? N_pad : g_max_N,
+                           K_pad > g_max_K ? K_pad : g_max_K) != 0) {
+            fprintf(stderr, "fp4_qwen3_mm: init failed\n");
+            exit(1);
+        }
+    }
+
+    int act_elems = M_pad * K_pad;
+    f32_to_bf16_pad_kernel<<<(act_elems + 255) / 256, 256>>>(
+        x, g_act_bf16, M, M_pad, n, K_pad);
+
+    CUDA_CHECK(cudaMemset(g_out_bf16, 0,
+        (size_t)M_pad * N_pad * sizeof(__nv_bfloat16)));
+
+    if (fp4_gemm_run_cached(g_act_bf16, weight_cache, NULL, g_out_bf16,
+                            M_pad, 1.0f, 0.0f) != 0) {
+        fprintf(stderr, "fp4_qwen3_mm: gemm failed M=%d n=%d d=%d\n", M, n, d);
+        exit(1);
+    }
+    fp4_gemm_sync();
+
+    bf16_to_f32_trunc_kernel<<<(M * d + 255) / 256, 256>>>(
+        g_out_bf16, y, M, d, N_pad);
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
