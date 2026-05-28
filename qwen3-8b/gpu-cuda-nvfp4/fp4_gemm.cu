@@ -85,6 +85,9 @@ using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1x
 using ScaleFactorType = typename ElementA::ScaleFactorType;  // float_ue4m3_t
 
 static constexpr int SF_VEC_SIZE = Sm1xxBlkScaledConfig::SFVecSize;  // 16
+/* Cached B scales are packed with this M in tile_atom_to_shape_SFB; runtime GEMM
+ * must use the same layout M even when the activation batch M_pad is larger. */
+static constexpr int FP4_WEIGHT_SFB_LAYOUT_M = 128;
 
 // ============================================================================
 // GPU quantization kernels
@@ -148,6 +151,41 @@ __device__ __forceinline__ uint8_t d_float_to_ue4m3(float val) {
         }
         return (uint8_t)((ue4m3_exp << 3) | mant);
     }
+}
+
+static float host_ue4m3_to_float(uint8_t raw)
+{
+    int exp = (raw >> 3) & 0xF;
+    int mant = raw & 0x7;
+    if (exp == 0)
+        return ldexpf((float)mant, -9);
+    return ldexpf(1.0f + (float)mant / 8.0f, exp - 7);
+}
+
+static uint8_t host_float_to_ue4m3(float val)
+{
+    val = fmaxf(val, 1.953125e-3f);
+    val = fminf(val, 480.0f);
+    union { float f; uint32_t u; } bits;
+    bits.f = val;
+    int fp32_exp = ((bits.u >> 23) & 0xFF) - 127;
+    int fp32_mant = bits.u & 0x7FFFFF;
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        int shift = 1 - ue4m3_exp;
+        int mant = (0x800000 | fp32_mant) >> (20 + shift);
+        if (mant > 7) mant = 7;
+        return (uint8_t)mant;
+    }
+    if (ue4m3_exp >= 15)
+        return 0x7F;
+    int mant = (fp32_mant + (1 << 19)) >> 20;
+    if (mant >= 8) {
+        mant = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 16) return 0xFF;
+    }
+    return (uint8_t)((ue4m3_exp << 3) | mant);
 }
 
 // Convert UE4M3 raw byte back to float
@@ -216,6 +254,20 @@ __device__ __forceinline__ int compute_sf_index(int r, int k_block, int rows, in
     int row_tile_stride = 512 * k_tiles;
     int k_tile_stride = 512;
 
+    return r0 * 16 + r1 * 4 + r2 * row_tile_stride + k1 * 1 + k2 * k_tile_stride;
+}
+
+static int host_compute_sf_index(int r, int k_block, int rows, int nsb)
+{
+    (void)rows;
+    int r0 = r % 32;
+    int r1 = (r / 32) % 4;
+    int r2 = r / 128;
+    int k1 = k_block % 4;
+    int k2 = k_block / 4;
+    int k_tiles = nsb / 4;
+    int row_tile_stride = 512 * k_tiles;
+    int k_tile_stride = 512;
     return r0 * 16 + r1 * 4 + r2 * row_tile_stride + k1 * 1 + k2 * k_tile_stride;
 }
 
@@ -362,10 +414,9 @@ static void quantize_matrix_colmajor_host(
     }
 }
 
-template <typename LayoutSF>
 static void quantize_row_host(
     const cutlass::bfloat16_t *row_ptr, uint8_t *dst_fp4,
-    ScaleFactorType *dst_sf, int r, int K, LayoutSF layout_sf)
+    uint8_t *dst_sf, int r, int K, int N_rows)
 {
     int nsb = K / SF_VEC_SIZE;
     for (int sb = 0; sb < nsb; sb++) {
@@ -377,11 +428,11 @@ static void quantize_row_host(
         }
         float scale_val = max_abs / 6.0f;
         if (scale_val < 1e-10f) scale_val = 1e-10f;
-        ScaleFactorType scale_ue4m3 = ScaleFactorType(scale_val);
-        float actual_scale = float(scale_ue4m3);
+        uint8_t scale_raw = host_float_to_ue4m3(scale_val);
+        float actual_scale = host_ue4m3_to_float(scale_raw);
         float scale_inv = 1.0f / actual_scale;
-        int sf_idx = layout_sf(r, k_start, 0);
-        dst_sf[sf_idx] = scale_ue4m3;
+        int sf_idx = host_compute_sf_index(r, sb, N_rows, nsb);
+        dst_sf[sf_idx] = scale_raw;
         for (int i = 0; i < SF_VEC_SIZE; i += 2) {
             float v0 = float(row_ptr[k_start + i]) * scale_inv;
             float v1 = float(row_ptr[k_start + i + 1]) * scale_inv;
@@ -688,7 +739,10 @@ int fp4_gemm_run(
         },
         {
             {alpha, beta},
-            reinterpret_cast<const ElementC*>(C_bf16 ? C_bf16 : D_bf16), stride_C,
+            (beta != 0.0f && C_bf16)
+                ? reinterpret_cast<const ElementC*>(C_bf16)
+                : nullptr,
+            stride_C,
             reinterpret_cast<ElementD*>(D_bf16), stride_D
         }
     };
@@ -762,7 +816,10 @@ int fp4_gemm_run_host(
         },
         {
             {alpha, beta},
-            reinterpret_cast<const ElementC*>(C_bf16 ? C_bf16 : D_bf16), stride_C,
+            (beta != 0.0f && C_bf16)
+                ? reinterpret_cast<const ElementC*>(C_bf16)
+                : nullptr,
+            stride_C,
             reinterpret_cast<ElementD*>(D_bf16), stride_D
         }
     };
@@ -829,9 +886,8 @@ static FP4HostWeight *build_host_weight_padded(
     int N_pad, int K_pad, int N_act, int K_act,
     fp4_dequant_row_fn get_row, void *ctx)
 {
-    int dummy_M = 128;
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(dummy_M, N_pad, K_pad, 1));
+        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, N_pad, K_pad, 1));
     int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
 
     FP4HostWeight *w = (FP4HostWeight *)calloc(1, sizeof(FP4HostWeight));
@@ -849,26 +905,49 @@ static FP4HostWeight *build_host_weight_padded(
         return nullptr;
     }
 
-    cutlass::bfloat16_t *row_bf16 = (cutlass::bfloat16_t *)calloc((size_t)K_pad,
-        sizeof(cutlass::bfloat16_t));
+    cutlass::bfloat16_t *h_bf16 = (cutlass::bfloat16_t *)calloc(
+        (size_t)N_pad * K_pad, sizeof(cutlass::bfloat16_t));
     float *row_f32 = (float *)malloc((size_t)K_act * sizeof(float));
-    if (!row_bf16 || !row_f32) {
-        free(row_bf16);
+    if (!h_bf16 || !row_f32) {
+        free(h_bf16);
         free(row_f32);
         fp4_host_weight_free(w);
         return nullptr;
     }
 
-    ScaleFactorType *dst_sf = (ScaleFactorType *)w->h_sf;
     for (int r = 0; r < N_act; r++) {
         get_row(ctx, r, row_f32, K_act);
         for (int k = 0; k < K_act; k++)
-            row_bf16[k] = cutlass::bfloat16_t(row_f32[k]);
-        quantize_row_host(row_bf16, w->h_fp4, dst_sf, r, K_pad, layout_SFB);
+            h_bf16[(size_t)r * K_pad + k] = cutlass::bfloat16_t(row_f32[k]);
+    }
+    free(row_f32);
+
+    __nv_bfloat16 *dev_bf16 = NULL;
+    cudaError_t err = cudaMalloc(&dev_bf16, (size_t)N_pad * K_pad * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "build_host_weight_padded: cudaMalloc bf16: %s\n",
+                cudaGetErrorString(err));
+        free(h_bf16);
+        fp4_host_weight_free(w);
+        return nullptr;
+    }
+    cudaMemcpy(dev_bf16, h_bf16, (size_t)N_pad * K_pad * sizeof(__nv_bfloat16),
+               cudaMemcpyHostToDevice);
+    free(h_bf16);
+
+    void *tmp_cache = fp4_quantize_weights(dev_bf16, N_pad, K_pad);
+    cudaFree(dev_bf16);
+    if (!tmp_cache) {
+        fp4_host_weight_free(w);
+        return nullptr;
     }
 
-    free(row_bf16);
-    free(row_f32);
+    const FP4WeightCache *tc = (const FP4WeightCache *)tmp_cache;
+    size_t fp4_bytes = (size_t)N_pad * (size_t)K_pad / 2;
+    size_t sf_bytes = (size_t)sf_elems * sizeof(ScaleFactorType);
+    cudaMemcpy(w->h_fp4, tc->d_fp4, fp4_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(w->h_sf, tc->d_sf, sf_bytes, cudaMemcpyDeviceToHost);
+    fp4_weight_cache_free(tmp_cache);
     return w;
 }
 
@@ -928,26 +1007,54 @@ static FP4WeightCache *build_weight_cache_host_bf16(
     return cache;
 }
 
-// Quantize BF16 weights once and return a cache handle
-// The caller must call fp4_weight_cache_free() when done
+// Quantize BF16 weights once on GPU (CUTLASS scale layout via compute_sf_index)
 void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     if (N % 128 != 0 || K % 128 != 0) {
         fprintf(stderr, "fp4_quantize_weights: N=%d, K=%d must be multiples of 128\n", N, K);
         return nullptr;
     }
 
-    cutlass::bfloat16_t *h_bf16 = (cutlass::bfloat16_t *)malloc(
-        (size_t)N * K * sizeof(cutlass::bfloat16_t));
-    if (!h_bf16) return nullptr;
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, N, K, 1));
+    int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
 
-    cudaMemcpy(h_bf16, weight_bf16, (size_t)N * K * sizeof(cutlass::bfloat16_t),
-               cudaMemcpyDeviceToHost);
+    FP4WeightCache* cache = new FP4WeightCache();
+    cache->N = N;
+    cache->K = K;
+    cache->sf_elems = sf_elems;
 
-    FP4WeightCache *cache = build_weight_cache_host_bf16(h_bf16, N, K);
-    free(h_bf16);
-    if (!cache)
-        fprintf(stderr, "fp4_quantize_weights: quantize failed N=%d K=%d\n", N, K);
-    return (void *)cache;
+    cudaError_t err;
+    err = cudaMalloc(&cache->d_fp4, (size_t)N * K / 2);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fp4_quantize_weights: cudaMalloc fp4 failed: %s\n",
+                cudaGetErrorString(err));
+        delete cache;
+        return nullptr;
+    }
+    err = cudaMalloc(&cache->d_sf, (size_t)sf_elems);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fp4_quantize_weights: cudaMalloc sf failed: %s\n",
+                cudaGetErrorString(err));
+        cudaFree(cache->d_fp4);
+        delete cache;
+        return nullptr;
+    }
+
+    int nsb = K / SF_VEC_SIZE;
+    int total_blocks = N * nsb;
+    int threads = 256;
+    int blocks = (total_blocks + threads - 1) / threads;
+    quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
+        (const __nv_bfloat16*)weight_bf16,
+        cache->d_fp4, cache->d_sf,
+        N, K, nsb, nullptr);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fp4_quantize_weights: kernel: %s\n", cudaGetErrorString(err));
+        fp4_weight_cache_free(cache);
+        return nullptr;
+    }
+    return (void*)cache;
 }
 
 struct F16RowCtx {
@@ -1003,6 +1110,18 @@ size_t fp4_weight_cache_device_bytes(const void *cache_handle) {
     const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
     return (size_t)cache->N * (size_t)cache->K / 2
          + (size_t)cache->sf_elems * sizeof(ScaleFactorType);
+}
+
+size_t fp4_gemm_vram_bytes(void)
+{
+    if (!g.initialized) return 0;
+    size_t lut_bytes = 0;
+    if (g.d_SFA_lut && g.lut_M > 0 && g.lut_N > 0 && g.lut_nsb > 0) {
+        lut_bytes = (size_t)g.lut_M * (size_t)g.lut_nsb * sizeof(int)
+                  + (size_t)g.lut_N * (size_t)g.lut_nsb * sizeof(int);
+    }
+    return g.alloc_A_fp4 + g.alloc_B_fp4 + g.alloc_SFA + g.alloc_SFB
+         + g.workspace_size + lut_bytes;
 }
 
 FP4HostWeight *fp4_host_weight_build(int N_act, int K_act,
@@ -1067,10 +1186,19 @@ int fp4_gemm_run_cached(
         quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
             (const __nv_bfloat16*)A_bf16, g.d_A_fp4, g.d_SFA, M, K, nsb, g.d_SFA_lut);
     }
+    cudaError_t qerr = cudaGetLastError();
+    if (qerr != cudaSuccess) {
+        fprintf(stderr, "fp4_gemm_run_cached: quantize kernel: %s\n",
+                cudaGetErrorString(qerr));
+        return -1;
+    }
+    cudaDeviceSynchronize();
 
     // Run CUTLASS GEMM with quantized A + cached B
     auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
-    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+    /* B scales were stored with FP4_WEIGHT_SFB_LAYOUT_M at upload — not activation M_pad */
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, N, K, 1));
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
@@ -1087,7 +1215,10 @@ int fp4_gemm_run_cached(
         },
         {
             {alpha, beta},
-            reinterpret_cast<const ElementC*>(C_bf16 ? C_bf16 : D_bf16), stride_C,
+            (beta != 0.0f && C_bf16)
+                ? reinterpret_cast<const ElementC*>(C_bf16)
+                : nullptr,
+            stride_C,
             reinterpret_cast<ElementD*>(D_bf16), stride_D
         }
     };

@@ -107,6 +107,7 @@ PROMPT  ?= Hello, how are you?
 BENCH_PROMPT ?= Artificial intelligence has transformed many industries over the past decade. Machine learning models can now understand natural language, recognize images, and generate creative content with remarkable fluency. Large language models are trained on vast corpora of text and learn statistical patterns that enable them to predict the next token in a sequence. This capability powers applications ranging from virtual assistants and code completion tools to scientific research and education. However, deploying these models efficiently remains a challenge because they require substantial compute resources during both training and inference. Researchers explore quantization and specialized hardware to reduce latency while preserving quality.
 BENCH_N      ?= 128
 BENCH_SEED   ?= 42
+BENCH_LOG_FILE ?= /tmp/benchmark.log
 
 # GPU identifier for BENCH_LOG (Blackwell sm_120a target)
 GPU_SM ?= sm_120a
@@ -183,6 +184,13 @@ clean:
 # BENCH_LOG_BEGIN — appended by make log.push
 BENCH_LOG :=
 BENCH_LOG += 2026-05-24T15:03:39|sm_120a|24365a8c2057|132|128|622.60|66.71|122.03
+BENCH_LOG += 2026-05-28T22:44:32|sm_120a|de9a61c86ea0|132|128|595.27|66.71|121.47
+BENCH_LOG += 2026-05-28T22:53:50|sm_120a|de9a61c86ea0|132|128|605.02|66.64|121.55
+BENCH_LOG += 2026-05-28T23:02:53|sm_120a|de9a61c86ea0|132|128|617.50|66.69|121.89
+BENCH_LOG += 2026-05-28T23:05:13|sm_120a|de9a61c86ea0|132|128|609.23|66.70|121.73
+BENCH_LOG += 2026-05-28T23:12:25|sm_120a|de9a61c86ea0|132|128|615.65|66.62|121.74
+BENCH_LOG += 2026-05-29T02:00:21|sm_120a|de9a61c86ea0|132|128|591.14|66.92|121.72
+BENCH_LOG += 2026-05-29T02:02:20|sm_120a|de9a61c86ea0|132|128|619.62|66.81|122.13
 # BENCH_LOG_END
 
 log:
@@ -214,15 +222,19 @@ log.push: build
 		exit 1; \
 	fi
 	@echo "Running benchmark (prompt=\"$(BENCH_PROMPT)\", -n $(BENCH_N), -t 0, -s $(BENCH_SEED)) ..."
-	@out=$$(./$(BIN) "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED) 2>&1); \
-	np=$$(echo "$$out" | sed -n 's/^--- \([0-9][0-9]*\) prompt tokens + \([0-9][0-9]*\) generated tokens ---/\1/p' | tail -1); \
-	ng=$$(echo "$$out" | sed -n 's/^--- \([0-9][0-9]*\) prompt tokens + \([0-9][0-9]*\) generated tokens ---/\2/p' | tail -1); \
-	pf=$$(echo "$$out" | sed -n 's/^prefill_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
-	dc=$$(echo "$$out" | sed -n 's/^decode_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
-	tt=$$(echo "$$out" | sed -n 's/^total_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
+	@BENCH_LOG_FILE="$(BENCH_LOG_FILE)" ./$(BIN) "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED); \
+	if [ ! -f "$(BENCH_LOG_FILE)" ]; then \
+		echo "error: benchmark log not found: $(BENCH_LOG_FILE)" >&2; \
+		exit 1; \
+	fi; \
+	np=$$(sed -n 's/^prompt_tokens=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	ng=$$(sed -n 's/^gen_tokens=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	pf=$$(sed -n 's/^prefill_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	dc=$$(sed -n 's/^decode_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	tt=$$(sed -n 's/^total_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
 	if [ -z "$$np" ] || [ -z "$$pf" ] || [ -z "$$dc" ] || [ -z "$$tt" ]; then \
-		echo "error: failed to parse benchmark output" >&2; \
-		echo "$$out" >&2; \
+		echo "error: failed to parse $(BENCH_LOG_FILE)" >&2; \
+		cat "$(BENCH_LOG_FILE)" >&2; \
 		exit 1; \
 	fi; \
 	entry="BENCH_LOG += $$(date +%Y-%m-%dT%H:%M:%S)|$(GPU_SM)|$$(hostname -s)|$$np|$$ng|$$pf|$$dc|$$tt"; \

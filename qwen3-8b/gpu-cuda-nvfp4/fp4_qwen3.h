@@ -23,6 +23,7 @@ FP4HostWeight *fp4_qwen3_host_weight_from_rows(int N, int K,
                                                  fp4_dequant_row_fn get_row,
                                                  void *ctx);
 void  fp4_qwen3_free_weight(void *cache);
+size_t fp4_qwen3_vram_bytes(void);
 
 /* y[M*d] = W[d,n] @ x[M*n]  (W is cached NVFP4, x/y are F32). */
 void fp4_qwen3_mm(const void *weight_cache,

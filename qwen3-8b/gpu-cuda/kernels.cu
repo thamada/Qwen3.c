@@ -15,10 +15,8 @@
 
 #ifdef BONSAI_FP4
 #include "fp4_qwen3.h"
-/* CUTLASS NVFP4 GEMM requires M>=128. Prefill FP4 output is still being
- * validated against CUTLASS column-major B layout; keep disabled until verified. */
-/* CUTLASS NVFP4 prefill: row-major weights vs ColumnMajor B layout mismatch
- * still under investigation. Decode uses fast FP16 GEMV (M=1). */
+#include "fp4_gemm.h"
+/* CUTLASS NVFP4 GEMM requires M>=128 for prefill; M<128 uses FP4 GEMV (decode). */
 #endif
 
 #ifdef BONSAI_POLARQUANT
@@ -1233,13 +1231,168 @@ void gpu_copy_logits(GpuModel *gm, float *host_logits)
         (size_t)gm->cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
+static size_t fp16_mat_bytes(int n_out, int n_in)
+{
+    return (size_t)n_out * (size_t)n_in * sizeof(uint16_t);
+}
+
+static size_t weights_embd_bytes(const GpuModel *gm)
+{
+    size_t nel = (size_t)gm->cfg.vocab_size * (size_t)gm->cfg.dim;
+    if (gm->embd_t == DT_F32)
+        return nel * sizeof(float);
+    return nel * sizeof(uint16_t);
+}
+
+static size_t weights_f32_norm_bytes(const GpuModel *gm)
+{
+    const int L = gm->cfg.n_layers;
+    const int dim = gm->cfg.dim;
+    const int hd = gm->cfg.head_dim;
+    return (size_t)L * (size_t)dim * sizeof(float) * 2 +
+           (size_t)L * (size_t)hd * sizeof(float) * 2 +
+           (size_t)dim * sizeof(float);
+}
+
+#ifdef BONSAI_FP4
+static size_t dev_layer_sum_fp4_bytes(const DevLayerBuf *lb)
+{
+    if (!lb || !lb->layer) return 0;
+    size_t sum = 0;
+    for (int l = 0; l < lb->n_layers; l++)
+        sum += fp4_weight_cache_device_bytes(lb->layer[l]);
+    return sum;
+}
+
+static size_t weights_fp4_linear_bytes(const GpuModel *gm)
+{
+    size_t b =
+        dev_layer_sum_fp4_bytes(&gm->wq) +
+        dev_layer_sum_fp4_bytes(&gm->wk) +
+        dev_layer_sum_fp4_bytes(&gm->wv) +
+        dev_layer_sum_fp4_bytes(&gm->wo) +
+        dev_layer_sum_fp4_bytes(&gm->gate) +
+        dev_layer_sum_fp4_bytes(&gm->up) +
+        dev_layer_sum_fp4_bytes(&gm->down);
+    if (gm->out.ptr)
+        b += fp4_weight_cache_device_bytes(gm->out.ptr);
+    return b;
+}
+#endif
+
+static size_t weights_fp16_linear_bytes(const GpuModel *gm)
+{
+    const int L = gm->cfg.n_layers;
+    const int dim = gm->cfg.dim;
+    const int hidden = gm->cfg.hidden_dim;
+    const int kv_dim = gm->cfg.kv_dim;
+    const int vocab = gm->cfg.vocab_size;
+
+    size_t per_layer =
+        fp16_mat_bytes(dim, dim) +
+        fp16_mat_bytes(kv_dim, dim) +
+        fp16_mat_bytes(kv_dim, dim) +
+        fp16_mat_bytes(dim, dim) +
+        fp16_mat_bytes(hidden, dim) +
+        fp16_mat_bytes(hidden, dim) +
+        fp16_mat_bytes(dim, hidden);
+
+    size_t b = (size_t)L * per_layer;
+    if (gm->out.ptr && gm->out.ptr != gm->embd.ptr)
+        b += fp16_mat_bytes(vocab, dim);
+    return b;
+}
+
+void gpu_model_vram_profile(const GpuModel *gm, GpuVramProfile *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!gm) return;
+
+    const int L = gm->cfg.n_layers;
+    const int dim = gm->cfg.dim;
+    const int hidden = gm->cfg.hidden_dim;
+    const int kv_dim = gm->cfg.kv_dim;
+    const int vocab = gm->cfg.vocab_size;
+    const int max_seq = gm->cfg.max_seq;
+    const int qdim = gm->cfg.n_heads * gm->cfg.head_dim;
+
+    out->weights_embd_bytes = weights_embd_bytes(gm);
+    out->weights_f32_norm_bytes = weights_f32_norm_bytes(gm);
+#ifdef BONSAI_FP4
+    if (gm->use_fp4) {
+        out->weights_linear_bytes = weights_fp4_linear_bytes(gm);
+        out->fp4_gemm_scratch_bytes =
+            fp4_qwen3_vram_bytes() + fp4_gemm_vram_bytes();
+    } else
+#endif
+        out->weights_linear_bytes = weights_fp16_linear_bytes(gm);
+
+#ifdef BONSAI_POLARQUANT
+    if (gm->use_polarquant) {
+        int bpt = polarquant_bytes_per_token(gm->cfg.n_kv_heads);
+        out->kv_cache_bytes =
+            (size_t)L * (size_t)max_seq * (size_t)bpt * 2;
+    } else
+#endif
+    {
+        out->kv_cache_bytes =
+            (size_t)L * (size_t)max_seq * (size_t)kv_dim * sizeof(float) * 2;
+    }
+
+    out->decode_activations_bytes =
+        (size_t)dim * sizeof(float) * 3 +
+        (size_t)hidden * sizeof(float) * 2 +
+        (size_t)qdim * sizeof(float) +
+        (size_t)kv_dim * sizeof(float) * 2 +
+        (size_t)vocab * sizeof(float);
+
+    {
+        size_t bc = (size_t)max_seq;
+        out->prefill_batch_bytes =
+            bc * (size_t)dim * sizeof(float) * 3 +
+            bc * (size_t)qdim * sizeof(float) +
+            bc * (size_t)kv_dim * sizeof(float) * 2 +
+            bc * (size_t)hidden * sizeof(float) * 2 +
+            bc * sizeof(int);
+    }
+
+    out->total_bytes =
+        out->weights_embd_bytes +
+        out->weights_f32_norm_bytes +
+        out->weights_linear_bytes +
+        out->kv_cache_bytes +
+        out->decode_activations_bytes +
+        out->prefill_batch_bytes +
+        out->fp4_gemm_scratch_bytes;
+
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        out->device_total_bytes = total_bytes;
+        if (total_bytes >= free_bytes)
+            out->device_used_bytes = total_bytes - free_bytes;
+    }
+}
+
+void gpu_get_device_desc(char *buf, size_t cap)
+{
+    if (!buf || cap == 0) return;
+    buf[0] = '\0';
+    int dev = 0;
+    cudaDeviceProp prop;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        snprintf(buf, cap, "unknown");
+        return;
+    }
+    snprintf(buf, cap, "%s (compute %d.%d, %.1f GB)",
+             prop.name, prop.major, prop.minor,
+             (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+}
+
 void gpu_print_device_info(void)
 {
-    int dev = 0;
-    CUDA_CHECK(cudaGetDevice(&dev));
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
-    printf("GPU: %s (compute %d.%d, %.1f GB)\n",
-           prop.name, prop.major, prop.minor,
-           (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    char desc[256];
+    gpu_get_device_desc(desc, sizeof desc);
+    printf("GPU: %s\n", desc);
 }
