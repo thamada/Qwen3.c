@@ -49,6 +49,7 @@ void      gpu_model_vram_profile(const GpuModel *gm, GpuVramProfile *out);
 void      gpu_forward(GpuModel *gm, int token, int pos);
 void      gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens);
 void      gpu_copy_logits(GpuModel *gm, float *host_logits);
+void      gpu_set_prefill_len(GpuModel *gm, int n_tokens);
 void      gpu_print_device_info(void);
 void      gpu_get_device_desc(char *buf, size_t cap);
 

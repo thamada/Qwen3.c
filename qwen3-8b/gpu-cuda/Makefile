@@ -93,9 +93,10 @@ BUILD_CONFIG := $(CUDA_GENCODE)|fa=$(FA_BR_VAL)|pq=$(BONSAI_POLARQUANT)
 
 KERNELS_OBJ := kernels.fabr$(FA_BR_VAL).pq$(BONSAI_POLARQUANT).o
 MAIN_OBJ    := main.pq$(BONSAI_POLARQUANT).o
+FA_DEBUG_OBJ := fa_debug.o
 BIN         := qwen3-gpu-cuda
 
-.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache FORCE
+.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache fa-debug FORCE
 
 .DEFAULT_GOAL := run
 
@@ -105,14 +106,21 @@ $(BUILD_STAMP): FORCE
 
 FORCE:
 
-build: $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) fp16_cache_io.o
+build: $(MAIN_OBJ) $(KERNELS_OBJ) $(FA_DEBUG_OBJ) $(PQ_OBJS) fp16_cache_io.o
 	@echo "=== build: GPU_CCAP=$(GPU_CCAP_NUM) CUDA_GENCODE=$(CUDA_GENCODE) FA_BR=$(FA_BR_VAL) NVCC=$(NVCC) ==="
-	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) fp16_cache_io.o $(LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(FA_DEBUG_OBJ) $(PQ_OBJS) fp16_cache_io.o $(LDFLAGS)
+
+$(FA_DEBUG_OBJ): fa_debug.c fa_debug.h
+	$(CC) $(CFLAGS) $(FA_BR_FLAG) -c fa_debug.c -o $@
+
+fa-debug: build
+	@echo "=== FA debug FP16 ==="
+	./$(BIN) "$(MODEL)" -p "Hello" -n 12 -t 0 -s 42 --fa-debug 2>&1 | grep -E '^FA_DEBUG|^    ' || true
 
 build.polarquant:
 	$(MAKE) build BONSAI_POLARQUANT=1
 
-$(MAIN_OBJ): main.c gpu.h polarquant.h fp16_cache.h
+$(MAIN_OBJ): main.c gpu.h fa_debug.h polarquant.h fp16_cache.h
 	$(CC) $(CFLAGS) $(PQ_FLAG) -c main.c -o $@
 
 fp16_cache_io.o: fp16_cache_io.c fp16_cache.h

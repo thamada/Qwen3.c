@@ -4,6 +4,49 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 07:34:58
+
+**NVFP4 短 prefill 異常出力の切り分け・修正**（活性量子化クランプ、FA 診断、検証拡張、調査ログ）。
+
+**ベースライン**: `433319eb31c3c992536afb5c9a3717084ea5d137`（Merge PR #34）。詳細は **`qwen3-8b/gpu-cuda-nvfp4/DEBUG.md`**。
+
+#### 背景
+
+`"Hello"` 等の短 prefill（≈20 tok）で decode 累積後に **`?,` 連打** 等の異常出力。Flash Attention・SFA 索引・バッチ GEMM 行パリティは単体検証で正常。**真因**は L6 **`down`** への極大 **`hb[t=0]`**（max≈4857）→ 活性 FP4 量子化の UE4M3 スケールが危険域 → CUTLASS 出力 **NaN** → **`x_batch[t=0]`** 汚染 → 中間層 KV **`kc[t=0]=0`**。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_gemm.cu`
+
+- **`FP4_QUANT_MAX_ABS = 1024.0f`**: 活性量子化前に **`max_abs = fminf(max_abs, …)`**（デバイス・ホスト両方）。**`peak≥2048`** で NaN になる事象を **`fp4-test`** の **`down_extreme`** で再現・修正後 PASS。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_qwen3.cu`
+
+- GEMM 前に **`g_out_bf16`** を **`cudaMemset`** ゼロクリア。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_verify.cu` / `Makefile`
+
+- **`run_batch_row_parity`**（M_act=20, M_pad=128）、**`run_extreme_act`** を **`make fp4-test`** に追加。
+- **`make sfa-verify`**: **`sfa_index_verify.cpp`** で **`compute_sf_index`** と CUTLASS layout の一致確認。
+
+#### `qwen3-8b/gpu-cuda/fa_debug.c` / `fa_debug.h` / `kernels.cu` / `main.c`
+
+- **`--fa-debug`**: prefill/decode の KV・**`x_batch[t=0]`**・L6 **`hb`/`down-out`**・FA CPU replay（層0 head0）。**`make fa-debug`**（FP16 vs NVFP4 比較）。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md`
+
+- 上記調査・修正の詳細ログ（ベースコミット・コマンド・誤解点・ベンチ注意を含む）。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/Makefile`
+
+- **`log.push`**: **`-t $(BENCH_TEMP) -s $(BENCH_SEED)`** を実行行に反映（温度・シードがベンチに効く）。
+
+#### ドキュメント
+
+**`doc/design.md`**: NVFP4 実行経路（CUTLASS GEMM）、診断ターゲット、トラブルシュート、**`DEBUG.md`** 参照を同期。
+
+**`README.md`** / **`README.en.md`**: 付録 CUDA 節（GEMM 経路、**`fp4-test`** / **`sfa-verify`** / **`fa-debug`**、**`DEBUG.md`**、トラブルシュート、ベンチ **`BENCH_TEMP`**）を同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 04:06:32
 
 **NVFP4 推論を prefill / decode とも FP4 GEMV に統一**、**SFB LUT 格納**、**キャッシュ v2**、**VRAM 計測更新**。

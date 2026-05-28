@@ -78,6 +78,7 @@ FP4_FLAG  := -DBONSAI_FP4=1
 FP4_GEMM_OBJ  := fp4_gemm.sm120a.o
 FP4_QWEN3_OBJ := fp4_qwen3.sm120a.o
 FP4_OBJS      := $(FP4_GEMM_OBJ) $(FP4_QWEN3_OBJ) fp4_cache_io.o
+FA_DEBUG_OBJ  := ../gpu-cuda/fa_debug.o
 
 # PolarQuant KV cache: BONSAI_POLARQUANT=1（make build.polarquant）
 BONSAI_POLARQUANT ?= 0
@@ -107,17 +108,29 @@ PROMPT  ?= Hello, how are you?
 BENCH_PROMPT ?= Artificial intelligence has transformed many industries over the past decade. Machine learning models can now understand natural language, recognize images, and generate creative content with remarkable fluency. Large language models are trained on vast corpora of text and learn statistical patterns that enable them to predict the next token in a sequence. This capability powers applications ranging from virtual assistants and code completion tools to scientific research and education. However, deploying these models efficiently remains a challenge because they require substantial compute resources during both training and inference. Researchers explore quantization and specialized hardware to reduce latency while preserving quality.
 BENCH_N      ?= 128
 BENCH_SEED   ?= 42
+BENCH_TEMP   ?= 0 
 BENCH_LOG_FILE ?= /tmp/benchmark.log
 
 # GPU identifier for BENCH_LOG (Blackwell sm_120a target)
 GPU_SM ?= sm_120a
 
-.PHONY: build build.polarquant run run.polarquant clean blackwell cutlass fp4-test pq-test log log.push pack-cache
+.PHONY: build build.polarquant run run.polarquant clean blackwell cutlass fp4-test pq-test log log.push pack-cache fa-debug
 
 .DEFAULT_GOAL := run
 
-build: cutlass $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(PQ_OBJS) $(LDFLAGS)
+build: cutlass $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(FA_DEBUG_OBJ) $(PQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(FP4_OBJS) $(FA_DEBUG_OBJ) $(PQ_OBJS) $(LDFLAGS)
+
+$(FA_DEBUG_OBJ): ../gpu-cuda/fa_debug.c ../gpu-cuda/fa_debug.h
+	$(CC) $(CFLAGS) $(FA_BR_FLAG) -c ../gpu-cuda/fa_debug.c -o $@
+
+fa-debug: build
+	@echo "======== FA debug compare (Hello, gen=12) ========"
+	@echo "--- FP16 ---"
+	$(MAKE) -C ../gpu-cuda build CUDA_GENCODE=$(CUDA_GENCODE) FA_BR=$(BLACKWELL_FA_BR)
+	../gpu-cuda/qwen3-gpu-cuda "$(MODEL)" -p "Hello" -n 12 -t 0 -s 42 --fa-debug 2>&1 | grep -E '^FA_DEBUG|^    ' || true
+	@echo "--- NVFP4 ---"
+	./$(BIN) "$(MODEL)" -p "Hello" -n 12 -t 0 -s 42 --fa-debug 2>&1 | grep -E '^FA_DEBUG|^    ' || true
 
 fp4_cache_io.o: fp4_cache_io.c fp4_cache.h
 	$(CC) $(CFLAGS) -c fp4_cache_io.c -o $@
@@ -125,10 +138,10 @@ fp4_cache_io.o: fp4_cache_io.c fp4_cache.h
 build.polarquant:
 	$(MAKE) build BONSAI_POLARQUANT=1
 
-$(MAIN_OBJ): $(SRC_DIR)/main.c $(SRC_DIR)/gpu.h fp4_qwen3.h fp4_cache.h $(SRC_DIR)/polarquant.h
+$(MAIN_OBJ): $(SRC_DIR)/main.c $(SRC_DIR)/gpu.h $(SRC_DIR)/fa_debug.h fp4_qwen3.h fp4_cache.h $(SRC_DIR)/polarquant.h
 	$(CC) $(CFLAGS) $(FP4_FLAG) $(PQ_FLAG) -c $(SRC_DIR)/main.c -o $@
 
-$(KERNELS_OBJ): $(SRC_DIR)/kernels.cu $(SRC_DIR)/gpu.h fp4_qwen3.h $(SRC_DIR)/polarquant.h
+$(KERNELS_OBJ): $(SRC_DIR)/kernels.cu $(SRC_DIR)/gpu.h $(SRC_DIR)/fa_debug.h fp4_qwen3.h $(SRC_DIR)/polarquant.h
 	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(FP4_FLAG) $(PQ_FLAG) -c $(SRC_DIR)/kernels.cu -o $@
 
 $(FP4_GEMM_OBJ): fp4_gemm.cu fp4_gemm.h | cutlass
@@ -140,9 +153,14 @@ $(FP4_QWEN3_OBJ): fp4_qwen3.cu fp4_qwen3.h fp4_gemm.h | cutlass
 polarquant.o: $(SRC_DIR)/polarquant.cu $(SRC_DIR)/polarquant.h $(SRC_DIR)/polarquant_kernels.cuh
 	$(NVCC) $(NVCCFLAGS) -c $(SRC_DIR)/polarquant.cu -o polarquant.o
 
-fp4-test: cutlass $(FP4_GEMM_OBJ)
-	$(NVCC) $(BLACKWELL_NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu $(FP4_GEMM_OBJ) $(LDFLAGS)
+fp4-test: cutlass $(FP4_GEMM_OBJ) fp4_cache_io.o
+	$(NVCC) $(BLACKWELL_NVCCFLAGS) $(FP4_CXXFLAGS) -o fp4_verify fp4_verify.cu $(FP4_GEMM_OBJ) fp4_cache_io.o $(LDFLAGS)
 	./fp4_verify
+
+sfa-verify: cutlass
+	$(NVCC) $(BLACKWELL_NVCCFLAGS) $(FP4_CXXFLAGS) --expt-relaxed-constexpr \
+		-x cu -o sfa_index_verify sfa_index_verify.cpp
+	./sfa_index_verify
 
 pq-test: polarquant.o
 	$(NVCC) $(NVCCFLAGS) -DBONSAI_POLARQUANT=1 -o polarquant_verify $(SRC_DIR)/polarquant_verify.cu polarquant.o $(LDFLAGS)
@@ -184,14 +202,8 @@ clean:
 # BENCH_LOG_BEGIN — appended by make log.push
 BENCH_LOG :=
 BENCH_LOG += 2026-05-24T15:03:39|sm_120a|24365a8c2057|132|128|622.60|66.71|122.03
-BENCH_LOG += 2026-05-28T22:44:32|sm_120a|de9a61c86ea0|132|128|595.27|66.71|121.47
-BENCH_LOG += 2026-05-28T22:53:50|sm_120a|de9a61c86ea0|132|128|605.02|66.64|121.55
-BENCH_LOG += 2026-05-28T23:02:53|sm_120a|de9a61c86ea0|132|128|617.50|66.69|121.89
-BENCH_LOG += 2026-05-28T23:05:13|sm_120a|de9a61c86ea0|132|128|609.23|66.70|121.73
-BENCH_LOG += 2026-05-28T23:12:25|sm_120a|de9a61c86ea0|132|128|615.65|66.62|121.74
-BENCH_LOG += 2026-05-29T02:00:21|sm_120a|de9a61c86ea0|132|128|591.14|66.92|121.72
 BENCH_LOG += 2026-05-29T02:02:20|sm_120a|de9a61c86ea0|132|128|619.62|66.81|122.13
-BENCH_LOG += 2026-05-29T03:30:11|sm_120a|de9a61c86ea0|132|6|30.52|68.72|31.27
+BENCH_LOG += 2026-05-29T07:28:24|sm_120a|de9a61c86ea0|132|13|4623.10|66.64|648.35
 # BENCH_LOG_END
 
 log:
@@ -222,8 +234,8 @@ log.push: build
 		echo "  run: make -C .. model" >&2; \
 		exit 1; \
 	fi
-	@echo "Running benchmark (prompt=\"$(BENCH_PROMPT)\", -n $(BENCH_N), -t 0, -s $(BENCH_SEED)) ..."
-	@BENCH_LOG_FILE="$(BENCH_LOG_FILE)" ./$(BIN) "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED); \
+	@echo "Running benchmark (prompt=\"$(BENCH_PROMPT)\", -n $(BENCH_N), -t $(BENCH_TEMP), -s $(BENCH_SEED)) ..."
+	@BENCH_LOG_FILE="$(BENCH_LOG_FILE)" ./$(BIN) "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t $(BENCH_TEMP) -s $(BENCH_SEED); \
 	if [ ! -f "$(BENCH_LOG_FILE)" ]; then \
 		echo "error: benchmark log not found: $(BENCH_LOG_FILE)" >&2; \
 		exit 1; \

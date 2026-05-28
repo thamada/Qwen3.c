@@ -1,6 +1,6 @@
 /*
  * NVFP4 block-scaled GEMM for Blackwell SM120/SM121 (CUTLASS Example 79a ベース).
- * Bonsai gpu-cuda 内部用。Python/ctypes 向けではない。
+ * Inference linear layers use Tensor Core GEMM only (Bonsai gpu-cuda-nvfp4 同趣旨).
  */
 
 #include "fp4_gemm.h"
@@ -85,9 +85,11 @@ using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1x
 using ScaleFactorType = typename ElementA::ScaleFactorType;  // float_ue4m3_t
 
 static constexpr int SF_VEC_SIZE = Sm1xxBlkScaledConfig::SFVecSize;  // 16
-/* Cached B scales are packed with this M in tile_atom_to_shape_SFB; runtime GEMM
- * must use the same layout M even when the activation batch M_pad is larger. */
-static constexpr int FP4_WEIGHT_SFB_LAYOUT_M = 128;
+/* Weight pack / offline cache: SFB layout uses M=128 (Bonsai dummy_M). Runtime GEMM
+ * uses layout_SFB(M,N,K) with activation batch M_pad (see fp4_gemm_run_cached). */
+static constexpr int FP4_SFB_PACK_M = 128;
+/* Cap activation max_abs so scale=max_abs/6 stays in UE4M3 normal range (not exp=15). */
+static constexpr float FP4_QUANT_MAX_ABS = 1024.0f;
 
 // ============================================================================
 // GPU quantization kernels
@@ -293,6 +295,7 @@ __global__ void quantize_bf16_colmajor_to_fp4_kernel(
         float val = __bfloat162float(src[r + (size_t)k * N_stride]);
         max_abs = fmaxf(max_abs, fabsf(val));
     }
+    max_abs = fminf(max_abs, FP4_QUANT_MAX_ABS);
 
     float scale_val = max_abs / 6.0f;
     if (scale_val < 1.953125e-3f) scale_val = 1.953125e-3f;
@@ -320,7 +323,7 @@ __global__ void quantize_bf16_to_fp4_kernel(
     const __nv_bfloat16* __restrict__ src,  // [rows, K]
     uint8_t* __restrict__ dst_fp4,           // [rows, K/2]
     uint8_t* __restrict__ dst_sf,            // scales in CUTLASS layout
-    int rows, int K, int nsb, const int* sf_lut)
+    int rows, int K, int nsb)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_blocks = rows * nsb;
@@ -338,6 +341,7 @@ __global__ void quantize_bf16_to_fp4_kernel(
         float val = __bfloat162float(row[k_start + i]);
         max_abs = fmaxf(max_abs, fabsf(val));
     }
+    max_abs = fminf(max_abs, FP4_QUANT_MAX_ABS);
 
     float scale_val = max_abs / 6.0f;
     if (scale_val < 1.953125e-3f) scale_val = 1.953125e-3f;
@@ -345,7 +349,7 @@ __global__ void quantize_bf16_to_fp4_kernel(
     float actual_scale = d_ue4m3_to_float(scale_raw);
     float scale_inv = 1.0f / actual_scale;
 
-    int sf_idx = sf_lut ? sf_lut[r * nsb + sb] : compute_sf_index(r, sb, rows, nsb);
+    int sf_idx = compute_sf_index(r, sb, rows, nsb);
     dst_sf[sf_idx] = scale_raw;
 
     uint8_t* out_row = dst_fp4 + r * (K / 2);
@@ -395,13 +399,14 @@ static void quantize_matrix_colmajor_host(
                 float val = float(src[r + (size_t)k * N_stride]);
                 max_abs = fmaxf(max_abs, fabsf(val));
             }
+            max_abs = fminf(max_abs, FP4_QUANT_MAX_ABS);
             float scale_val = max_abs / 6.0f;
-            if (scale_val < 1e-10f) scale_val = 1e-10f;
-            ScaleFactorType scale_ue4m3 = ScaleFactorType(scale_val);
-            float actual_scale = float(scale_ue4m3);
+            if (scale_val < 1.953125e-3f) scale_val = 1.953125e-3f;
+            uint8_t scale_raw = host_float_to_ue4m3(scale_val);
+            float actual_scale = host_ue4m3_to_float(scale_raw);
             float scale_inv = 1.0f / actual_scale;
             int sf_idx = layout_sf(r, k_start, 0);
-            dst_sf[sf_idx] = scale_ue4m3;
+            reinterpret_cast<uint8_t *>(dst_sf)[sf_idx] = scale_raw;
             for (int i = 0; i < SF_VEC_SIZE; i += 2) {
                 int k0 = k_start + i;
                 float v0 = float(src[r + (size_t)k0 * N_stride]) * scale_inv;
@@ -426,8 +431,9 @@ static void quantize_row_host(
             float val = float(row_ptr[k_start + i]);
             max_abs = fmaxf(max_abs, fabsf(val));
         }
+        max_abs = fminf(max_abs, FP4_QUANT_MAX_ABS);
         float scale_val = max_abs / 6.0f;
-        if (scale_val < 1e-10f) scale_val = 1e-10f;
+        if (scale_val < 1.953125e-3f) scale_val = 1.953125e-3f;
         uint8_t scale_raw = host_float_to_ue4m3(scale_val);
         float actual_scale = host_ue4m3_to_float(scale_raw);
         float scale_inv = 1.0f / actual_scale;
@@ -458,13 +464,14 @@ static void quantize_matrix_host(
                 float val = float(row_ptr[k_start + i]);
                 max_abs = fmaxf(max_abs, fabsf(val));
             }
+            max_abs = fminf(max_abs, FP4_QUANT_MAX_ABS);
             float scale_val = max_abs / 6.0f;
-            if (scale_val < 1e-10f) scale_val = 1e-10f;
-            ScaleFactorType scale_ue4m3 = ScaleFactorType(scale_val);
-            float actual_scale = float(scale_ue4m3);
+            if (scale_val < 1.953125e-3f) scale_val = 1.953125e-3f;
+            uint8_t scale_raw = host_float_to_ue4m3(scale_val);
+            float actual_scale = host_ue4m3_to_float(scale_raw);
             float scale_inv = 1.0f / actual_scale;
             int sf_idx = layout_sf(r, k_start, 0);
-            dst_sf[sf_idx] = scale_ue4m3;
+            reinterpret_cast<uint8_t *>(dst_sf)[sf_idx] = scale_raw;
             for (int i = 0; i < SF_VEC_SIZE; i += 2) {
                 float v0 = float(row_ptr[k_start + i]) * scale_inv;
                 float v1 = float(row_ptr[k_start + i + 1]) * scale_inv;
@@ -508,16 +515,11 @@ struct FP4GemmState {
     ScaleFactorType* h_SFA;
     ScaleFactorType* h_SFB;
 
-    // CUTLASS workspace
+    // CUTLASS workspace + epilogue stub (get_workspace_size needs valid C/D ptrs)
     uint8_t* d_workspace;
     size_t workspace_size;
-
-    /* Scale-factor index LUTs (layout_SFA/SFB); compute_sf_index is wrong for K>256 */
-    int *d_SFA_lut;
-    int *d_SFB_lut;
-    int  lut_M;
-    int  lut_N;
-    int  lut_nsb;
+    __nv_bfloat16* d_epilogue;
+    size_t epilogue_cap;
 };
 
 static FP4GemmState g = {};
@@ -535,45 +537,50 @@ static void cleanup() {
     free(g.h_SFA);
     free(g.h_SFB);
     if (g.d_workspace) cudaFree(g.d_workspace);
-    if (g.d_SFA_lut) cudaFree(g.d_SFA_lut);
-    if (g.d_SFB_lut) cudaFree(g.d_SFB_lut);
+    if (g.d_epilogue) cudaFree(g.d_epilogue);
     memset(&g, 0, sizeof(g));
 }
 
-static void build_sf_luts(int M, int N, int K)
+static int ensure_epilogue_buffer(int M, int N)
 {
-    if (g.d_SFA_lut) cudaFree(g.d_SFA_lut);
-    if (g.d_SFB_lut) cudaFree(g.d_SFB_lut);
-    g.d_SFA_lut = NULL;
-    g.d_SFB_lut = NULL;
-    g.lut_M = M;
-    g.lut_N = N;
-    g.lut_nsb = K / SF_VEC_SIZE;
+    size_t need = (size_t)M * N;
+    if (need <= g.epilogue_cap) return 0;
+    if (g.d_epilogue) cudaFree(g.d_epilogue);
+    g.d_epilogue = nullptr;
+    g.epilogue_cap = 0;
+    cudaError_t err = cudaMalloc(&g.d_epilogue, need * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "fp4_gemm: epilogue alloc %zu: %s\n", need, cudaGetErrorString(err));
+        return -1;
+    }
+    g.epilogue_cap = need;
+    return 0;
+}
 
-    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
-        cute::make_shape(M, N, K, 1));
-    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(M, N, K, 1));
-
-    int n_a = M * g.lut_nsb;
-    int n_b = N * g.lut_nsb;
-    int *h_a = (int *)malloc((size_t)n_a * sizeof(int));
-    int *h_b = (int *)malloc((size_t)n_b * sizeof(int));
-    if (!h_a || !h_b) { free(h_a); free(h_b); return; }
-
-    for (int r = 0; r < M; r++)
-        for (int sb = 0; sb < g.lut_nsb; sb++)
-            h_a[r * g.lut_nsb + sb] = layout_SFA(r, sb * SF_VEC_SIZE, 0);
-    for (int r = 0; r < N; r++)
-        for (int sb = 0; sb < g.lut_nsb; sb++)
-            h_b[r * g.lut_nsb + sb] = layout_SFB(r, sb * SF_VEC_SIZE, 0);
-
-    cudaMalloc(&g.d_SFA_lut, (size_t)n_a * sizeof(int));
-    cudaMalloc(&g.d_SFB_lut, (size_t)n_b * sizeof(int));
-    cudaMemcpy(g.d_SFA_lut, h_a, (size_t)n_a * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(g.d_SFB_lut, h_b, (size_t)n_b * sizeof(int), cudaMemcpyHostToDevice);
-    free(h_a);
-    free(h_b);
+static size_t query_workspace_size(int M, int N, int K)
+{
+    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K, 1},
+        {
+            reinterpret_cast<const ElementA::DataType*>(g.d_A_fp4), stride_A,
+            reinterpret_cast<const ElementB::DataType*>(g.d_B_fp4), stride_B,
+            reinterpret_cast<const ScaleFactorType*>(g.d_SFA), layout_SFA,
+            reinterpret_cast<const ScaleFactorType*>(g.d_SFB), layout_SFB
+        },
+        {
+            {1.0f, 0.0f},
+            nullptr,
+            stride_C,
+            reinterpret_cast<ElementD*>(g.d_epilogue), stride_D
+        }
+    };
+    return Gemm::get_workspace_size(args);
 }
 
 // ============================================================================
@@ -605,7 +612,10 @@ static bool buffers_sufficient(int M, int N, int K) {
         {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
         {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
     };
-    size_t need_workspace = Gemm::get_workspace_size(args);
+    if ((size_t)M * N > g.epilogue_cap)
+        return false;
+
+    size_t need_workspace = query_workspace_size(M, N, K);
 
     return g.alloc_A_fp4 >= need_A_fp4 &&
            g.alloc_B_fp4 >= need_B_fp4 &&
@@ -624,7 +634,6 @@ int fp4_gemm_init(int M, int N, int K) {
         g.sfa_elems = cute::size(cute::filter_zeros(layout_SFA));
         g.sfb_elems = cute::size(cute::filter_zeros(layout_SFB));
         g.M = M; g.N = N; g.K = K;
-        build_sf_luts(M, N, K);
         return 0;
     }
 
@@ -666,20 +675,24 @@ int fp4_gemm_init(int M, int N, int K) {
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
 
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K, 1},
-        {nullptr, stride_A, nullptr, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
-        {{1.0f, 0.0f}, nullptr, stride_C, nullptr, stride_D}
-    };
+    if (ensure_epilogue_buffer(M, N) != 0)
+        return -1;
 
-    g.workspace_size = Gemm::get_workspace_size(args);
+    g.workspace_size = query_workspace_size(M, N, K);
     g.d_workspace = nullptr;
-    if (g.workspace_size > 0) cudaMalloc(&g.d_workspace, g.workspace_size);
+    if (g.workspace_size > 0) {
+        cudaError_t err = cudaMalloc(&g.d_workspace, g.workspace_size);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "fp4_gemm_init: workspace alloc %zu: %s\n",
+                    g.workspace_size, cudaGetErrorString(err));
+            cleanup();
+            return -1;
+        }
+    }
 
     g.M = M; g.N = N; g.K = K;
     g.max_M = M; g.max_N = N; g.max_K = K;
     g.initialized = true;
-    build_sf_luts(M, N, K);
     return 0;
 }
 
@@ -708,7 +721,7 @@ int fp4_gemm_run(
         int threads = 256;
         int blocks = (total_blocks + threads - 1) / threads;
         quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
-            (const __nv_bfloat16*)A_bf16, g.d_A_fp4, g.d_SFA, M, K, nsb, g.d_SFA_lut);
+            (const __nv_bfloat16*)A_bf16, g.d_A_fp4, g.d_SFA, M, K, nsb);
     }
 
     // Quantize B on GPU
@@ -717,7 +730,7 @@ int fp4_gemm_run(
         int threads = 256;
         int blocks = (total_blocks + threads - 1) / threads;
         quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
-            (const __nv_bfloat16*)B_bf16, g.d_B_fp4, g.d_SFB, N, K, nsb, g.d_SFB_lut);
+            (const __nv_bfloat16*)B_bf16, g.d_B_fp4, g.d_SFB, N, K, nsb);
     }
 
     // Run CUTLASS GEMM
@@ -851,49 +864,11 @@ void fp4_gemm_sync() { cudaDeviceSynchronize(); }
 // Cached weight handle - stores pre-quantized FP4 data + scales on device
 struct FP4WeightCache {
     uint8_t* d_fp4;    // [N, K/2] packed FP4 data on device
-    uint8_t* d_sf;     // Scale factors in CUTLASS interleaved layout
-    int *d_sf_lut;     // [N * (K/16)] row/sb -> scale index (matches GEMM layout_SFB)
+    uint8_t* d_sf;     // Scale factors in CUTLASS interleaved layout (pack M=128)
     int N;
     int K;
     int sf_elems;      // Number of scale factor elements
-    int lut_nsb;       // K / SF_VEC_SIZE
 };
-
-static int build_weight_sf_lut(FP4WeightCache *cache)
-{
-    if (!cache || cache->N <= 0 || cache->K <= 0) return -1;
-
-    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, cache->N, cache->K, 1));
-    int nsb = cache->K / SF_VEC_SIZE;
-    int n = cache->N * nsb;
-    int *h_lut = (int *)malloc((size_t)n * sizeof(int));
-    if (!h_lut) return -1;
-
-    for (int r = 0; r < cache->N; r++)
-        for (int sb = 0; sb < nsb; sb++)
-            h_lut[r * nsb + sb] = layout_SFB(r, sb * SF_VEC_SIZE, 0);
-
-    cudaError_t err = cudaMalloc(&cache->d_sf_lut, (size_t)n * sizeof(int));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "build_weight_sf_lut: cudaMalloc failed: %s\n",
-                cudaGetErrorString(err));
-        free(h_lut);
-        return -1;
-    }
-    cudaMemcpy(cache->d_sf_lut, h_lut, (size_t)n * sizeof(int), cudaMemcpyHostToDevice);
-    free(h_lut);
-    cache->lut_nsb = nsb;
-    return 0;
-}
-
-static void free_weight_sf_lut(FP4WeightCache *cache)
-{
-    if (!cache) return;
-    if (cache->d_sf_lut) cudaFree(cache->d_sf_lut);
-    cache->d_sf_lut = nullptr;
-    cache->lut_nsb = 0;
-}
 
 static int align128(int x) { return (x + 127) & ~127; }
 
@@ -925,7 +900,7 @@ static FP4HostWeight *build_host_weight_padded(
     fp4_dequant_row_fn get_row, void *ctx)
 {
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, N_pad, K_pad, 1));
+        cute::make_shape(FP4_SFB_PACK_M, N_pad, K_pad, 1));
     int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
 
     FP4HostWeight *w = (FP4HostWeight *)calloc(1, sizeof(FP4HostWeight));
@@ -997,8 +972,6 @@ static FP4WeightCache *upload_weight_cache_from_host(const FP4HostWeight *host)
     cache->N = host->N;
     cache->K = host->K;
     cache->sf_elems = host->sf_elems;
-    cache->d_sf_lut = nullptr;
-    cache->lut_nsb = 0;
 
     size_t fp4_bytes = (size_t)host->N * (size_t)host->K / 2;
     size_t sf_bytes = (size_t)host->sf_elems * sizeof(ScaleFactorType);
@@ -1022,12 +995,6 @@ static FP4WeightCache *upload_weight_cache_from_host(const FP4HostWeight *host)
 
     cudaMemcpy(cache->d_fp4, host->h_fp4, fp4_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(cache->d_sf, host->h_sf, sf_bytes, cudaMemcpyHostToDevice);
-    if (build_weight_sf_lut(cache) != 0) {
-        cudaFree(cache->d_fp4);
-        cudaFree(cache->d_sf);
-        delete cache;
-        return nullptr;
-    }
     return cache;
 }
 
@@ -1061,15 +1028,13 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     }
 
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, N, K, 1));
+        cute::make_shape(FP4_SFB_PACK_M, N, K, 1));
     int sf_elems = cute::size(cute::filter_zeros(layout_SFB));
 
     FP4WeightCache* cache = new FP4WeightCache();
     cache->N = N;
     cache->K = K;
     cache->sf_elems = sf_elems;
-    cache->d_sf_lut = nullptr;
-    cache->lut_nsb = 0;
 
     cudaError_t err;
     err = cudaMalloc(&cache->d_fp4, (size_t)N * K / 2);
@@ -1088,13 +1053,6 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
         return nullptr;
     }
 
-    if (build_weight_sf_lut(cache) != 0) {
-        cudaFree(cache->d_fp4);
-        cudaFree(cache->d_sf);
-        delete cache;
-        return nullptr;
-    }
-
     int nsb = K / SF_VEC_SIZE;
     int total_blocks = N * nsb;
     int threads = 256;
@@ -1102,7 +1060,7 @@ void* fp4_quantize_weights(const void* weight_bf16, int N, int K) {
     quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
         (const __nv_bfloat16*)weight_bf16,
         cache->d_fp4, cache->d_sf,
-        N, K, nsb, cache->d_sf_lut);
+        N, K, nsb);
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         fprintf(stderr, "fp4_quantize_weights: kernel: %s\n", cudaGetErrorString(err));
@@ -1163,24 +1121,16 @@ int fp4_weight_cache_K(const void* cache_handle) {
 size_t fp4_weight_cache_device_bytes(const void *cache_handle) {
     if (!cache_handle) return 0;
     const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
-    size_t lut_bytes = cache->d_sf_lut
-        ? (size_t)cache->N * (size_t)cache->lut_nsb * sizeof(int)
-        : 0;
     return (size_t)cache->N * (size_t)cache->K / 2
-         + (size_t)cache->sf_elems * sizeof(ScaleFactorType)
-         + lut_bytes;
+         + (size_t)cache->sf_elems * sizeof(ScaleFactorType);
 }
 
 size_t fp4_gemm_vram_bytes(void)
 {
     if (!g.initialized) return 0;
-    size_t lut_bytes = 0;
-    if (g.d_SFA_lut && g.lut_M > 0 && g.lut_N > 0 && g.lut_nsb > 0) {
-        lut_bytes = (size_t)g.lut_M * (size_t)g.lut_nsb * sizeof(int)
-                  + (size_t)g.lut_N * (size_t)g.lut_nsb * sizeof(int);
-    }
+    size_t epilogue_bytes = g.epilogue_cap * sizeof(__nv_bfloat16);
     return g.alloc_A_fp4 + g.alloc_B_fp4 + g.alloc_SFA + g.alloc_SFB
-         + g.workspace_size + lut_bytes;
+         + g.workspace_size + epilogue_bytes;
 }
 
 FP4HostWeight *fp4_host_weight_build(int N_act, int K_act,
@@ -1202,7 +1152,6 @@ void fp4_weight_cache_free(void* cache_handle) {
     FP4WeightCache* cache = (FP4WeightCache*)cache_handle;
     cudaFree(cache->d_fp4);
     cudaFree(cache->d_sf);
-    free_weight_sf_lut(cache);
     delete cache;
 }
 
@@ -1230,35 +1179,36 @@ int fp4_gemm_run_cached(
         return -1;
     }
 
-    // Initialize state (allocates A-side buffers + workspace)
-    if (!g.initialized || g.M != M || g.N != N || g.K != K) {
-        int rc = fp4_gemm_init(M, N, K);
-        if (rc != 0) return rc;
+    if (!g.initialized) {
+        fprintf(stderr, "fp4_gemm_run_cached: not initialized (call fp4_gemm_prealloc first)\n");
+        return -1;
+    }
+    if (fp4_gemm_init(M, N, K) != 0) {
+        fprintf(stderr, "fp4_gemm_run_cached: fp4_gemm_init failed M=%d N=%d K=%d\n", M, N, K);
+        return -1;
+    }
+    if (M > g.max_M || N > g.max_N || K > g.max_K) {
+        fprintf(stderr, "fp4_gemm_run_cached: M=%d N=%d K=%d exceeds prealloc max_M=%d max_N=%d max_K=%d\n",
+                M, N, K, g.max_M, g.max_N, g.max_K);
+        return -1;
+    }
+    if (!buffers_sufficient(M, N, K)) {
+        fprintf(stderr, "fp4_gemm_run_cached: buffers too small for M=%d N=%d K=%d\n", M, N, K);
+        return -1;
     }
 
     int nsb = K / SF_VEC_SIZE;
 
-    // Only quantize A on GPU (B is pre-quantized)
     {
         int total_blocks = M * nsb;
         int threads = 256;
         int blocks = (total_blocks + threads - 1) / threads;
         quantize_bf16_to_fp4_kernel<<<blocks, threads>>>(
-            (const __nv_bfloat16*)A_bf16, g.d_A_fp4, g.d_SFA, M, K, nsb, g.d_SFA_lut);
+            (const __nv_bfloat16*)A_bf16, g.d_A_fp4, g.d_SFA, M, K, nsb);
     }
-    cudaError_t qerr = cudaGetLastError();
-    if (qerr != cudaSuccess) {
-        fprintf(stderr, "fp4_gemm_run_cached: quantize kernel: %s\n",
-                cudaGetErrorString(qerr));
-        return -1;
-    }
-    cudaDeviceSynchronize();
 
-    // Run CUTLASS GEMM with quantized A + cached B
     auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
-    /* B scales were stored with FP4_WEIGHT_SFB_LAYOUT_M at upload — not activation M_pad */
-    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
-        cute::make_shape(FP4_WEIGHT_SFB_LAYOUT_M, N, K, 1));
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
@@ -1285,11 +1235,38 @@ int fp4_gemm_run_cached(
 
     Gemm gemm;
 
+    if (ensure_epilogue_buffer(M, N) != 0)
+        return -1;
+
+    size_t need_ws = Gemm::get_workspace_size(arguments);
+
     auto status = gemm.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "fp4_gemm_run_cached: can_implement: %s\n", cutlassGetStatusString(status));
+        fprintf(stderr, "fp4_gemm_run_cached: can_implement(%d,%d,%d): %s\n",
+                M, N, K, cutlassGetStatusString(status));
         return -2;
     }
+    if (need_ws > g.workspace_size) {
+        if (g.d_workspace) cudaFree(g.d_workspace);
+        g.d_workspace = nullptr;
+        g.workspace_size = 0;
+        if (need_ws > 0) {
+            cudaError_t err = cudaMalloc(&g.d_workspace, need_ws);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "fp4_gemm_run_cached: workspace alloc %zu: %s\n",
+                        need_ws, cudaGetErrorString(err));
+                return -1;
+            }
+            g.workspace_size = need_ws;
+        }
+    }
+
+    cudaError_t qerr = cudaGetLastError();
+    if (qerr != cudaSuccess) {
+        fprintf(stderr, "fp4_gemm_run_cached: quantize kernel: %s\n", cudaGetErrorString(qerr));
+        return -1;
+    }
+    cudaDeviceSynchronize();
 
     status = gemm.initialize(arguments, g.d_workspace);
     if (status != cutlass::Status::kSuccess) {
@@ -1303,127 +1280,7 @@ int fp4_gemm_run_cached(
         return -4;
     }
 
-    // No sync here — caller should call fp4_gemm_sync() when needed
-    // This allows pipelining multiple GEMMs without roundtrips
     return 0;
-}
-
-#define FP4_GEMV_WARP 32
-#define FP4_GEMV_ROWS 8
-#define FP4_GEMV_THREADS (FP4_GEMV_WARP * FP4_GEMV_ROWS)
-
-__device__ __forceinline__ float d_fp4_nibble_to_float(uint8_t nibble)
-{
-    int sign = (nibble & 0x8) ? -1 : 1;
-    return sign * c_fp4_values[nibble & 0x7];
-}
-
-__device__ __forceinline__ float fp4_dot_row(
-    const float *x, const uint8_t *row_fp4, const uint8_t *w_sf,
-    int row, int n, int nsb, const int *sf_lut)
-{
-    float val = 0.f;
-    for (int sb = 0; sb < nsb; sb++) {
-        int k0 = sb * SF_VEC_SIZE;
-        if (k0 >= n) break;
-        int sf_idx = sf_lut[(size_t)row * nsb + sb];
-        float scale = d_ue4m3_to_float(w_sf[sf_idx]);
-        #pragma unroll
-        for (int i = 0; i < SF_VEC_SIZE; i += 2) {
-            int k = k0 + i;
-            if (k >= n) break;
-            uint8_t pk = row_fp4[(k0 + i) >> 1];
-            val += x[k] * d_fp4_nibble_to_float(pk & 0xF) * scale;
-            if (k + 1 < n)
-                val += x[k + 1] * d_fp4_nibble_to_float(pk >> 4) * scale;
-        }
-    }
-    return val;
-}
-
-__launch_bounds__(FP4_GEMV_THREADS)
-__global__ void fp4_gemv_kernel(float *__restrict__ o,
-    const float *__restrict__ x,
-    const uint8_t *__restrict__ w_fp4,
-    const uint8_t *__restrict__ w_sf,
-    int n, int d, int K, int nsb, const int *__restrict__ sf_lut)
-{
-    int local_row = threadIdx.x / FP4_GEMV_WARP;
-    int lane      = threadIdx.x % FP4_GEMV_WARP;
-    int row       = blockIdx.x * FP4_GEMV_ROWS + local_row;
-    if (row >= d) return;
-
-    const uint8_t *row_fp4 = w_fp4 + (size_t)row * (K / 2);
-    float val = 0.f;
-
-    for (int sb = lane; sb < nsb; sb += FP4_GEMV_WARP) {
-        int k0 = sb * SF_VEC_SIZE;
-        if (k0 >= n) continue;
-        int sf_idx = sf_lut[(size_t)row * nsb + sb];
-        float scale = d_ue4m3_to_float(w_sf[sf_idx]);
-        #pragma unroll
-        for (int i = 0; i < SF_VEC_SIZE; i += 2) {
-            int k = k0 + i;
-            if (k >= n) break;
-            uint8_t pk = row_fp4[(k0 + i) >> 1];
-            val += x[k] * d_fp4_nibble_to_float(pk & 0xF) * scale;
-            if (k + 1 < n)
-                val += x[k + 1] * d_fp4_nibble_to_float(pk >> 4) * scale;
-        }
-    }
-    for (int off = FP4_GEMV_WARP / 2; off > 0; off >>= 1)
-        val += __shfl_down_sync(0xffffffffu, val, off, FP4_GEMV_WARP);
-    if (lane == 0)
-        o[row] = val;
-}
-
-__global__ void fp4_gemv_batch_kernel(float *__restrict__ o,
-    const float *__restrict__ x,
-    const uint8_t *__restrict__ w_fp4,
-    const uint8_t *__restrict__ w_sf,
-    int n, int d, int K, int nsb, int M, const int *__restrict__ sf_lut)
-{
-    int flat = blockIdx.x * blockDim.x + threadIdx.x;
-    int t = flat / d;
-    int row = flat % d;
-    if (t >= M || row >= d) return;
-
-    const float *xt = x + (size_t)t * n;
-    float *ot = o + (size_t)t * d;
-    const uint8_t *row_fp4 = w_fp4 + (size_t)row * (K / 2);
-    ot[row] = fp4_dot_row(xt, row_fp4, w_sf, row, n, nsb, sf_lut);
-}
-
-void fp4_gemv_cached(const void *cache_handle, const float *x, float *y,
-                     int n, int d)
-{
-    if (!cache_handle) return;
-    const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
-    if (!cache->d_sf_lut) {
-        fprintf(stderr, "fp4_gemv_cached: missing scale LUT\n");
-        return;
-    }
-    int K = cache->K;
-    int nsb = K / SF_VEC_SIZE;
-    int blocks = (d + FP4_GEMV_ROWS - 1) / FP4_GEMV_ROWS;
-    fp4_gemv_kernel<<<blocks, FP4_GEMV_THREADS>>>(
-        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb, cache->d_sf_lut);
-}
-
-void fp4_gemv_batch_cached(const void *cache_handle, const float *x, float *y,
-                           int M, int n, int d)
-{
-    if (!cache_handle || M <= 0) return;
-    const FP4WeightCache *cache = (const FP4WeightCache *)cache_handle;
-    if (!cache->d_sf_lut) {
-        fprintf(stderr, "fp4_gemv_batch_cached: missing scale LUT\n");
-        return;
-    }
-    int K = cache->K;
-    int nsb = K / SF_VEC_SIZE;
-    int total = M * d;
-    fp4_gemv_batch_kernel<<<(total + 255) / 256, 256>>>(
-        y, x, cache->d_fp4, cache->d_sf, n, d, K, nsb, M, cache->d_sf_lut);
 }
 
 }  // extern "C"

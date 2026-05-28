@@ -756,11 +756,13 @@ Put CUDA **`bin`** on **`PATH`** (`/usr/local/bin/nvcc` alone may fail at link t
 | CUDA 13 + NVFP4 full setup | `cd qwen3-8b/gpu-cuda-nvfp4` → `make blackwell` |
 | PolarQuant round-trip test | `make pq-test` in each directory |
 | CUTLASS NVFP4 GEMM unit test | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fp4-test` (**Blackwell / sm_120a required**) |
+| SFA/SFB index verification | `cd qwen3-8b/gpu-cuda-nvfp4` → `make sfa-verify` |
+| Flash Attention debug (Hello) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fa-debug` (FP16 vs NVFP4) |
 | Benchmark history (ROCm) | `cd qwen3-8b/gpu-rocm` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
 | Benchmark history (CUDA FP16) | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log` (parses stdout **`prefill_tps:`**) |
 | Benchmark history (CUDA NVFP4) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log` (same) |
 
-Default FP16 build (`gpu-cuda`) uses PTX (`compute_86`). For a native GPU, set `CUDA_GENCODE=arch=compute_XX,code=sm_XX`. NVFP4 build defaults to **`sm_120a`**. **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** use **`BLACKWELL_NVCCFLAGS`** (**`-std=c++17`** + fixed **`sm_120a`**). CUTLASS **`v4.5.0`** is fetched via **`make cutlass`**.
+Default FP16 build (`gpu-cuda`) uses **`nvidia-smi` auto-detection** (Blackwell **12.x** → **`sm_120`** + **`FA_BR=32`**). **PTX `compute_86` JIT** can corrupt output on RTX 5090; avoid it. NVFP4 build defaults to **`sm_120a`**. **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** use **`BLACKWELL_NVCCFLAGS`** (**`-std=c++17`** + fixed **`sm_120a`**). CUTLASS **`v4.5.0`** is fetched via **`make cutlass`**.
 
 
 | Directory | Weights at load | Linear / KV at runtime |
@@ -768,8 +770,8 @@ Default FP16 build (`gpu-cuda`) uses PTX (`compute_86`). For a native GPU, set `
 | **`gpu-rocm`** | If offline cache (**`<model>.gguf.fp16`**) exists, H2D from **`.fp16bin`**; otherwise **fused row-wise GGUF dequant** → FP16 | hipBLAS GemmEx (Prefill) + custom GEMV (Decode); KV in **F32** |
 | **`gpu-cuda`** | If offline cache (**`<model>.gguf.fp16`**) exists, H2D from **`.fp16bin`**; otherwise **fused row-wise GGUF dequant** → FP16 | FP16 GEMV kernels; KV in **F32** (default) |
 | **`gpu-cuda`** + **`build.polarquant`** | Linear weights stay FP16 (same as above) | KV in **PolarQuant-R** (64 B/head); tile-wise F32 decode during attention |
-| **`gpu-cuda-nvfp4`** | If offline cache (**`<model>.gguf.nvfp4`**) exists, H2D from **`.fp4bin`**; otherwise **fused row-wise GGUF dequant** → NVFP4. **`token_embd`** via row-wise FP16 H2D | **`fp4_qwen3_mm`** — decode / short prefill via **FP4 GEMV**; long prefill via CUTLASS GEMM |
-| **`gpu-cuda-nvfp4`** + **`build.polarquant`** | Same as above (NVFP4 only) | FP4 GEMV/GEMM for linear; PolarQuant-R KV |
+| **`gpu-cuda-nvfp4`** | If offline cache (**`<model>.gguf.nvfp4`**, **`FP4_CACHE_VERSION=2`**) exists, H2D from **`.fp4bin`**; otherwise **fused row-wise GGUF dequant** → NVFP4. **`token_embd`** via row-wise FP16 H2D | **`fp4_qwen3_mm`** — prefill / decode both use **CUTLASS NVFP4 GEMM** (**`fp4_gemm_run_cached`**, **`M` padded to 128**). Activations clamped with **`FP4_QUANT_MAX_ABS=1024`** |
+| **`gpu-cuda-nvfp4`** + **`build.polarquant`** | Same as above (NVFP4 only) | Same GEMM linear path; PolarQuant-R KV |
 
 **`gpu-rocm`** / **`gpu-cuda`** (FP16) also spend time on first-run GGUF row dequant. Pre-generate **`<model>.gguf.fp16`** with **`make pack-cache`** (or **`--pack-fp16-cache`**) so later runs show **`Loading FP16 cache from …`**. Use **`--no-fp16-cache`** to force re-dequantization from GGUF every time. On **`gpu-rocm`**, **`make build`** (when **`MODEL`** exists) auto-packs as well.
 
@@ -838,7 +840,9 @@ make build            # sm_120a + BONSAI_FP4=1 + FA_BR=32
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-Produces **`qwen3-gpu-cuda-nvfp4`**. At startup you should see **`Loading NVFP4 cache from …`** or **`Uploading weights (fused dequant -> NVFP4 linear layers)...`** and **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`** when the FP4 path is active.
+Produces **`qwen3-gpu-cuda-nvfp4`**. At startup you should see **`Loading NVFP4 cache from …`** or **`Uploading weights (fused dequant -> NVFP4 linear layers)...`** and **`GPU: FP4 Tensor Core GEMM path enabled (prefill + decode)`** when the FP4 path is active.
+
+If a short prompt produces **`?,` repetition** or garbage tokens, confirm a recent build where **`make fp4-test`** passes (investigation log: **`qwen3-8b/gpu-cuda-nvfp4/DEBUG.md`**, baseline commit **`433319eb`**).
 
 ### Offline NVFP4 cache (`make pack-cache`)
 
@@ -888,7 +892,7 @@ make run.polarquant MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 At startup you should see **all** of the following:
 
 - **`Loading NVFP4 cache from …`** or **`Uploading weights (fused dequant -> NVFP4 linear layers)...`**
-- **`GPU: FP4 Tensor Core path enabled (GEMM M>=128, GEMV decode)`**
+- **`GPU: FP4 Tensor Core GEMM path enabled (prefill + decode)`**
 - **`PolarQuant-R: KV cache enabled (head_dim=128, 64 bytes/head, ~8.00x vs F32)`**
 
 ### Run (binary directly)
@@ -911,19 +915,35 @@ NVFP4 build:
   -n 64
 ```
 
-Optional CUTLASS NVFP4 GEMM smoke test: `cd qwen3-8b/gpu-cuda-nvfp4 && make fp4-test` (builds and runs **`fp4_verify.cu`**, **Blackwell / sm_120a**, e.g. RTX 50. **`fp4_gemm.sm120a.o`** uses **C++17 + fixed `sm_120a`**). See `doc/design.md` (CUDA section).
+Optional verification and debug (**Blackwell / sm_120a** required):
+
+```bash
+cd qwen3-8b/gpu-cuda-nvfp4
+make fp4-test      # CUTLASS path parity, batch rows, extreme activation (down_extreme)
+make sfa-verify    # compute_sf_index vs CUTLASS layout
+make fa-debug      # FP16 vs NVFP4, Hello + --fa-debug
+./qwen3-gpu-cuda-nvfp4 ../model.gguf -p "Hello" -n 12 --fa-debug 2>&1 | grep FA_DEBUG
+```
+
+See **`doc/design.md`** (CUDA section) and **`qwen3-8b/gpu-cuda-nvfp4/DEBUG.md`** for details.
 
 ### Benchmark history (`gpu-cuda/Makefile` / `gpu-cuda-nvfp4/Makefile`)
 
-The **`BENCH_LOG`** append format matches the ROCm Makefile, but metrics are collected differently. **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** print **`--- benchmark ---`** and **`prefill_tps:` / `decode_tps:` / `total_tps:`** on stdout at the end of inference; **`make log.push`** parses those lines (ROCm uses **`BENCH_LOG_FILE`** instead).
+Same idea as **`gpu-rocm`**: **`make log.push`** runs inference, then reads **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) and appends one line to **`BENCH_LOG`** in that directory's Makefile. **`make log`** prints the table.
 
-From **`gpu-cuda/`** or **`gpu-cuda-nvfp4/`**, **`make log.push`** runs a benchmark with the default long prompt (~128 tokens), **`-n 128`**, and **`-t 0`**, then appends the result to **`BENCH_LOG`** in that directory's Makefile. **`make log`** prints the history as a table.
+| Variable | Default | Meaning |
+|---|---|---|
+| `BENCH_PROMPT` | long English prompt (in Makefile) | benchmark prompt |
+| `BENCH_N` | `128` | max generated tokens (`-n`) |
+| `BENCH_SEED` | `42` | RNG seed (`-s`); **ignored when `-t 0`** |
+| `BENCH_TEMP` | `0` | temperature (`-t`); **passed on the `log.push` command line** |
+| `BENCH_LOG_FILE` | `/tmp/benchmark.log` | key=value metrics file |
 
 ```bash
 cd qwen3-8b/gpu-cuda
-make log.push                    # default BENCH_N=128, BENCH_SEED=42
-make log                         # show history
-make log.push BENCH_N=64         # override generation length, etc.
+make log.push
+make log
+make log.push BENCH_N=64 BENCH_TEMP=0.8 BENCH_SEED=77
 
 cd qwen3-8b/gpu-cuda-nvfp4
 make log.push
@@ -932,15 +952,16 @@ make log
 
 One line per entry (pipe-separated): **`timestamp|GPU_SM|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
 
-- **`gpu-cuda`**: column 2 **`GPU_SM`** is taken from **`CUDA_GENCODE`** **`code=`** (default **`compute_86`**). Override example: **`make log.push CUDA_GENCODE=arch=compute_90,code=sm_90`**
+- **`gpu-cuda`**: column 2 from **`nvidia-smi`** (e.g. **`sm_120`**)
 - **`gpu-cuda-nvfp4`**: column 2 defaults to **`sm_120a`**
 
-Example **`BENCH_LOG`** entry (NVFP4, 132 prompt tokens, RTX 5090 / Blackwell): prefill **622.60** / decode **66.71** / total **122.03** tok/s (**`2026-05-24T15:03:39|sm_120a|…`**).
+Example NVFP4 entries (132 prompt tokens, RTX 5090): **622.60** / **66.71** / **122.03** tok/s (**`2026-05-24`**, **`gen=128`**); **4623.10** / **66.64** / **648.35** (**`2026-05-29`**, **`gen=13`** early EOS). VRAM breakdown is in **`BENCH_LOG_FILE`** (`[vram_breakdown]`), not in **`BENCH_LOG`**.
 
 ### Source reading
 
-7. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu` — CUDA FP16.  
-8. `qwen3-8b/gpu-cuda-nvfp4/fp4_cache_io.c` / `fp4_qwen3.cu` / `fp4_gemm.cu` — Blackwell NVFP4.
+7. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu` / `fa_debug.c` — CUDA FP16 (**`--fa-debug`**, VRAM bench log).  
+8. `qwen3-8b/gpu-cuda-nvfp4/fp4_cache_io.c` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `fp4_verify.cu` — Blackwell NVFP4 (**`FP4_QUANT_MAX_ABS`**, shared **`kernels.cu`**).  
+9. `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md` — NVFP4 anomaly investigation log (baseline **`433319eb31c3c992536afb5c9a3717084ea5d137`**).
 
 
 ### Troubleshooting (GPU / XDNA appendix)
@@ -972,9 +993,17 @@ In **`gpu-cuda-nvfp4`**, confirm **`sm_120a`** build, CUDA 13, and **`make cutla
 
 You may be using a stale **`fp4_gemm.o`** built for **`compute_86` PTX** only. In **`gpu-cuda-nvfp4`**, run **`make clean`** → **`make fp4-test`** again (**`fp4_gemm.sm120a.o`** is fixed to **`sm_120a` + C++17**). Requires a **Blackwell GPU**.
 
-### NVFP4 decode is extremely slow
+### NVFP4 garbage output after short prefill (`?,` repetition)
 
-An older binary may route M=1 through CUTLASS with M=128 padding. Confirm a recent **`gpu-cuda-nvfp4`** build with **`fp4_gemv_cached`** and check startup logs for **`GEMM M>=128, GEMV decode`**.
+Extreme activations at layer 6 **`down`** can saturate NVFP4 activation scales → GEMM **NaN** → corrupted KV (Flash Attention itself is fine). Use a build with **`FP4_QUANT_MAX_ABS=1024`** where **`make fp4-test`** passes (**`down_extreme`** included). See **`qwen3-8b/gpu-cuda-nvfp4/DEBUG.md`**.
+
+### NVFP4 repetition / “LLM” spam
+
+May be an old **GEMM prefill vs GEMV decode** mismatch or the NaN path above. Re-run **`make pack-cache`** with **`FP4_CACHE_VERSION=2`** and confirm **`GPU: FP4 Tensor Core GEMM path enabled (prefill + decode)`** at startup.
+
+### NVFP4 `make log.push` stops early or repeats every run
+
+Long bench prompts often hit **EOS early** (e.g. **`gen_tokens=13`**). **`-t 0`** ignores seed. Try **`make log.push BENCH_TEMP=0.8 BENCH_SEED=77`**. Ensure **`BENCH_TEMP`** is on the **`log.push`** recipe in **`Makefile`**.
 
 ### `gpu-cuda-nvfp4` PolarQuant build is slow / `Killed` (OOM)
 

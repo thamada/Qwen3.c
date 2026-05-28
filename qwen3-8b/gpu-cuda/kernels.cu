@@ -5,6 +5,7 @@
  */
 
 #include "gpu.h"
+#include "fa_debug.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -16,7 +17,7 @@
 #ifdef BONSAI_FP4
 #include "fp4_qwen3.h"
 #include "fp4_gemm.h"
-/* CUTLASS NVFP4 GEMM requires M>=128 for prefill; M<128 uses FP4 GEMV (decode). */
+/* NVFP4 linear layers: CUTLASS Tensor Core GEMM via fp4_qwen3_mm (M padded to 128). */
 #endif
 
 #ifdef BONSAI_POLARQUANT
@@ -752,6 +753,7 @@ struct GpuModel {
     float *hb_batch, *hb2_batch;
     int *tokens_dev;
     int batch_cap;
+    int prefill_len;
 #ifdef BONSAI_FP4
     int use_fp4;
 #endif
@@ -908,7 +910,7 @@ GpuModel *gpu_model_create(const GpuConfig *cfg, const GpuWeightsHost *host)
         if (!gm->out.ptr) exit(1);
         gm->out_t = host->out_t;
         gm->use_fp4 = 1;
-        printf("GPU: FP4 GEMV path enabled (prefill + decode)\n");
+        printf("GPU: FP4 Tensor Core GEMM path enabled (prefill + decode)\n");
     }
 #else
     gm->wq       = dev_adopt_layers(L, host->wq);
@@ -1110,6 +1112,12 @@ void gpu_forward(GpuModel *gm, int token, int pos)
             npos, n_heads, hd, kv_dim, kv_mul, scale);
 #endif
 
+        if (fa_debug_enabled()) {
+            fa_debug_decode_hook(gm->prefill_len, pos, l, c->n_layers,
+                npos, kv_dim, hd, n_heads, n_kv, kv_mul, scale,
+                gm->q, gm->k, gm->v, gm->xb, gm->kc + loff, gm->vc + loff);
+        }
+
         gpu_mm(gm->xb2, gm->xb, &gm->wo, l, dim, dim, wt, 1);
         add_kernel<<<(dim + 255) / 256, 256>>>(gm->x, gm->xb2, dim);
 
@@ -1159,9 +1167,15 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
         rmsnorm_batch_kernel<<<n_tokens, 256>>>(
             gm->xb_batch, gm->x_batch, (float *)gm->norm_att.layer[l], dim, n_tokens, c->norm_eps);
 
+        if (fa_debug_enabled() && (l == 0 || l == 17))
+            fa_debug_prefill_layer_hook(l, "pre-wk", n_tokens, dim, kv_dim, gm->xb_batch, NULL);
+
         gpu_mm_batch(gm->q_batch, gm->xb_batch, &gm->wq, l, dim, dim, wt, n_tokens);
         gpu_mm_batch(gm->k_batch, gm->xb_batch, &gm->wk, l, dim, kv_dim, wt, n_tokens);
         gpu_mm_batch(gm->v_batch, gm->xb_batch, &gm->wv, l, dim, kv_dim, wt, n_tokens);
+
+        if (fa_debug_enabled() && (l == 0 || l == 17))
+            fa_debug_prefill_layer_hook(l, "post-wk", n_tokens, dim, kv_dim, NULL, gm->k_batch);
 
         rmsnorm_head_batch_kernel<<<n_tokens * n_heads, 256>>>(
             gm->q_batch, (float *)gm->q_norm.layer[l], n_heads, hd, n_tokens, c->norm_eps);
@@ -1195,6 +1209,10 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
         kv_write_batch_kernel<<<n_tokens, 256>>>(
             gm->vc + loff, gm->v_batch, kv_dim, n_tokens);
 
+        if (fa_debug_enabled() && l == 0)
+            fa_debug_prefill_kv_layer0_hook(n_tokens, kv_dim, hd,
+                gm->kc + loff, gm->vc + loff);
+
         flash_attn_prefill_gqa_kernel<<<n_tokens * n_heads, FA_HD>>>(
             gm->xb_batch, gm->q_batch, gm->kc + loff, gm->vc + loff,
             n_tokens, n_heads, hd, kv_dim, kv_mul, scale);
@@ -1203,6 +1221,9 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
         gpu_mm_batch(gm->xb2_batch, gm->xb_batch, &gm->wo, l, dim, dim, wt, n_tokens);
         add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
             gm->x_batch, gm->xb2_batch, dim, n_tokens);
+
+        if (fa_debug_enabled() && l == 6)
+            fa_debug_prefill_x_row0_tag(l, "post-attn", dim, gm->x_batch);
 
         rmsnorm_batch_kernel<<<n_tokens, 256>>>(
             gm->xb_batch, gm->x_batch, (float *)gm->norm_ffn.layer[l], dim, n_tokens, c->norm_eps);
@@ -1213,10 +1234,26 @@ void gpu_forward_prefill(GpuModel *gm, const int *tokens, int n_tokens)
         swiglu_batch_kernel<<<(n_tokens * hidden + 255) / 256, 256>>>(
             gm->hb_batch, gm->hb2_batch, hidden, n_tokens);
 
+        if (fa_debug_enabled() && l == 6) {
+            fa_debug_prefill_hb_row0_tag(l, "pre-down", hidden, gm->hb_batch);
+        }
+
         gpu_mm_batch(gm->xb_batch, gm->hb_batch, &gm->down, l, hidden, dim, wt, n_tokens);
+
+        if (fa_debug_enabled() && l == 6)
+            fa_debug_prefill_x_row0_tag(l, "down-out", dim, gm->xb_batch);
+
         add_batch_kernel<<<(n_tokens * dim + 255) / 256, 256>>>(
             gm->x_batch, gm->xb_batch, dim, n_tokens);
+
+        if (fa_debug_enabled() && (l <= 7 || l == 16 || l == 17))
+            fa_debug_prefill_x_row0(l, dim, gm->x_batch);
     }
+
+    gm->prefill_len = n_tokens;
+
+    if (fa_debug_enabled())
+        fa_debug_prefill_hook(n_tokens, kv_dim, hd, max_seq, c->n_layers, gm->kc, gm->vc);
 
     const float *x_last = gm->x_batch + (size_t)(n_tokens - 1) * dim;
     rmsnorm_kernel<<<1, 256>>>(gm->x, x_last, (float *)gm->norm_out.ptr, dim, c->norm_eps);
@@ -1228,6 +1265,11 @@ void gpu_copy_logits(GpuModel *gm, float *host_logits)
 {
     CUDA_CHECK(cudaMemcpy(host_logits, gm->logits,
         (size_t)gm->cfg.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+void gpu_set_prefill_len(GpuModel *gm, int n_tokens)
+{
+    if (gm) gm->prefill_len = n_tokens;
 }
 
 static size_t fp16_mat_bytes(int n_out, int n_in)

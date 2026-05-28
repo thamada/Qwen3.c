@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "gpu.h"
+#include "fa_debug.h"
 #include <cuda_runtime.h>
 #ifdef BONSAI_FP4
 #include "fp4_qwen3.h"
@@ -2118,6 +2119,7 @@ static void generate(Model *m, int *prompt, int n_prompt,
             gpu_forward_prefill(m->gpu, prompt, n_prompt);
         } else {
             forward(m, prompt[0], 0);
+            gpu_set_prefill_len(m->gpu, 1);
         }
         gpu_copy_logits(m->gpu, m->s.logits);
         struct timespec t_now;
@@ -2170,6 +2172,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  -k <topp>     Top-p sampling (default: 0.9)\n");
         fprintf(stderr, "  -s <seed>     Random seed (default: time)\n");
         fprintf(stderr, "  -l <len>      Max sequence length (default: 512)\n");
+        fprintf(stderr, "  --fa-debug    Log Flash-Attention Q/K/V stats at decode (pos 27-34)\n");
 #ifdef BONSAI_FP4
         fprintf(stderr, "  --pack-nvfp4-cache [dir]  Offline NVFP4 cache (default: <model>.gguf.nvfp4)\n");
         fprintf(stderr, "  --no-nvfp4-cache          Force GGUF dequant (ignore offline cache)\n");
@@ -2187,6 +2190,7 @@ int main(int argc, char *argv[]) {
     float topp       = 0.9f;
     uint64_t seed    = (uint64_t)time(NULL);
     int   max_seq    = 512;
+    int   fa_debug   = 0;
 #ifdef BONSAI_FP4
     int pack_nvfp4 = 0;
     g_nvfp4_cache_dir[0] = '\0';
@@ -2198,6 +2202,10 @@ int main(int argc, char *argv[]) {
 #endif
 
     for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--fa-debug")) {
+            fa_debug = 1;
+            continue;
+        }
 #ifdef BONSAI_FP4
         if (!strcmp(argv[i], "--pack-nvfp4-cache")) {
             pack_nvfp4 = 1;
@@ -2315,6 +2323,15 @@ int main(int argc, char *argv[]) {
     GpuConfig gc = gpu_config_from(c);
     GpuWeightsHost gw = gpu_weights_from(&model.wd);
     model.gpu = gpu_model_create(&gc, &gw);
+
+    fa_debug_set_enabled(fa_debug);
+#ifdef BONSAI_FP4
+    fa_debug_set_backend_label("NVFP4");
+#else
+    fa_debug_set_backend_label("FP16");
+#endif
+    if (fa_debug)
+        printf("FA_DEBUG: enabled (watch decode pos 27-34, layers 0/17/35)\n");
 
     int n_prompt_tokens;
     int *prompt_tokens = chat_encode(&model.tok, prompt, &n_prompt_tokens);
