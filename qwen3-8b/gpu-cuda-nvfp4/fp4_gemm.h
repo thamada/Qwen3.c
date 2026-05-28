@@ -27,6 +27,7 @@ const void *fp4_weight_cache_sf_ptr(const void *cache);
 int   fp4_weight_cache_N(const void *cache);
 int   fp4_weight_cache_K(const void *cache);
 size_t fp4_weight_cache_device_bytes(const void *cache);
+size_t fp4_gemm_vram_bytes(void);
 void  fp4_weight_cache_free(void *cache);
 
 FP4HostWeight *fp4_host_weight_build(int N_act, int K_act,

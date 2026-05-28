@@ -2,13 +2,42 @@
 # NVFP4 版は ../gpu-cuda-nvfp4/ を参照。
 #
 # CUDA Toolkit が必要（例: sudo apt install nvidia-cuda-toolkit）。
-# 既定は PTX (compute_86) を生成し、ドライバ JIT で新 GPU にも対応。
-# 例: make build CUDA_GENCODE=arch=compute_90,code=sm_90
+# 既定: 先頭 GPU の compute capability から -gencode を自動選択（nvidia-smi）。
+#   RTX 50 / Blackwell (12.x) → sm_120 + FA_BR=32（PTX JIT の compute_86 は推論が壊れる）
+#   上記以外のフォールバック → compute_86 PTX
+# 手動例: make build CUDA_GENCODE=arch=compute_90,code=sm_90
 
-CUDA_GENCODE ?= arch=compute_86,code=compute_86
+CUDA13_NVCC ?= /usr/local/cuda/bin/nvcc
+
+# nvidia-smi の "12.0" → 120
+GPU_CCAP_NUM := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | awk -F. '{print $$1$$2}')
+ifeq ($(GPU_CCAP_NUM),120)
+DEFAULT_GENCODE := arch=compute_120,code=sm_120
+DEFAULT_FA_BR   := 32
+else ifeq ($(GPU_CCAP_NUM),121)
+DEFAULT_GENCODE := arch=compute_120a,code=sm_120a
+DEFAULT_FA_BR   := 32
+else ifeq ($(GPU_CCAP_NUM),90)
+DEFAULT_GENCODE := arch=compute_90,code=sm_90
+else ifeq ($(GPU_CCAP_NUM),89)
+DEFAULT_GENCODE := arch=compute_89,code=sm_89
+else ifeq ($(GPU_CCAP_NUM),86)
+DEFAULT_GENCODE := arch=compute_86,code=sm_86
+else
+DEFAULT_GENCODE := arch=compute_86,code=compute_86
+endif
+
+CUDA_GENCODE ?= $(DEFAULT_GENCODE)
+FA_BR        ?= $(or $(DEFAULT_FA_BR),64)
 
 CUDA_HOME ?= /usr/local/cuda
 
+# Blackwell 向けには CUDA 13 の nvcc を優先（存在すれば）
+ifneq ($(filter 120 121,$(GPU_CCAP_NUM)),)
+ifneq ($(wildcard $(CUDA13_NVCC)),)
+NVCC ?= $(CUDA13_NVCC)
+endif
+endif
 NVCC    ?= $(CUDA_HOME)/bin/nvcc
 CC      ?= cc
 
@@ -36,9 +65,10 @@ PROMPT  ?= Hello, how are you?
 BENCH_PROMPT ?= Artificial intelligence has transformed many industries over the past decade. Machine learning models can now understand natural language, recognize images, and generate creative content with remarkable fluency. Large language models are trained on vast corpora of text and learn statistical patterns that enable them to predict the next token in a sequence. This capability powers applications ranging from virtual assistants and code completion tools to scientific research and education. However, deploying these models efficiently remains a challenge because they require substantial compute resources during both training and inference. Researchers explore quantization and specialized hardware to reduce latency while preserving quality.
 BENCH_N      ?= 128
 BENCH_SEED   ?= 42
+BENCH_LOG_FILE ?= /tmp/benchmark.log
 
-# GPU identifier for BENCH_LOG (CUDA_GENCODE の code=、例: compute_86 / sm_90)
-GPU_SM := $(shell echo '$(CUDA_GENCODE)' | sed -n 's/.*code=\([^,]*\).*/\1/p')
+# sm_* label for benchmark log (nvidia-smi compute cap, e.g. 12.0 → sm_120)
+GPU_SM := sm_$(GPU_CCAP_NUM)
 
 # PolarQuant KV cache: BONSAI_POLARQUANT=1（make build.polarquant）
 BONSAI_POLARQUANT ?= 0
@@ -51,20 +81,32 @@ PQ_OBJS   := polarquant.o
 endif
 
 FA_BR_FLAG :=
-FA_BR_VAL  := $(if $(FA_BR),$(FA_BR),64)
 ifneq ($(FA_BR),)
 FA_BR_FLAG := -DFA_BR=$(FA_BR)
 endif
+
+FA_BR_VAL := $(FA_BR)
+
+# CUDA_GENCODE / FA_BR が変わったら kernels を必ず再コンパイル
+BUILD_STAMP  := .build_config.stamp
+BUILD_CONFIG := $(CUDA_GENCODE)|fa=$(FA_BR_VAL)|pq=$(BONSAI_POLARQUANT)
 
 KERNELS_OBJ := kernels.fabr$(FA_BR_VAL).pq$(BONSAI_POLARQUANT).o
 MAIN_OBJ    := main.pq$(BONSAI_POLARQUANT).o
 BIN         := qwen3-gpu-cuda
 
-.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache
+.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache FORCE
 
 .DEFAULT_GOAL := run
 
+$(BUILD_STAMP): FORCE
+	@printf '%s\n' '$(BUILD_CONFIG)' > $@.new
+	@if ! cmp -s $@.new $@ 2>/dev/null; then mv $@.new $@; else rm -f $@.new; fi
+
+FORCE:
+
 build: $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) fp16_cache_io.o
+	@echo "=== build: GPU_CCAP=$(GPU_CCAP_NUM) CUDA_GENCODE=$(CUDA_GENCODE) FA_BR=$(FA_BR_VAL) NVCC=$(NVCC) ==="
 	$(NVCC) $(NVCCFLAGS) -o $(BIN) $(MAIN_OBJ) $(KERNELS_OBJ) $(PQ_OBJS) fp16_cache_io.o $(LDFLAGS)
 
 build.polarquant:
@@ -76,7 +118,7 @@ $(MAIN_OBJ): main.c gpu.h polarquant.h fp16_cache.h
 fp16_cache_io.o: fp16_cache_io.c fp16_cache.h
 	$(CC) $(CFLAGS) -c fp16_cache_io.c -o fp16_cache_io.o
 
-$(KERNELS_OBJ): kernels.cu gpu.h polarquant.h
+$(KERNELS_OBJ): kernels.cu gpu.h polarquant.h $(BUILD_STAMP)
 	$(NVCC) $(NVCCFLAGS) $(FA_BR_FLAG) $(PQ_FLAG) -c kernels.cu -o $@
 
 polarquant.o: polarquant.cu polarquant.h polarquant_kernels.cuh
@@ -96,7 +138,7 @@ pack-cache: build
 	./$(BIN) "$(MODEL)" --pack-fp16-cache
 
 clean:
-	rm -f $(BIN) polarquant_verify \
+	rm -f $(BIN) polarquant_verify .build_config.stamp \
 	      main.o main.pq*.o kernels.*.o polarquant.o fp16_cache_io.o
 
 # -----------------------------------------------------------------------------
@@ -107,6 +149,7 @@ clean:
 # BENCH_LOG_BEGIN — appended by make log.push
 BENCH_LOG :=
 BENCH_LOG += 2026-05-24T15:10:24|compute_86|24365a8c2057|132|16|62.83|75.27|63.98
+BENCH_LOG += 2026-05-28T22:36:23|sm_120|de9a61c86ea0|132|16|62.80|75.91|64.00
 # BENCH_LOG_END
 
 log:
@@ -138,15 +181,19 @@ log.push: build
 		exit 1; \
 	fi
 	@echo "Running benchmark (prompt=\"$(BENCH_PROMPT)\", -n $(BENCH_N), -t 0, -s $(BENCH_SEED)) ..."
-	@out=$$(./$(BIN) "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED) 2>&1); \
-	np=$$(echo "$$out" | sed -n 's/^--- \([0-9][0-9]*\) prompt tokens + \([0-9][0-9]*\) generated tokens ---/\1/p' | tail -1); \
-	ng=$$(echo "$$out" | sed -n 's/^--- \([0-9][0-9]*\) prompt tokens + \([0-9][0-9]*\) generated tokens ---/\2/p' | tail -1); \
-	pf=$$(echo "$$out" | sed -n 's/^prefill_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
-	dc=$$(echo "$$out" | sed -n 's/^decode_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
-	tt=$$(echo "$$out" | sed -n 's/^total_tps: \([0-9.][0-9.]*\)/\1/p' | tail -1); \
+	@BENCH_LOG_FILE="$(BENCH_LOG_FILE)" ./$(BIN) "$(MODEL)" -p "$(BENCH_PROMPT)" -n $(BENCH_N) -t 0 -s $(BENCH_SEED); \
+	if [ ! -f "$(BENCH_LOG_FILE)" ]; then \
+		echo "error: benchmark log not found: $(BENCH_LOG_FILE)" >&2; \
+		exit 1; \
+	fi; \
+	np=$$(sed -n 's/^prompt_tokens=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	ng=$$(sed -n 's/^gen_tokens=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	pf=$$(sed -n 's/^prefill_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	dc=$$(sed -n 's/^decode_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
+	tt=$$(sed -n 's/^total_tps=//p' "$(BENCH_LOG_FILE)" | tail -1); \
 	if [ -z "$$np" ] || [ -z "$$pf" ] || [ -z "$$dc" ] || [ -z "$$tt" ]; then \
-		echo "error: failed to parse benchmark output" >&2; \
-		echo "$$out" >&2; \
+		echo "error: failed to parse $(BENCH_LOG_FILE)" >&2; \
+		cat "$(BENCH_LOG_FILE)" >&2; \
 		exit 1; \
 	fi; \
 	entry="BENCH_LOG += $$(date +%Y-%m-%dT%H:%M:%S)|$(GPU_SM)|$$(hostname -s)|$$np|$$ng|$$pf|$$dc|$$tt"; \

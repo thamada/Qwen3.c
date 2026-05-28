@@ -4,6 +4,51 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 02:07:34
+
+**CUDA ベンチログ統一・VRAM プロファイル・GPU 自動検出**、**NVFP4 量子化／GEMM 修正**、**README CPU 主眼化**。
+
+#### `qwen3-8b/gpu-cuda/main.c` / `kernels.cu` / `gpu.h`
+
+- **`write_benchmark_log`**: 推論終了時に **`BENCH_LOG_FILE`**（未設定時 **`/tmp/benchmark.log`**）へ key=value 形式で書き出し（ROCm 版と同形式 + **`[vram_breakdown]`** 節）。
+- **`GpuVramProfile`** / **`gpu_model_vram_profile`**: 重み（embedding / norm / 線形 or FP4）・KV・decode 活性・prefill バッチ・（NVFP4 時）**`fp4_gemm_scratch`** の推定バイト数。**`cudaMemGetInfo`** で device used/total も記録。
+- **`gpu_get_device_desc`**: ベンチログ **`gpu=`** 用の短いデバイス文字列。
+- **`throughput_summary`**: stdout の **`prefill_tps:`** 等は **`make log.push`** 互換のため維持。メトリクス本体は **`BENCH_LOG_FILE`** へ。
+- **`kernels.cu`**: **`BONSAI_FP4`** 時に **`fp4_gemm.h`** を include（Prefill M≥128 の CUTLASS 経路コメント整理）。
+
+#### `qwen3-8b/gpu-cuda/Makefile`
+
+- **`nvidia-smi`** から先頭 GPU の compute capability を検出し **`CUDA_GENCODE`** / **`FA_BR`** を自動選択（**12.0 → `sm_120` + FA_BR=32**、**12.1 → `sm_120a`**、**89/90/86** 等。未検出時 **`compute_86` PTX**）。
+- Blackwell（**120/121**）では **`/usr/local/cuda/bin/nvcc`**（CUDA 13）を優先。
+- **`.build_config.stamp`**: **`CUDA_GENCODE` / `FA_BR` / `BONSAI_POLARQUANT`** 変更時に **`kernels.*.o`** を確実に再コンパイル。
+- **`BENCH_LOG_FILE ?= /tmp/benchmark.log`**。**`log.push`** は stdout パースを廃止し、実行後 **`$(BENCH_LOG_FILE)`** から **`prompt_tokens=`** 等を **`sed`** で抽出。
+- **`GPU_SM`**: **`sm_$(GPU_CCAP_NUM)`**（**`nvidia-smi`** 由来。旧 **`CUDA_GENCODE` の `code=`** から変更）。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/fp4_gemm.cu` / `fp4_gemm.h` / `fp4_qwen3.cu` / `fp4_qwen3.h`
+
+- **`FP4_WEIGHT_SFB_LAYOUT_M=128`**: キャッシュ済み B スケールの **`tile_atom_to_shape_SFB`** を GEMM 実行時と一致させる（レイアウト不一致による数値崩れを修正）。
+- **`fp4_quantize_weights`**: ホスト CPU 量子化から **GPU カーネル**（**`compute_sf_index`** 準拠）へ変更。**`build_host_weight_padded`** も GPU 量子化経由。
+- **`fp4_gemm_run` / `fp4_gemm_run_host`**: **`beta=0`** 時は **`C`** ポインタを **`nullptr`** に（CUTLASS 要件）。
+- **`fp4_gemm_vram_bytes`** / **`fp4_qwen3_vram_bytes`**: GEMM workspace・BF16 活性スクラッチの VRAM 見積もり（**`gpu_model_vram_profile`** から参照）。
+- **`fp4_qwen3_init`**: **128³** の smoke GEMM で CUTLASS／workspace 設定を起動前に検証。
+- **`f32_to_bf16_pad_kernel`**: パディング次元 **`M_pad`** と実バッチ **`M_act`** の引数を修正。
+
+#### `qwen3-8b/gpu-cuda-nvfp4/Makefile`
+
+- **`BENCH_LOG_FILE`** と **`log.push`** のファイル読取（**`gpu-cuda/`** と同趣旨）。**`BENCH_LOG`** サンプル行を Blackwell 計測分追加。
+
+#### `qwen3-8b/gpu-rocm/Makefile`
+
+- **`BENCH_LOG`** 内の重複・古いサンプル行を整理（機能変更なし）。
+
+#### ドキュメント
+
+**`README.md`** / **`README.en.md`**: 本文を **CPU 3 バリアント**（**`cpu` / `cpu-multicore` / `cpu-blas`**）中心に再構成。**ROCm / CUDA / XDNA2** は **付録**（末尾）へ移動。**`BENCH_LOG_FILE`**・VRAM 内訳・CUDA **`nvidia-smi` 自動検出**・Blackwell で **PTX `compute_86` 非推奨**を追記。
+
+**`doc/design.md`**: 上記 CUDA ビルド変数・ベンチログ形式・実行時挙動・NVFP4 量子化経路・トラブルシュート・ドキュメント役割を同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-27 18:55:19
 
 **`qwen3-8b/`** — **IQ2_S / IQ3_S グリッドテーブル**（**`kmask_iq2xs`** / **`iq2s_grid`** / **`iq3s_grid`**）に日本語コメントを追加。対象は **`cpu/`**・**`cpu-multicore/`**・**`cpu-blas/`**・**`gpu-rocm/`**・**`gpu-cuda/`** の各 **`main.c`**（**`xdna2*`** は未対象）。

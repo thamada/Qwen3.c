@@ -31,10 +31,10 @@ static size_t g_act_cap = 0, g_out_cap = 0;
 static int align128(int x) { return (x + 127) & ~127; }
 
 static __global__ void f32_to_bf16_pad_kernel(
-    const float *src, __nv_bfloat16 *dst, int M, int n, int K_pad, int M_act)
+    const float *src, __nv_bfloat16 *dst, int M_act, int M_pad, int n, int K_pad)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = M * K_pad;
+    int total = M_pad * K_pad;
     if (idx >= total) return;
     int m = idx / K_pad;
     int k = idx % K_pad;
@@ -78,6 +78,27 @@ int fp4_qwen3_init(int max_M, int max_N, int max_K)
     g_max_M = M;
     g_max_N = N;
     g_max_K = K;
+
+    /* 128³ smoke test — catches CUTLASS/workspace misconfig before full model load */
+    {
+        const int tM = 128, tN = 128, tK = 128;
+        __nv_bfloat16 *dev_w = NULL, *dev_act = NULL, *dev_out = NULL;
+        cudaMalloc(&dev_w, (size_t)tN * tK * sizeof(__nv_bfloat16));
+        cudaMalloc(&dev_act, (size_t)tM * tK * sizeof(__nv_bfloat16));
+        cudaMalloc(&dev_out, (size_t)tM * tN * sizeof(__nv_bfloat16));
+        cudaMemset(dev_w, 0, (size_t)tN * tK * sizeof(__nv_bfloat16));
+        cudaMemset(dev_act, 0, (size_t)tM * tK * sizeof(__nv_bfloat16));
+        void *wc = fp4_quantize_weights(dev_w, tN, tK);
+        int rc = wc ? fp4_gemm_run_cached(dev_act, wc, NULL, dev_out, tM, 1.0f, 0.0f) : -1;
+        if (wc) fp4_weight_cache_free(wc);
+        cudaFree(dev_w);
+        cudaFree(dev_act);
+        cudaFree(dev_out);
+        if (rc != 0) {
+            fprintf(stderr, "fp4_qwen3_init: NVFP4 sanity GEMM failed (rc=%d)\n", rc);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -127,6 +148,11 @@ void fp4_qwen3_free_weight(void *cache)
     fp4_weight_cache_free(cache);
 }
 
+size_t fp4_qwen3_vram_bytes(void)
+{
+    return g_act_cap * sizeof(__nv_bfloat16) + g_out_cap * sizeof(__nv_bfloat16);
+}
+
 void fp4_qwen3_mm(const void *weight_cache,
                   const float *x, float *y,
                   int M, int n, int d)
@@ -158,7 +184,7 @@ void fp4_qwen3_mm(const void *weight_cache,
     }
 
     f32_to_bf16_pad_kernel<<<(M_pad * K_pad + 255) / 256, 256>>>(
-        x, g_act_bf16, M_pad, n, K_pad, M);
+        x, g_act_bf16, M, M_pad, n, K_pad);
 
     if (fp4_gemm_run_cached(g_act_bf16, weight_cache, NULL, g_out_bf16,
                             M_pad, 1.0f, 0.0f) != 0) {
