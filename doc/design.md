@@ -48,9 +48,9 @@
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value ベンチ＋**`[vram_breakdown]`**（**`GpuVramProfile`** / **`model_vram_profile`**。**`make log.push`** がパース。推論区間のみ）。 |
 | `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-cuda/`** と同 API。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ（pack-cache 省略）。**`pack-cache`**: **`--pack-fp16-cache`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`log.push`** は **`BENCH_LOG_FILE`** から **`prompt_tokens=`** 等を読み取り **`BENCH_LOG`** に追記）。**`BENCH_LOG_FILE`** 既定 **`/tmp/benchmark.log`**。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`clean`** は **`qwen3-rocm`**・**`wmma-probe`**・**`main.o`**・**`fp16_cache_io.o`** を削除。 |
-| `qwen3-8b/gpu-rocm/wmma_probe.c` | gfx11 向け **WMMA 校正用**最小 HIP プローブ（**`__builtin_amdgcn_wmma_*`**）。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
-| `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（gfx11）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3`** カーネル trace。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ（pack-cache 省略）。**`pack-cache`**: **`--pack-fp16-cache`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`log.push`** は **`BENCH_LOG_FILE`** から **`prompt_tokens=`** 等を読み取り **`BENCH_LOG`** に追記）。**`BENCH_LOG_FILE`** 既定 **`/tmp/benchmark.log`**。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`wmma-probe`** は **`$(HIP_CFLAGS)`** + **`WMMA_PROBE_RDNA_FLAG`**（**`gfx11*` / `gfx12*`**）。**`clean`** は **`qwen3-rocm`**・**`wmma-probe`**・**`main.o`**・**`fp16_cache_io.o`** を削除。 |
+| `qwen3-8b/gpu-rocm/wmma_probe.c` | RDNA **gfx11 / gfx12** 向け **WMMA 校正用**最小 HIP プローブ。**gfx11**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`**。**gfx12**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`**。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
+| `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（RDNA **gfx11 / gfx12**）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3 --kernel-trace`** カーネル trace。**`count_wmma_in_obj`**: HIP バイナリは **`--offloading`** で AMDGPU コードを抽出して **`v_wmma`** をカウント。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（**`BONSAI_FP4=0`** 時 FP16 線形 + オフラインキャッシュ。**`BONSAI_FP4=1`** 時 NVFP4 ロード・**`--pack-nvfp4-cache`** も本ファイル）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界（**`GpuVramProfile`** / **`gpu_model_vram_profile`** / **`gpu_get_device_desc`**）。重み H2D 時、8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value ベンチ＋**`[vram_breakdown]`**（**`make log.push`** が読取）。stdout の **`prefill_tps:`** 等は互換用に維持。**`gpu-cuda-nvfp4`** も共有参照。 |
 | `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。既定 **`make build` / `make run`**。**`nvidia-smi`** で **`CUDA_GENCODE`** / **`FA_BR`** を自動選択（Blackwell **12.x → `sm_120` + FA_BR=32**、未検出時 **`compute_86` PTX**）。**`.build_config.stamp`** で **`kernels.*.o`** の stale 回避。**`build.polarquant`** / **`run.polarquant`**、**`pack-cache`**、**`pq-test`**、**`fa-debug`**。**`BENCH_LOG_FILE`**。**`make log`** / **`make log.push`**（**`GPU_SM=sm_<ccap>`**）。NVFP4 関連は含まない。 |
 | `qwen3-8b/gpu-cuda/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
@@ -216,7 +216,31 @@ make wmma-probe                     # 校正用 wmma-probe のみビルド
 
 起動時に **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** が出れば Prefill 線形層は hipBLAS 経路が有効。Prefill / Decode の分離と 3 段階の改善経緯は **「ROCm Prefill 高速化の詳細（3 段階）」** を参照。
 
-**`make wmma`** は Prefill が **hipBLAS / rocBLAS ライブラリ経由**であること（**`main.c` に直接 WMMA を書いていない**こと）を **`llvm-objdump`** で検証する。**`qwen3-rocm` バイナリ自体に WMMA 命令が無い**のが正常。**rocBLAS** 内部カーネルに WMMA があるかは **`Kernels.so-000-$(GPU_ARCH).hsaco`** を参照（0 件でも FMAC 経路の WARN がありうる）。詳細は **`scripts/check_wmma.sh`** のコメント参照。
+**WMMA と rocBLAS**: **WMMA が実際に使われるかは rocBLAS のカーネル選択次第**であり、**`qwen3-rocm` 側で ON/OFF する手段はない**。Prefill GEMM は hipBLAS **`GemmEx`** → rocBLAS に渡され、行列サイズ・**`GPU_ARCH`**・精度等で内部カーネルが選ばれる。WMMA 命令を含むカーネルが選ばれることも、**`v_fmac_f32`** 等 FMAC 系のみのこともある（**`gfx1201`** では **`make wmma`** の lib チェックで WMMA 0 件 WARN があり得る）。
+
+**`make wmma`** は Prefill が **hipBLAS / rocBLAS ライブラリ経由**であること（**`main.c` に直接 WMMA を書いていない**こと）を **`llvm-objdump`** で検証する。**`qwen3-rocm` バイナリ自体に WMMA 命令が無い**のが正常。**rocBLAS** バンドル ISA（**`Kernels.so-000-$(GPU_ARCH).hsaco`**）の WMMA 有無は静的参考。**`wmma-probe`** は RDNA **gfx11 / gfx12** 向け校正用（検出器が **`v_wmma`** を拾えることの確認）。実行時 ISA は **`WMMA_SKIP_ROCPROF=0`** または下記手動 **`rocprofv3`** で確認。詳細は **`scripts/check_wmma.sh`** および **`README.md`** の **「WMMA 利用状況の確認」** を参照。
+
+#### 手動 `rocprofv3 --kernel-trace`（Prefill 実行時 ISA）
+
+**`make wmma WMMA_SKIP_ROCPROF=0`** と同趣旨。Prefill 中にロードされた **`.hsaco` / `.co`** を trace し **`v_wmma`** を数える。
+
+```bash
+cd qwen3-8b/gpu-rocm
+MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
+TRACE_DIR=/tmp/qwen3-wmma-trace
+LLVM_OBJDUMP=${LLVM_OBJDUMP:-/opt/rocm/llvm/bin/llvm-objdump}
+
+mkdir -p "$TRACE_DIR"
+rocprofv3 --kernel-trace -d "$TRACE_DIR" -f csv -- \
+  ./qwen3-rocm "$MODEL" -p "Hello" -n 0 -t 0 -s 42
+
+find "$TRACE_DIR" -type f \( -name '*.hsaco' -o -name '*.co' \) -print0 | while IFS= read -r -d '' f; do
+  n=$("$LLVM_OBJDUMP" -d "$f" 2>/dev/null | grep -ciE '\tv_wmma|\bv_wmma_' || true)
+  printf '%4d  %s\n' "$n" "$f"
+done
+```
+
+合計 **0** なら当該 Prefill で WMMA カーネル未使用の可能性が高い。**1 以上**なら trace 中に WMMA カーネルが実行された。**`.hsaco`** が無い場合は **`rocprofv3`** / GPU アクセス / **`libdw.so`** 等を確認。
 
 | 変数（`gpu-rocm/Makefile`） | 意味 | 既定例 |
 |-----------------------------|------|--------|
@@ -965,7 +989,7 @@ hipblasGemmEx(handle,
 | **`launch_mm_f16_batch`** | **`n_tokens >= 2`** かつ **`x_f16 != NULL`** なら hipBLAS。それ以外は **`mm_f16_gemv_batch_kernel`**。 |
 | **Makefile** | **`-lhipblas -lrocblas`** を追加。 |
 | **起動ログ** | **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** |
-| **WMMA** | **`main.c` に直接 WMMA なし**（Prefill GEMM は hipBLAS → rocBLAS）。WMMA が rocBLAS 内部で使われるかはカーネル選択依存。**`make wmma`** で確認 |
+| **WMMA** | **`main.c` に直接 WMMA なし**（Prefill GEMM は hipBLAS → rocBLAS）。WMMA 使用は rocBLAS カーネル選択依存で **`qwen3-rocm` から ON/OFF 不可**。**`make wmma`** / 手動 **`rocprofv3 --kernel-trace`** で事後確認 |
 | **未変更** | **Decode**（**`mm_f16_gemv_kernel`**）、**Attention**（**`attn_flash_prefill_kernel`**）、サンプリング、重みロード。 |
 
 **なぜ段階 1 より大幅に速いか**:
@@ -1074,7 +1098,8 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | **ROCm FP16 キャッシュ miss 警告** | **`.fp16bin`** 欠落・形状不一致・**`manifest`** 無効 | **`make pack-cache`** を再実行。**`--no-fp16-cache`** で強制再逆量子化 |
 | **`gpu-rocm` ビルド失敗（C++ headers not found）** | **g++ / libstdc++-dev** 未導入 | **`apt install g++ libstdc++-dev`** |
 | **ROCm Prefill が遅い（~30 tok/s 程度）** | 古いバイナリ・hipBLAS 未リンク | 起動ログに **`Prefill linear: hipBLAS GemmEx`** があるか確認。**`make -C gpu-rocm clean build`**。詳細は **「ROCm Prefill 高速化の詳細（3 段階）」** |
-| **`make wmma` が FAIL** | **`qwen3-rocm` に WMMA 命令**・hipBLAS 経路未報告・**`wmma-probe` 校正失敗** | **`make -C gpu-rocm wmma WMMA_SKIP_RUN=1`** で静的のみ確認。**`llvm-objdump`** パス（**`LLVM_OBJDUMP=`**）。MODEL 未配置時は **`WMMA_SKIP_RUN=1`** |
+| **`make wmma` が FAIL** | **`qwen3-rocm` に WMMA 命令**・hipBLAS 経路未報告・**`wmma-probe` 校正失敗**（**gfx11/gfx12** で probe に **`v_wmma` 無し**） | **`make -C gpu-rocm wmma WMMA_SKIP_RUN=1`** で静的のみ確認。**`llvm-objdump`** パス（**`LLVM_OBJDUMP=`**）。MODEL 未配置時は **`WMMA_SKIP_RUN=1`**。実行時 ISA は **`WMMA_SKIP_ROCPROF=0`** または **`README.md`** の手動 **`rocprofv3`** 手順 |
+| **`make wmma-probe` で `cmath` / `cstdlib` エラー** | **`hipcc`** が libstdc++ ヘッダを見つけられない | **`apt install g++ libstdc++-dev`**。**`wmma-probe`** は **`$(HIP_CFLAGS)`** 経由でヘッダパスを付与（2026-05-29 以降の Makefile） |
 | ISA 不一致 / `GPU_ARCH not detected` | 自動検出失敗・手動指定の誤り | **`cd qwen3-8b/gpu-rocm && make detect-gpu-arch`**。失敗時は **`rocminfo`** の **`Name: gfx*`** を確認し **`make build GPU_ARCH=…`** |
 | `nvcc` not found / `nvlink` 失敗 | `PATH` に CUDA `bin` が無い | `export PATH=/usr/local/cuda/bin:$PATH` または各 CUDA ディレクトリの **`Makefile`** の `CUDA_HOME` を確認 |
 | CUDA FP16 で出力が文字化け（Blackwell / RTX 50 系） | **`CUDA_GENCODE=compute_86` PTX JIT** で **`kernels.cu`** が不整合 | **`make build`** で **`nvidia-smi` 自動検出**（**`sm_120` + FA_BR=32**）を確認。**`=== build: GPU_CCAP=… ===`** 行を参照。手動 **`CUDA_GENCODE=arch=compute_120,code=sm_120`** |

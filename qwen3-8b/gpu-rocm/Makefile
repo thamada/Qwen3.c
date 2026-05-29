@@ -113,12 +113,15 @@ clean:
 # WMMA usage check (make wmma)
 # -----------------------------------------------------------------------------
 
+# RDNA WMMA probe: gfx11* and gfx12* both use __builtin_amdgcn_wmma_* on RDNA.
+WMMA_PROBE_RDNA_FLAG := $(if $(or $(findstring gfx11,$(GPU_ARCH)),$(findstring gfx12,$(GPU_ARCH))),-DWMMA_PROBE_HAS_RDNA_WMMA=1,)
+
 wmma-probe: detect-gpu-arch
-	$(HIPCC) -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
-		--offload-arch=$(GPU_ARCH) \
-		$(if $(findstring gfx11,$(GPU_ARCH)),-DWMMA_PROBE_HAS_GFX11=1,) \
+	@test -n "$(CXX_INC_DIRS)" || (echo "error: C++ headers not found. Install: apt install g++ libstdc++-dev" >&2; exit 1)
+	$(HIPCC) $(HIP_CFLAGS) \
+		$(WMMA_PROBE_RDNA_FLAG) \
 		-o wmma-probe -x hip wmma_probe.c \
-		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib
+		-L$(ROCM)/lib -lamdhip64 -Wl,-rpath,$(ROCM)/lib $(LDFLAGS_STDCXX)
 
 wmma: qwen3-rocm wmma-probe
 	@GPU_ARCH=$(GPU_ARCH) MODEL="$(MODEL)" ROCM=$(ROCM) \
