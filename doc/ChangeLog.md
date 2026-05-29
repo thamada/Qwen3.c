@@ -4,6 +4,30 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 08:15:06
+
+**`gpu-rocm` ベンチログに VRAM 内訳（`GpuVramProfile`）を追加**。
+
+#### `qwen3-8b/gpu-rocm/main.c`
+
+- **`GpuVramProfile`** 構造体と **`model_vram_profile()`** を追加（**`gpu-cuda`** の **`gpu_model_vram_profile`** と同趣旨のカテゴリ分け）。
+- **`write_benchmark_log()`** に **`vram_total`** / **`vram_device_*`** / **`[vram_breakdown]`** 節を出力（各項目 **bytes** + **`_mib`**）。
+- **`throughput_summary()`** が推論終了時に **`model_vram_profile()`** を呼び出し。
+- **`vram_prefill_batch`** に Prefill 用 **`d_scratch_f16`**（**`max_seq × hidden_dim`** FP16）を含める。
+
+#### ベンチマーク（`make log.push`・**`gfx1201`**・**`Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**・132+16 トークン）
+
+- スループット: prefill **124.95** / decode **28.88** / total **91.89** tok/s。
+- **`vram_total`**: **15863.92 MiB**（**`gpu-cuda` FP16** **~15852 MiB** と同程度）。**`vram_prefill_batch`**: **96.00 MiB**（CUDA **~84 MiB** より大きい — **`d_scratch_f16`** 分）。
+
+#### ドキュメント
+
+**`doc/design.md`**: ROCm ベンチログの VRAM キー・参考計測表・実行時挙動を同期。
+
+**`README.md`**: **「ROCm GPU 長プロンプト」** 節にスループット表と VRAM 内訳表を追加。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 07:34:58
 
 **NVFP4 短 prefill 異常出力の切り分け・修正**（活性量子化クランプ、FA 診断、検証拡張、調査ログ）。

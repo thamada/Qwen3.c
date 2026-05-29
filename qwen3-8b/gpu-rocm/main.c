@@ -774,6 +774,18 @@ typedef struct {
     uint64_t doff;
 } Model;
 
+typedef struct {
+    size_t total_bytes;
+    size_t weights_embd_bytes;
+    size_t weights_f32_norm_bytes;
+    size_t weights_linear_bytes;
+    size_t kv_cache_bytes;
+    size_t decode_activations_bytes;
+    size_t prefill_batch_bytes;
+    size_t device_used_bytes;
+    size_t device_total_bytes;
+} GpuVramProfile;
+
 #define SM_BLOCKS  512
 #define SM_THREADS 256
 
@@ -1715,6 +1727,111 @@ static void free_state_gpu(Model *m) {
     m->d_tokens = NULL;
     m->batch_cap = 0;
     memset(sd, 0, sizeof(*sd));
+}
+
+static size_t fp16_mat_bytes(int n_out, int n_in)
+{
+    return (size_t)n_out * (size_t)n_in * sizeof(uint16_t);
+}
+
+static size_t model_weights_embd_bytes(const Model *m)
+{
+    const Config *c = &m->cfg;
+    return (size_t)c->vocab_size * (size_t)c->dim * sizeof(uint16_t);
+}
+
+static size_t model_weights_f32_norm_bytes(const Model *m)
+{
+    const Config *c = &m->cfg;
+    const int L = c->n_layers;
+    const int dim = c->dim;
+    const int hd = c->head_dim;
+    return (size_t)L * (size_t)dim * sizeof(float) * 2 +
+           (size_t)L * (size_t)hd * sizeof(float) * 2 +
+           (size_t)dim * sizeof(float);
+}
+
+static size_t model_weights_fp16_linear_bytes(const Model *m)
+{
+    const Config *c = &m->cfg;
+    const int L = c->n_layers;
+    const int dim = c->dim;
+    const int hidden = c->hidden_dim;
+    const int kv_dim = c->kv_dim;
+    const int vocab = c->vocab_size;
+
+    size_t per_layer =
+        fp16_mat_bytes(dim, dim) +
+        fp16_mat_bytes(kv_dim, dim) +
+        fp16_mat_bytes(kv_dim, dim) +
+        fp16_mat_bytes(dim, dim) +
+        fp16_mat_bytes(hidden, dim) +
+        fp16_mat_bytes(hidden, dim) +
+        fp16_mat_bytes(dim, hidden);
+
+    size_t b = (size_t)L * per_layer;
+    if (m->wd.out && m->wd.out != m->wd.embd)
+        b += fp16_mat_bytes(vocab, dim);
+    return b;
+}
+
+static void model_vram_profile(const Model *m, GpuVramProfile *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!m) return;
+
+    const Config *c = &m->cfg;
+    const int L = c->n_layers;
+    const int dim = c->dim;
+    const int hidden = c->hidden_dim;
+    const int kv_dim = c->kv_dim;
+    const int vocab = c->vocab_size;
+    const int max_seq = c->max_seq;
+    const int qdim = c->n_heads * c->head_dim;
+
+    out->weights_embd_bytes = model_weights_embd_bytes(m);
+    out->weights_f32_norm_bytes = model_weights_f32_norm_bytes(m);
+    out->weights_linear_bytes = model_weights_fp16_linear_bytes(m);
+
+    out->kv_cache_bytes =
+        (size_t)L * (size_t)max_seq * (size_t)kv_dim * sizeof(float) * 2;
+
+    out->decode_activations_bytes =
+        (size_t)dim * sizeof(float) * 3 +
+        (size_t)hidden * sizeof(float) * 2 +
+        (size_t)qdim * sizeof(float) +
+        (size_t)kv_dim * sizeof(float) * 2 +
+        (size_t)vocab * sizeof(float);
+    if (c->head_dim > 256)
+        out->decode_activations_bytes +=
+            (size_t)c->n_heads * (size_t)max_seq * sizeof(float);
+
+    {
+        size_t bc = (size_t)max_seq;
+        out->prefill_batch_bytes =
+            bc * (size_t)dim * sizeof(float) * 3 +
+            bc * (size_t)qdim * sizeof(float) +
+            bc * (size_t)kv_dim * sizeof(float) * 2 +
+            bc * (size_t)hidden * sizeof(float) * 2 +
+            bc * sizeof(int) +
+            m->scratch_f16_nelem * sizeof(uint16_t);
+    }
+
+    out->total_bytes =
+        out->weights_embd_bytes +
+        out->weights_f32_norm_bytes +
+        out->weights_linear_bytes +
+        out->kv_cache_bytes +
+        out->decode_activations_bytes +
+        out->prefill_batch_bytes;
+
+    size_t free_bytes = 0, total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+        out->device_total_bytes = total_bytes;
+        if (total_bytes >= free_bytes)
+            out->device_used_bytes = total_bytes - free_bytes;
+    }
 }
 
 /* ================================================================
@@ -3112,7 +3229,14 @@ typedef struct {
     double prefill_tps;
     double decode_tps;
     double total_tps;
+    GpuVramProfile vram;
 } BenchLogInfo;
+
+static void write_vram_bytes_line(FILE *f, const char *key, size_t bytes)
+{
+    fprintf(f, "%s=%zu\n", key, bytes);
+    fprintf(f, "%s_mib=%.2f\n", key, (double)bytes / (1024.0 * 1024.0));
+}
 
 static void write_benchmark_log(const BenchLogInfo *info) {
     const char *path = getenv("BENCH_LOG_FILE");
@@ -3155,13 +3279,27 @@ static void write_benchmark_log(const BenchLogInfo *info) {
     fprintf(f, "decode_tps=%.2f\n", info->decode_tps);
     fprintf(f, "total_tps=%.2f\n", info->total_tps);
     fprintf(f, "\n");
+    write_vram_bytes_line(f, "vram_total", info->vram.total_bytes);
+    if (info->vram.device_total_bytes > 0) {
+        write_vram_bytes_line(f, "vram_device_used", info->vram.device_used_bytes);
+        write_vram_bytes_line(f, "vram_device_total", info->vram.device_total_bytes);
+    }
+    fprintf(f, "\n");
+    fprintf(f, "[vram_breakdown]\n");
+    write_vram_bytes_line(f, "vram_weights_embd", info->vram.weights_embd_bytes);
+    write_vram_bytes_line(f, "vram_weights_f32_norm", info->vram.weights_f32_norm_bytes);
+    write_vram_bytes_line(f, "vram_weights_linear", info->vram.weights_linear_bytes);
+    write_vram_bytes_line(f, "vram_kv_cache", info->vram.kv_cache_bytes);
+    write_vram_bytes_line(f, "vram_decode_activations", info->vram.decode_activations_bytes);
+    write_vram_bytes_line(f, "vram_prefill_batch", info->vram.prefill_batch_bytes);
+    fprintf(f, "\n");
     fprintf(f, "--- prompt ---\n");
     fprintf(f, "%s\n", info->prompt_text ? info->prompt_text : "");
     fprintf(f, "--- end prompt ---\n");
     fclose(f);
 }
 
-static void throughput_summary(const BenchLogInfo *meta,
+static void throughput_summary(const BenchLogInfo *meta, const Model *model,
                              int n_prefill, double prefill_sec,
                              int n_decode, double decode_sec,
                              double total_sec) {
@@ -3184,6 +3322,8 @@ static void throughput_summary(const BenchLogInfo *meta,
         info.prefill_tps = prefill_tps;
         info.decode_tps = decode_tps;
         info.total_tps = total_tps;
+        if (model)
+            model_vram_profile(model, &info.vram);
         write_benchmark_log(&info);
     }
 }
@@ -3260,7 +3400,7 @@ static void generate(Model *m, int *prompt, int n_prompt,
     printf("\n\n--- %d prompt tokens + %d generated tokens ---\n", n_prompt, gen);
     printf("--- %.1fs total ---\n", elapsed);
     if (prefill_reported || decode_timing)
-        throughput_summary(meta, n_prompt, prefill_sec, gen, decode_sec, elapsed);
+        throughput_summary(meta, m, n_prompt, prefill_sec, gen, decode_sec, elapsed);
 }
 
 /* ================================================================
