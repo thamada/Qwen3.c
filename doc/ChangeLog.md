@@ -4,6 +4,36 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 08:44:32
+
+**`gpu-rocm` WMMA 確認の gfx12 対応・`wmma-probe` ビルド修正・ドキュメント拡充**。
+
+#### 背景
+
+**`make wmma-probe`** が **`hipcc`** 単体呼び出しのため libstdc++ ヘッダ未検出（**`cmath` / `cstdlib`** エラー）になる問題があった。**`gfx1201`** では gfx11 向け WMMA ビルトインが選択不可で probe 校正も失敗していた。
+
+#### `qwen3-8b/gpu-rocm/Makefile`
+
+- **`wmma-probe`**: **`$(HIP_CFLAGS)`** / **`$(LDFLAGS_STDCXX)`** / **`CXX_INC_DIRS`** チェックを **`qwen3-rocm`** と同様に適用。
+- **`WMMA_PROBE_RDNA_FLAG`**: **`gfx11*`** / **`gfx12*`** で **`-DWMMA_PROBE_HAS_RDNA_WMMA=1`** を付与。
+
+#### `qwen3-8b/gpu-rocm/wmma_probe.c`
+
+- RDNA **gfx11 / gfx12** 両対応。**gfx12** は **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`**（FP16 入力）、**gfx11** は従来の **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`**。
+
+#### `qwen3-8b/gpu-rocm/scripts/check_wmma.sh`
+
+- **`is_rdna_wmma_arch()`**: probe 失敗時の FAIL 条件を **`gfx11*`** / **`gfx12*`** に拡張。
+- **`count_wmma_in_obj()`**: HIP fat binary は **`llvm-objdump --offloading`** で AMDGPU 側を抽出してから **`v_wmma`** をカウント（ファイル名誤検出を回避）。**`.hsaco`** / **`.co`** は直接逆アセンブル。
+
+#### ドキュメント
+
+**`README.md`**: rocBLAS カーネル選択により WMMA ON/OFF 不可である旨、手動 **`rocprofv3 --kernel-trace`** で **`v_wmma`** を数える手順を **「WMMA 利用状況の確認」** 節に追記。**`wmma-probe`** を RDNA gfx11/gfx12 向けと明記。
+
+**`doc/design.md`**: 上記実装・WMMA 検証フロー・手動 rocprof 手順を同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 08:15:06
 
 **`gpu-rocm` ベンチログに VRAM 内訳（`GpuVramProfile`）を追加**。

@@ -1,29 +1,39 @@
-/* Minimal WMMA probe for gfx11 — used by `make wmma` to calibrate ISA detection. */
+/* Minimal WMMA probe for RDNA (gfx11/gfx12) — used by `make wmma` to calibrate ISA detection. */
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 
 typedef float f32x8 __attribute__((ext_vector_type(8)));
 
-#if defined(WMMA_PROBE_HAS_GFX11) || defined(__gfx1100__) || defined(__gfx1101__) || \
-    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx11__)
-#undef WMMA_PROBE_HAS_GFX11
-#define WMMA_PROBE_HAS_GFX11 1
+#if defined(WMMA_PROBE_HAS_RDNA_WMMA) || defined(WMMA_PROBE_HAS_GFX11) || \
+    defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx11__) || \
+    defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1202__) || defined(__gfx12__)
+#undef WMMA_PROBE_HAS_RDNA_WMMA
+#define WMMA_PROBE_HAS_RDNA_WMMA 1
 #endif
 
-#if WMMA_PROBE_HAS_GFX11
+#if WMMA_PROBE_HAS_RDNA_WMMA
 __global__ void wmma_probe_kernel(float *out) {
     f32x8 zero = (f32x8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    f32x8 acc = zero;
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1202__) || defined(__gfx12__)
+    typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
+    f16x8 a = (f16x8){1.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f, 0.f};
+    f16x8 b = (f16x8){1.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f, 0.f};
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, zero);
+#else
     f32x8 a = (f32x8){1.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f, 0.f};
     f32x8 b = (f32x8){1.f, 0.f, 1.f, 0.f, 1.f, 0.f, 1.f, 0.f};
-    f32x8 r = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, zero);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, zero);
+#endif
     if (threadIdx.x == 0 && blockIdx.x == 0)
-        *out = r[0];
+        *out = acc[0];
 }
 #endif
 
 int main(void) {
-#if !WMMA_PROBE_HAS_GFX11
-    fprintf(stderr, "wmma_probe: WMMA builtins require gfx11 (compile with --offload-arch=gfx11xx)\n");
+#if !WMMA_PROBE_HAS_RDNA_WMMA
+    fprintf(stderr, "wmma_probe: WMMA builtins require RDNA gfx11/gfx12 (compile with --offload-arch=gfx11xx or gfx12xx)\n");
     return 2;
 #else
     float *d_out = NULL;

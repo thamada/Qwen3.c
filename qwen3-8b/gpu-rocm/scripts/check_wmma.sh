@@ -52,7 +52,31 @@ count_wmma_in_obj() {
         echo "-1"
         return
     fi
-    "$LLVM_OBJDUMP" -d "$obj" 2>/dev/null | grep -ciE 'wmma|v_wmma' || true
+
+    local obj_dir obj_base f tmpcnt total=0
+    obj_dir="$(cd "$(dirname "$obj")" && pwd)"
+    obj_base="$(basename "$obj")"
+
+    # HIP fat binaries embed AMDGPU code objects; extract sidecars for disassembly.
+    (cd "$obj_dir" && "$LLVM_OBJDUMP" --offloading -d "$obj_base" >/dev/null 2>&1) || true
+
+    for f in "$obj" "$obj_dir/$obj_base".*.hipv4-* "$obj_dir/$obj_base".*.amdgcn-*; do
+        [ -f "$f" ] || continue
+        tmpcnt=$("$LLVM_OBJDUMP" -d "$f" 2>/dev/null | grep -ciE '\tv_wmma|\bv_wmma_' || true)
+        total=$((total + tmpcnt))
+    done
+
+    rm -f "$obj_dir/$obj_base".*.hipv4-* "$obj_dir/$obj_base".*.amdgcn-* \
+        "$obj_dir/$obj_base".*.host-* 2>/dev/null || true
+
+    echo "$total"
+}
+
+is_rdna_wmma_arch() {
+    case "$GPU_ARCH" in
+        gfx11*|gfx12*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -83,7 +107,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# [probe] wmma_probe — calibration: detector must find WMMA on gfx11
+# [probe] wmma_probe — calibration: detector must find WMMA on RDNA gfx11/gfx12
 # ---------------------------------------------------------------------------
 section "probe: wmma-probe (detector calibration)"
 if [ ! -f wmma-probe ]; then
@@ -95,7 +119,7 @@ else
     elif [ "$probe_cnt" -gt 0 ]; then
         ok "wmma-probe contains $probe_cnt WMMA instruction(s) — detector works"
     else
-        if [[ "$GPU_ARCH" == gfx11* ]]; then
+        if is_rdna_wmma_arch; then
             fail "wmma-probe has no WMMA on $GPU_ARCH — fix detector or toolchain"
         else
             warn "wmma-probe has no WMMA (GPU_ARCH=$GPU_ARCH may not use RDNA WMMA)"
@@ -200,7 +224,7 @@ echo "  PASS: $PASS   FAIL: $FAIL   WARN: $WARN"
 echo ""
 echo "  Notes:"
 echo "    - qwen3-rocm uses hipBLAS/rocBLAS for prefill GEMM (not direct WMMA)."
-echo "    - WMMA in rocBLAS depends on kernel selection; 0 WMMA is common on gfx11."
+echo "    - WMMA in rocBLAS depends on kernel selection; 0 WMMA is common on gfx11/gfx12."
 echo "    - Use WMMA_SKIP_RUN=1 for static-only checks without a model."
 echo ""
 

@@ -736,10 +736,12 @@ make log.push BENCH_LOG_FILE=/tmp/my-bench.log
 
 ### WMMA 利用状況の確認（`make wmma`）
 
+**WMMA が実際に使われるかは rocBLAS のカーネル選択次第**であり、**`qwen3-rocm` 側で ON/OFF する手段はありません**。Prefill の GEMM は hipBLAS `GemmEx` に渡され、内部で rocBLAS が行列サイズ・GPU アーキテクチャ・精度などに応じてカーネルを選びます。その結果として WMMA 命令を含むカーネルが選ばれることもあれば、**`v_fmac_f32` など FMAC 系カーネルだけが使われることもあります**（`gfx1201` では `make wmma` の lib チェックで WMMA 0 件の WARN があり得ます）。WMMA 利用を「推論モード」として切り替えるのではなく、**`make wmma`**（静的 ISA 確認）や **`WMMA_SKIP_ROCPROF=0`**（実行時 `rocprofv3` trace）で、ライブラリ側が実際にどの命令を使ったかを事後確認する形になります。
+
 Prefill 線形層は **hipBLAS / rocBLAS** ライブラリ経由であり、**`main.c` に WMMA / rocWMMA / MFMA を直接書いていません**（Prefill GEMM は hipBLAS に委譲）。**`make wmma`** で次を確認できます。
 
 - **`main.c` / `qwen3-rocm` バイナリ**に WMMA 命令が無いこと（正常）
-- **`wmma-probe`**（gfx11 向け校正用バイナリ）に WMMA があること（`llvm-objdump` 検出器の校正）
+- **`wmma-probe`**（RDNA gfx11/gfx12 向け校正用バイナリ）に WMMA があること（`llvm-objdump` 検出器の校正）
 - **rocBLAS** バンドル ISA に WMMA があるか（0 件でも FMAC 経路の WARN がありうる）
 - 任意: 実行時ログ **`Prefill linear: hipBLAS GemmEx`**、**`rocprofv3`** カーネル trace
 
@@ -750,6 +752,48 @@ make wmma WMMA_SKIP_RUN=1           # 静的チェックのみ（MODEL 不要）
 make wmma WMMA_SKIP_ROCPROF=0       # rocprofv3 カーネル ISA も試行
 make wmma-probe                     # 校正用 wmma-probe のみビルド
 ```
+
+#### 手動で `rocprofv3 --kernel-trace` から `v_wmma` を数える
+
+Prefill 実行中に実際にロードされたカーネル（`.hsaco` / `.co`）をダンプし、WMMA 命令の有無を確認する手順です。**`make wmma WMMA_SKIP_ROCPROF=0`** が内部で行う処理と同趣旨です。
+
+**前提**: `qwen3-rocm` をビルド済み、MODEL の GGUF が配置済み、`rocprofv3` が PATH にあること（ROCm 7 系。`/opt/rocm/bin` など）。
+
+```bash
+cd qwen3-8b/gpu-rocm
+MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf   # 実際のパスに合わせる
+TRACE_DIR=/tmp/qwen3-wmma-trace
+LLVM_OBJDUMP=${LLVM_OBJDUMP:-/opt/rocm/llvm/bin/llvm-objdump}
+
+mkdir -p "$TRACE_DIR"
+rocprofv3 --kernel-trace -d "$TRACE_DIR" -f csv -- \
+  ./qwen3-rocm "$MODEL" -p "Hello" -n 0 -t 0 -s 42
+```
+
+**`-n 0`** は生成トークン 0（Prefill のみ短時間）の例です。プロンプト長や GPU によっては **`-n 1`** などに変えても構いません。
+
+trace 出力ディレクトリ内のコードオブジェクトを列挙し、各ファイルの逆アセンブルから **`v_wmma`** 命令を数えます。
+
+```bash
+# ダンプされた .hsaco / .co を確認
+find "$TRACE_DIR" -type f \( -name '*.hsaco' -o -name '*.co' \)
+
+# ファイルごとの v_wmma 件数
+find "$TRACE_DIR" -type f \( -name '*.hsaco' -o -name '*.co' \) -print0 | while IFS= read -r -d '' f; do
+  n=$("$LLVM_OBJDUMP" -d "$f" 2>/dev/null | grep -ciE '\tv_wmma|\bv_wmma_' || true)
+  printf '%4d  %s\n' "$n" "$f"
+done
+
+# 合計（check_wmma.sh の runtime チェックと同様）
+total=0
+while IFS= read -r -d '' f; do
+  n=$("$LLVM_OBJDUMP" -d "$f" 2>/dev/null | grep -ciE '\tv_wmma|\bv_wmma_' || true)
+  total=$((total + n))
+done < <(find "$TRACE_DIR" -type f \( -name '*.hsaco' -o -name '*.co' \) -print0)
+echo "total v_wmma instructions: $total"
+```
+
+**読み方**: 合計が **0** なら、今回の Prefill では rocBLAS 等が WMMA カーネルを選ばなかった可能性が高いです（FMAC 経路など）。**1 以上**なら、trace 中に WMMA を含むカーネルが実行されています。`.hsaco` が 1 件も出ない場合は ROCm プロファイラの設定（GPU アクセス、`libdw.so` 不足など）を確認してください。
 
 詳細は [`doc/design.md`](doc/design.md) の ROCm ビルド節と **`scripts/check_wmma.sh`** を参照。
 
