@@ -71,7 +71,7 @@ BENCH_N      ?= 128
 BENCH_SEED   ?= 42
 BENCH_LOG_FILE ?= /tmp/benchmark.log
 
-GPU_VK := $(shell QWEN3_VK_SHADER_DIR=. vulkaninfo --summary 2>/dev/null | awk '/deviceName/ {print $$2; exit}' || echo vulkan)
+GPU_VK := $(shell QWEN3_VK_SHADER_DIR=. vulkaninfo --summary 2>/dev/null | awk -F'=' '/deviceName/ {gsub(/^ +| +$$/, "", $$2); print $$2; exit}' || echo vulkan)
 
 log:
 	@echo ""
@@ -91,7 +91,7 @@ log:
 	@echo ""
 
 # BENCH_LOG_BEGIN
-BENCH_LOG += 2026-05-29T09:21:52|=|a0ea39c6eb9d|132|16|2.89|2.27|2.81
+BENCH_LOG += 2026-05-29T09:39:17|AMD Radeon Graphics (RADV GFX1201)|a0ea39c6eb9d|132|16|2.97|2.17|2.86
 # BENCH_LOG_END
 
 log.push: build
