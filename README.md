@@ -691,7 +691,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="日本語で短く説明してください。"
 ```
 
-プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。推論終了時、**`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** は **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（モデル・GPU・トークン数・tok/s・プロンプト全文など）を書き出します（**推論区間のみ**。モデル重み H2D は計測外）。tok/s に加え **VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）も **`[vram_breakdown]`** 節で出力します（**`gpu-vulkan`** は **`vram_total`** と簡易 **`[vram_breakdown]`**（線形重みは **`vram_total` に含む**））。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** は stdout に **`prefill_tps:`** 等も出力します（**`make log.push`** の互換用）。
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。推論終了時、**`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** は **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（モデル・GPU・トークン数・tok/s・プロンプト全文など）を書き出します（**推論区間のみ**。モデル重み H2D は計測外）。tok/s に加え **VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）も **`[vram_breakdown]`** 節で出力します（**`gpu-vulkan`** は **`vram_total`** と簡易 **`[vram_breakdown]`**（線形重みは **`vram_total` に含む**））。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。tok/s メトリクスは stderr の **`--- throughput ---`** 要約と **`BENCH_LOG_FILE`** のみ（stdout ベンチ行なし）。
 
 ### ベンチマーク履歴（`gpu-rocm/Makefile`）
 

@@ -686,7 +686,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="Short explanation in English."
 ```
 
-During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). After inference, **`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** write a structured benchmark log to **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) as key=value lines (model, GPU, token counts, tok/s, full prompt, etc.; **inference only**; model weight H2D excluded). tok/s plus **VRAM breakdown** (**`GpuVramProfile`** / **`model_vram_profile`**) appear under **`[vram_breakdown]`** (**`gpu-vulkan`**: **`vram_total`** plus a simplified **`[vram_breakdown]`**; linear weights are included in **`vram_total`** only). During weight upload, stdout prints **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** every 8 layers. **`gpu-cuda/`** still prints **`prefill_tps:`** etc. on stdout for **`make log.push`** compatibility.
+During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). After inference, **`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** write a structured benchmark log to **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) as key=value lines (model, GPU, token counts, tok/s, full prompt, etc.; **inference only**; model weight H2D excluded). tok/s plus **VRAM breakdown** (**`GpuVramProfile`** / **`model_vram_profile`**) appear under **`[vram_breakdown]`** (**`gpu-vulkan`**: **`vram_total`** plus a simplified **`[vram_breakdown]`**; linear weights are included in **`vram_total`** only). During weight upload, stdout prints **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** every 8 layers. tok/s metrics appear only in the stderr **`--- throughput ---`** summary and **`BENCH_LOG_FILE`** (no stdout benchmark lines).
 
 ### Benchmark history (`gpu-rocm/Makefile`)
 
@@ -912,8 +912,8 @@ Put CUDA **`bin`** on **`PATH`** (`/usr/local/bin/nvcc` alone may fail at link t
 | Flash Attention debug (Hello) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fa-debug` (FP16 vs NVFP4) |
 | Benchmark history (ROCm) | `cd qwen3-8b/gpu-rocm` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
 | Benchmark history (Vulkan) | `cd qwen3-8b/gpu-vulkan` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
-| Benchmark history (CUDA FP16) | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log` (parses stdout **`prefill_tps:`**) |
-| Benchmark history (CUDA NVFP4) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log` (same) |
+| Benchmark history (CUDA FP16) | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
+| Benchmark history (CUDA NVFP4) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
 
 Default FP16 build (`gpu-cuda`) uses **`nvidia-smi` auto-detection** (Blackwell **12.x** → **`sm_120`** + **`FA_BR=32`**). **PTX `compute_86` JIT** can corrupt output on RTX 5090; avoid it. NVFP4 build defaults to **`sm_120a`**. **`fp4_gemm.sm120a.o`** / **`fp4_qwen3.sm120a.o`** use **`BLACKWELL_NVCCFLAGS`** (**`-std=c++17`** + fixed **`sm_120a`**). CUTLASS **`v4.5.0`** is fetched via **`make cutlass`**.
 
