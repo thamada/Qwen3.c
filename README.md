@@ -691,7 +691,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="日本語で短く説明してください。"
 ```
 
-プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。推論終了時、**`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** は **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（モデル・GPU・トークン数・tok/s・プロンプト全文など）を書き出します（**推論区間のみ**。モデル重み H2D は計測外）。tok/s に加え **VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）も **`[vram_breakdown]`** 節で出力します（**`gpu-vulkan`** は **`vram_total`** のみ）。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** は stdout に **`prefill_tps:`** 等も出力します（**`make log.push`** の互換用）。
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。推論終了時、**`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** は **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（モデル・GPU・トークン数・tok/s・プロンプト全文など）を書き出します（**推論区間のみ**。モデル重み H2D は計測外）。tok/s に加え **VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）も **`[vram_breakdown]`** 節で出力します（**`gpu-vulkan`** は **`vram_total`** と簡易 **`[vram_breakdown]`**（線形重みは **`vram_total` に含む**））。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** は stdout に **`prefill_tps:`** 等も出力します（**`make log.push`** の互換用）。
 
 ### ベンチマーク履歴（`gpu-rocm/Makefile`）
 
@@ -710,7 +710,7 @@ make log.push BENCH_LOG_FILE=/tmp/my-bench.log
 
 手動実行時は **`BENCH_LOG_FILE=/path/to/log ./qwen3-rocm model.gguf -p "…" -n 64`** のあと、同ファイルの **`prefill_tps=`** 等を参照できます。
 
-**ベンチログファイル**（推論終了時に上書き）の主なキー: **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**、**`vram_total`**、**`[vram_breakdown]`**（**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。プロンプト全文は **`--- prompt ---`** 節。**`make log.push`**（**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）はこのファイルから **`prompt_tokens=`** 等を読み、**`Makefile` の `BENCH_LOG`** に 1 行追記します。Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳は **`BENCH_LOG_FILE`** を参照してください。
+**ベンチログファイル**（推論終了時に上書き）の主なキー: **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**、**`vram_total`**、**`[vram_breakdown]`**（**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。プロンプト全文は **`--- prompt ---`** 節。**`make log.push`**（**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）はこのファイルから **`prompt_tokens=`** 等を読み、**`Makefile` の `BENCH_LOG`** に 1 行追記します。Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳は **`BENCH_LOG_FILE`** を参照してください。
 
 #### ROCm GPU 長プロンプト（`gpu-rocm`・`make log.push`）
 
@@ -887,19 +887,7 @@ CLI は **`gpu-rocm` / `gpu-cuda`** と同趣旨です（**`--pack-fp16-cache`**
 - ディスクリプタセット・コマンドバッファの **再利用**（dispatch 回数は据え置きでも CPU オーバーヘッド削減）
 - Prefill 用 **batched GEMM** compute シェーダ（または Vulkan **`VK_KHR_cooperative_matrix`** 等）
 - 1 レイヤー分を **1 回の dispatch に融合**する mega-kernel 化
-- 長プロンプトベンチ（**`make log.push`**）での性能改善と履歴更新
-
-### 参考ベンチ（短プロンプト・開発環境）
-
-AMD Radeon（RADV **GFX1201**、Vulkan）上で **ChatML 後 20 プロンプト + 4 生成**（`-p "Hello" -n 4 -t 0`）の一例:
-
-| 区間 | tok/s（参考） |
-|------|----------------|
-| Prefill | ~2.9 |
-| Decode | ~2.3 |
-| Total | ~2.8 |
-
-同一 GPU の **`gpu-rocm`**（`make log.push` 履歴）では prefill/decode とも **数十 tok/s 級**です。**数値は環境依存**であり、上記は「Vulkan 経路が動作する」ことの参考値です。
+- 長プロンプトベンチ（**`make log.push`**）での性能改善（現状 **~3 tok/s** 級・ROCm 比 **10〜40×** 遅い）
 
 ### ベンチマーク履歴（`gpu-vulkan/Makefile`）
 
@@ -910,6 +898,36 @@ cd qwen3-8b/gpu-vulkan
 make log.push    # 長プロンプト ~132 token + -n 128 -t 0
 make log
 ```
+
+#### Vulkan GPU 長プロンプト（`gpu-vulkan`・`make log.push`）
+
+| 項目 | 値 |
+|---|---|
+| GPU | AMD Radeon Graphics（**RADV GFX1201**、32 GiB VRAM） |
+| OS | Linux |
+| モデル | `Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`（**`<model>.gguf.fp16`** キャッシュから H2D） |
+| コマンド | **`make log.push`** |
+| ワークロード | 長文プロンプト（ChatML 後 **132** トークン）+ decode **最大 128**（**`-n 128 -t 0 -s 42`**） |
+| 表の指標 | **`/tmp/benchmark.log`**（または **`BENCH_LOG_FILE`**）の **`prefill_tps` / `decode_tps` / `total_tps`** — 推論区間のみ |
+| 再現 | `qwen3-8b/gpu-vulkan/` で **`make log.push`** → **`make log`** |
+
+| 計測日時 | GPU | prefill tok/s | decode tok/s | total tok/s | 備考 |
+|---|---|---:|---:|---:|---|
+| 2026-05-29 09:39 | **RADV GFX1201** | **2.97** | **2.17** | **2.86** | 132+16 トークン（**`make log.push`**。`-t 0` で EOS により生成 16 で打切） |
+
+**VRAM 内訳**（上記 **2026-05-29 09:39** 計測。**`BENCH_LOG_FILE`** の **`[vram_breakdown]`**。`-l` 既定 **`max_seq=512`** 条件）:
+
+| 項目 | bytes | MiB | 備考 |
+|---|---:|---:|---|
+| **`vram_total`**（理論合計） | 16,621,944,320 | **15851.92** | 下記カテゴリ + FP16 線形重み（**~14435 MiB**） |
+| **`vram_device_total`** | 34,208,743,424 | **32624.00** | GPU 全体 VRAM（Vulkan では **`vram_device_used`** 未取得） |
+| `vram_weights_embd` | 1,244,659,712 | **1187.00** | FP16 **`token_embd`** |
+| `vram_weights_f32_norm` | 1,232,896 | **1.18** | F32 norm 重み |
+| `vram_kv_cache` | 150,994,944 | **144.00** | **`kc` / `vc`**（`-l` 依存） |
+| `vram_decode_activations` | 779,776 | **0.74** | 単トークン decode 用バッファ |
+| `vram_prefill_batch` | 88,082,432 | **84.00** | prefill バッチ（**`batch_cap = max_seq`**） |
+
+同一 GPU の **`gpu-rocm`**（**`make log.push`** 履歴）では prefill **124.95** / decode **28.88** / total **91.89** tok/s です。**Vulkan 経路は ROCm 比で prefill 約 42×・decode 約 13× 遅い**のが今回の実測です（カーネル性能に加え **`vkCmdDispatch` 同期オーバーヘッド**が大きい）。**数値は環境依存**です。
 
 ### ソースを読む場合
 
@@ -1177,12 +1195,12 @@ make log.push
 make log
 ```
 
-**注意:** **`make log.push` は `gpu-cuda/Makefile`（または `gpu-cuda-nvfp4/Makefile`）を書き換えます**。コミット前に `git diff` で差分を確認してください。表の **`total_tps`** は **推論区間のみ**（重みの VRAM アップロードは含みません）。
+**注意:** **`make log.push` は各 GPU バリアントの `Makefile`（`gpu-rocm` / `gpu-vulkan` / `gpu-cuda` / `gpu-cuda-nvfp4`）を書き換えます**。コミット前に `git diff` で差分を確認してください。表の **`total_tps`** は **推論区間のみ**（重みの VRAM アップロードは含みません）。
 
 **`BENCH_LOG_FILE` の VRAM 項目**（推論終了時）: **`vram_total`**、**`vram_device_used`** / **`vram_device_total`**（**`cudaMemGetInfo`** / **`hipMemGetInfo`**、各 **bytes** と **`_mib`**）、**`[vram_breakdown]`** セクション。
 
 - **`gpu-rocm`（FP16）**: FP16 embedding / F32 norm / FP16 線形重み（**`vram_weights_linear`**）/ KV / decode 活性 / prefill バッチ（**`d_scratch_f16`** 含む）
-- **`gpu-vulkan`（FP16）**: FP16 線形重み + KV + 活性バッファ（内訳は簡易。**`vram_total`** のみベンチログ出力）
+- **`gpu-vulkan`（FP16）**: FP16 embedding / F32 norm / FP16 線形重み（**`vram_total` に含む**・個別キー未出力）/ KV / decode 活性 / prefill バッチ
 - **`gpu-cuda`（FP16）**: FP16 embedding / F32 norm / FP16 線形重み（**`vram_weights_linear`**）/ KV / decode 活性 / prefill バッチ
 - **`gpu-cuda-nvfp4`（NVFP4）**: 上記のうち線形は **`vram_weights_fp4`**、加えて **`vram_fp4_gemm_scratch`**（BF16 活性／出力 + CUTLASS workspace 等）
 
@@ -1193,6 +1211,8 @@ Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳
 - **`gpu-vulkan`**: 第 2 列は **`vulkaninfo`** 由来の GPU 名
 - **`gpu-cuda`**: 第 2 列 **`sm_120`** 等（**`nvidia-smi` 自動検出**）
 - **`gpu-cuda-nvfp4`**: 第 2 列は既定 **`sm_120a`**
+
+**`gpu-vulkan`** の長プロンプト実測表・VRAM 内訳は上記 **「Vulkan compute 実装」→「Vulkan GPU 長プロンプト」** を参照（**2026-05-29 09:39** 計測: prefill **2.97** / decode **2.17** / total **2.86** tok/s）。
 
 #### FP16 GPU 長プロンプト（`gpu-cuda`・`make log.push`）
 

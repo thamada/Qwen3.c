@@ -686,7 +686,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="Short explanation in English."
 ```
 
-During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). After inference, **`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** write a structured benchmark log to **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) as key=value lines (model, GPU, token counts, tok/s, full prompt, etc.; **inference only**; model weight H2D excluded). tok/s plus **VRAM breakdown** (**`GpuVramProfile`** / **`model_vram_profile`**) appear under **`[vram_breakdown]`** (**`gpu-vulkan`** logs **`vram_total`** only). During weight upload, stdout prints **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** every 8 layers. **`gpu-cuda/`** still prints **`prefill_tps:`** etc. on stdout for **`make log.push`** compatibility.
+During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). After inference, **`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** write a structured benchmark log to **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) as key=value lines (model, GPU, token counts, tok/s, full prompt, etc.; **inference only**; model weight H2D excluded). tok/s plus **VRAM breakdown** (**`GpuVramProfile`** / **`model_vram_profile`**) appear under **`[vram_breakdown]`** (**`gpu-vulkan`**: **`vram_total`** plus a simplified **`[vram_breakdown]`**; linear weights are included in **`vram_total`** only). During weight upload, stdout prints **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** every 8 layers. **`gpu-cuda/`** still prints **`prefill_tps:`** etc. on stdout for **`make log.push`** compatibility.
 
 ### Benchmark history (`gpu-rocm/Makefile`)
 
@@ -705,7 +705,7 @@ make log.push BENCH_LOG_FILE=/tmp/my-bench.log
 
 For manual runs: **`BENCH_LOG_FILE=/path/to/log ./qwen3-rocm model.gguf -p "…" -n 64`**, then inspect **`prefill_tps=`** etc. in that file.
 
-**Benchmark log file** (overwritten after inference): main keys **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**, **`vram_total`**, **`[vram_breakdown]`** (**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**), plus the full prompt under **`--- prompt ---`**. **`make log.push`** (**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**) reads **`prompt_tokens=`** etc. from this file and appends one line to **`BENCH_LOG`** in the Makefile.
+**Benchmark log file** (overwritten after inference): main keys **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**, **`vram_total`**, **`[vram_breakdown]`** (**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**), plus the full prompt under **`--- prompt ---`**. **`make log.push`** (**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**) reads **`prompt_tokens=`** etc. from this file and appends one line to **`BENCH_LOG`** in the Makefile. Makefile **`BENCH_LOG`** history records tok/s only; see **`BENCH_LOG_FILE`** for VRAM breakdown.
 
 ### WMMA usage check (`make wmma`)
 
@@ -806,19 +806,7 @@ Possible improvements (not implemented):
 - **Reuse** descriptor sets and command buffers (reduce CPU overhead even if dispatch count stays the same)
 - Prefill **batched GEMM** compute shaders (or **`VK_KHR_cooperative_matrix`**, etc.)
 - **Mega-kernel** fusion (one dispatch per layer)
-- Long-prompt bench improvements and **`make log.push`** history updates
-
-### Reference bench (short prompt, dev environment)
-
-On AMD Radeon (RADV **GFX1201**, Vulkan), **20 prompt tokens after ChatML + 4 generated** (`-p "Hello" -n 4 -t 0`):
-
-| Phase | tok/s (reference) |
-|-------|-------------------|
-| Prefill | ~2.9 |
-| Decode | ~2.3 |
-| Total | ~2.8 |
-
-On the same GPU, **`gpu-rocm`** (`make log.push` history) reaches **tens of tok/s** for prefill and decode. Numbers are **environment-dependent**; the table above confirms the Vulkan path works.
+- Long-prompt bench improvements (currently **~3 tok/s** class; **~10–40×** slower than ROCm on the same GPU)
 
 ### Benchmark history (`gpu-vulkan/Makefile`)
 
@@ -829,6 +817,36 @@ cd qwen3-8b/gpu-vulkan
 make log.push    # long prompt ~132 tokens + -n 128 -t 0
 make log
 ```
+
+#### Vulkan GPU long prompt (`gpu-vulkan` · `make log.push`)
+
+| Item | Value |
+|---|---|
+| GPU | AMD Radeon Graphics (**RADV GFX1201**, 32 GiB VRAM) |
+| OS | Linux |
+| Model | `Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf` (H2D from **`<model>.gguf.fp16`** cache) |
+| Command | **`make log.push`** |
+| Workload | Long prompt (**132** tokens after ChatML) + decode **up to 128** (**`-n 128 -t 0 -s 42`**) |
+| Table metrics | **`prefill_tps` / `decode_tps` / `total_tps`** in **`/tmp/benchmark.log`** (or **`BENCH_LOG_FILE`**) — inference interval only |
+| Reproduce | `qwen3-8b/gpu-vulkan/` → **`make log.push`** → **`make log`** |
+
+| Measured | GPU | prefill tok/s | decode tok/s | total tok/s | Notes |
+|---|---|---:|---:|---:|---|
+| 2026-05-29 09:39 | **RADV GFX1201** | **2.97** | **2.17** | **2.86** | 132+16 tokens (**`make log.push`**; **`-t 0`** → EOS stopped at 16 generated) |
+
+**VRAM breakdown** (**2026-05-29 09:39** run; **`BENCH_LOG_FILE`** **`[vram_breakdown]`**; default **`-l`** → **`max_seq=512`**):
+
+| Item | bytes | MiB | Notes |
+|---|---:|---:|---|
+| **`vram_total`** (theoretical sum) | 16,621,944,320 | **15851.92** | categories below + FP16 linear weights (**~14435 MiB**) |
+| **`vram_device_total`** | 34,208,743,424 | **32624.00** | total GPU VRAM (**`vram_device_used`** not reported on Vulkan) |
+| `vram_weights_embd` | 1,244,659,712 | **1187.00** | FP16 **`token_embd`** |
+| `vram_weights_f32_norm` | 1,232,896 | **1.18** | F32 norm weights |
+| `vram_kv_cache` | 150,994,944 | **144.00** | **`kc` / `vc`** (depends on **`-l`**) |
+| `vram_decode_activations` | 779,776 | **0.74** | single-token decode buffers |
+| `vram_prefill_batch` | 88,082,432 | **84.00** | prefill batch (**`batch_cap = max_seq`**) |
+
+On the same GPU, **`gpu-rocm`** (**`make log.push`** history) measured prefill **124.95** / decode **28.88** / total **91.89** tok/s. **This Vulkan run was ~42× slower on prefill and ~13× slower on decode** than ROCm (kernel cost plus large **`vkCmdDispatch`** sync overhead). Numbers are **environment-dependent**.
 
 ### Source reading
 
@@ -1094,10 +1112,12 @@ make log.push
 make log
 ```
 
+**Note:** **`make log.push` rewrites the `Makefile` in each GPU variant** (`gpu-rocm` / `gpu-vulkan` / `gpu-cuda` / `gpu-cuda-nvfp4`). Check **`git diff`** before committing. Table **`total_tps`** is **inference only** (VRAM weight upload excluded).
+
 **`BENCH_LOG_FILE` VRAM fields** (after inference): **`vram_total`**, **`vram_device_used`** / **`vram_device_total`** (from **`cudaMemGetInfo`** / **`hipMemGetInfo`**, bytes and **`_mib`**), **`[vram_breakdown]`** section.
 
 - **`gpu-rocm` (FP16)**: FP16 embedding / F32 norm / FP16 linear weights (**`vram_weights_linear`**) / KV / decode activations / prefill batch (includes **`d_scratch_f16`**)
-- **`gpu-vulkan` (FP16)**: FP16 linear weights + KV + activation buffers (simplified breakdown; bench log outputs **`vram_total`** only)
+- **`gpu-vulkan` (FP16)**: FP16 embedding / F32 norm / FP16 linear weights (in **`vram_total`** only; no separate key) / KV / decode activations / prefill batch
 - **`gpu-cuda` (FP16)**: FP16 embedding / F32 norm / FP16 linear weights (**`vram_weights_linear`**) / KV / decode activations / prefill batch
 - **`gpu-cuda-nvfp4` (NVFP4)**: linear weights in **`vram_weights_fp4`** plus **`vram_fp4_gemm_scratch`** (BF16 activations/output + CUTLASS workspace, etc.)
 
@@ -1108,6 +1128,8 @@ One line per entry (pipe-separated): **`timestamp|GPU_SM|hostname|prompt_tokens|
 - **`gpu-vulkan`**: column 2 from **`vulkaninfo`** (GPU name)
 - **`gpu-cuda`**: column 2 from **`nvidia-smi`** (e.g. **`sm_120`**)
 - **`gpu-cuda-nvfp4`**: column 2 defaults to **`sm_120a`**
+
+**`gpu-vulkan`** long-prompt measured table and VRAM breakdown: see **Vulkan compute implementation → Vulkan GPU long prompt** above (**2026-05-29 09:39**: prefill **2.97** / decode **2.17** / total **2.86** tok/s).
 
 Example NVFP4 entries (132 prompt tokens, RTX 5090): **622.60** / **66.71** / **122.03** tok/s (**`2026-05-24`**, **`gen=128`**); **4623.10** / **66.64** / **648.35** (**`2026-05-29`**, **`gen=13`** early EOS). VRAM breakdown is in **`BENCH_LOG_FILE`** (`[vram_breakdown]`), not in **`BENCH_LOG`**.
 
