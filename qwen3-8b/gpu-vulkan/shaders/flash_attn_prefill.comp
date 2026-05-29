@@ -1,0 +1,118 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.inc"
+
+#define FA_BR 32
+#define FA_HD 128
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer XbBuf { float xb[]; };
+layout(set = 0, binding = 1) readonly buffer QBuf { float q[]; };
+layout(set = 0, binding = 2) readonly buffer KcBuf { float kc[]; };
+layout(set = 0, binding = 3) readonly buffer VcBuf { float vc[]; };
+
+layout(push_constant) uniform PC {
+    int loff;
+    int n_tokens;
+    int n_heads;
+    int kv_mul;
+    int kv_dim;
+    float scale;
+} pc;
+
+shared float k_tile[FA_BR][FA_HD];
+shared float v_tile[FA_BR][FA_HD];
+shared float q_sh[FA_HD];
+shared float o_sh[FA_HD];
+shared float scores[FA_BR];
+shared float red_sh[256];
+
+void main()
+{
+    int bt = int(gl_WorkGroupID.x);
+    int t = bt / pc.n_heads;
+    int h = bt % pc.n_heads;
+    if (t >= pc.n_tokens) return;
+    uint lid = gl_LocalInvocationID.x;
+    int hd = FA_HD;
+    int npos = t + 1;
+    int kvh = h / pc.kv_mul;
+
+    if (int(lid) < hd) {
+        q_sh[lid] = q[(t * pc.n_heads + h) * hd + int(lid)];
+        o_sh[lid] = 0.0;
+    }
+    barrier();
+
+    float m = -1e30;
+    float l = 0.0;
+
+    for (int t0 = 0; t0 < npos; t0 += FA_BR) {
+        int tc = npos - t0;
+        if (tc > FA_BR) tc = FA_BR;
+
+        for (int idx = int(lid); idx < tc * hd; idx += 128) {
+            int j = idx / hd;
+            int d = idx - j * hd;
+            int gidx = pc.loff + (t0 + j) * pc.kv_dim + kvh * hd + d;
+            k_tile[j][d] = kc[gidx];
+            v_tile[j][d] = vc[gidx];
+        }
+        barrier();
+
+        if (int(lid) < tc) {
+            float s = 0.0;
+            for (int d = 0; d < hd; d++)
+                s += q_sh[d] * k_tile[lid][d];
+            scores[lid] = s * pc.scale;
+        }
+        barrier();
+
+        float m_tile = -1e30;
+        if (int(lid) < tc) m_tile = scores[lid];
+        red_sh[lid] = m_tile;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (lid < s) red_sh[lid] = max(red_sh[lid], red_sh[lid + s]);
+            barrier();
+        }
+        m_tile = red_sh[0];
+        barrier();
+
+        float m_new = max(m, m_tile);
+        float alpha = (m > -1e29) ? exp(m - m_new) : 0.0;
+
+        if (int(lid) < hd)
+            o_sh[lid] *= alpha;
+
+        if (int(lid) < tc)
+            scores[lid] = exp(scores[lid] - m_new);
+        barrier();
+
+        float l_tile = 0.0;
+        if (int(lid) < tc) l_tile = scores[lid];
+        red_sh[lid] = l_tile;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (lid < s) red_sh[lid] += red_sh[lid + s];
+            barrier();
+        }
+        l_tile = red_sh[0];
+        barrier();
+
+        if (int(lid) < hd) {
+            float acc = 0.0;
+            for (int j = 0; j < tc; j++)
+                acc += scores[j] * v_tile[j][lid];
+            o_sh[lid] += acc;
+        }
+        barrier();
+
+        l = l * alpha + l_tile;
+        m = m_new;
+    }
+
+    if (int(lid) < hd)
+        xb[(t * pc.n_heads + h) * hd + int(lid)] = o_sh[lid] / l;
+}

@@ -1,0 +1,21 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer KcBuf { float kc[]; };
+layout(set = 0, binding = 1) readonly buffer SrcBuf { float src[]; };
+
+layout(push_constant) uniform PC {
+    int kv_dim;
+    int n_tokens;
+    int loff;
+} pc;
+
+void main()
+{
+    int t = int(gl_WorkGroupID.x);
+    if (t >= pc.n_tokens) return;
+    int i = int(gl_LocalInvocationID.x);
+    for (; i < pc.kv_dim; i += 256)
+        kc[pc.loff + t * pc.kv_dim + i] = src[t * pc.kv_dim + i];
+}

@@ -16,6 +16,9 @@ qwen3-8b/cpu-blas/qwen3-cpu-blas
 qwen3-8b/gpu-rocm/qwen3-rocm
 qwen3-8b/gpu-rocm/wmma-probe
 qwen3-8b/gpu-rocm/*.o
+qwen3-8b/gpu-vulkan/qwen3-vulkan
+qwen3-8b/gpu-vulkan/*.o
+qwen3-8b/gpu-vulkan/shaders/*.spv
 qwen3-8b/gpu-cuda/qwen3-gpu-cuda
 qwen3-8b/gpu-cuda/polarquant_verify
 qwen3-8b/gpu-cuda/*.o

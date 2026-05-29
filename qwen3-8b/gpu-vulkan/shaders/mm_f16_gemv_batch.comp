@@ -1,0 +1,31 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : enable
+#include "common.inc"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer OutBuf { float o[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; };
+layout(set = 0, binding = 2) readonly buffer WBuf { uint16_t w[]; };
+
+layout(push_constant) uniform PC {
+    int n;
+    int d;
+    int n_tokens;
+} pc;
+
+void main()
+{
+    int idx = int(gl_GlobalInvocationID.x);
+    int t = idx / pc.d;
+    int row = idx % pc.d;
+    if (t >= pc.n_tokens) return;
+
+    float val = 0.0;
+    int base_x = t * pc.n;
+    int base_w = row * pc.n;
+    for (int j = 0; j < pc.n; j++)
+        val += x[base_x + j] * f16_to_f32(uint(w[base_w + j]));
+    o[t * pc.d + row] = val;
+}
