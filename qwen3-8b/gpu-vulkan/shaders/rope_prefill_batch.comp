@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer VecBuf { float vec[]; };
+
+layout(push_constant) uniform PC {
+    int n_heads;
+    int head_dim;
+    int n_tokens;
+    float theta_base;
+} pc;
+
+void main()
+{
+    int bt = int(gl_GlobalInvocationID.x);
+    int pairs_per_token = pc.n_heads * (pc.head_dim / 2);
+    int total = pc.n_tokens * pairs_per_token;
+    if (bt >= total) return;
+
+    int t = bt / pairs_per_token;
+    int rem = bt % pairs_per_token;
+    int h = rem / (pc.head_dim / 2);
+    int pr = rem % (pc.head_dim / 2);
+    int pos = t;
+    int i = pr * 2;
+    float freq = 1.0 / pow(pc.theta_base, float(i) / float(pc.head_dim));
+    float angle = float(pos) * freq;
+    float cr = cos(angle);
+    float ci = sin(angle);
+    int idx = (t * pc.n_heads + h) * pc.head_dim + i;
+    float v0 = vec[idx];
+    float v1 = vec[idx + 1];
+    vec[idx]     = v0 * cr - v1 * ci;
+    vec[idx + 1] = v0 * ci + v1 * cr;
+}

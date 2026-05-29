@@ -4,6 +4,46 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 09:27:41
+
+**`gpu-vulkan` 付録追加**（Vulkan 1.1 compute 推論）**と README / 設計ドキュメント同期**。
+
+#### 背景
+
+ROCm / CUDA を入れず、**Vulkan compute シェーダ**だけで Qwen3 デコーダ推論を試す **付録バリアント**を追加。AMD（RADV）、NVIDIA、Intel 等の **Vulkan 対応 GPU** を想定。正しく推論できる **初期実装**として **`gpu-rocm` よりスループットは大幅に低い**（dispatch オーバーヘッド、Prefill batched GEMM 未実装）。
+
+#### 新規: `qwen3-8b/gpu-vulkan/`
+
+| ファイル | 役割 |
+|----------|------|
+| **`main.c`** | GGUF・トークナイザ・FP16 H2D（**`gpu-cuda`** ベース） |
+| **`gpu.h`** | **`gpu_forward`** / **`gpu_forward_prefill`** API |
+| **`vk_context.c/h`** | Vulkan インスタンス・デバイス・キュー |
+| **`vk_alloc.c/h`** | デバイスメモリ（**`vk_malloc`** / H2D / D2H） |
+| **`vk_pipeline.c/h`** | compute パイプライン・**`vk_dispatch`** |
+| **`vk_kernels.c`** | forward 実装 |
+| **`fp16_cache_io.c/h`** | **`<model>.gguf.fp16`**（**`gpu-rocm` / `gpu-cuda` と同形式**） |
+| **`shaders/*.comp`** | GLSL compute 18 本 → **`make`** で **`.spv`** |
+| **`Makefile`** | **`qwen3-vulkan`** ビルド、**`QWEN3_VK_SHADER_DIR`**、**`pack-cache`**、**`log.push`** |
+
+#### 実装上の要点
+
+- 重み: FP16 VRAM、KV: F32。**Prefill / Decode** とも FP16 GEMV + Flash Attention（GLSL）。
+- 各 dispatch で descriptor set 確保・fence 待ち（同期）。プール枯渇対策: **4096 sets** + **`vkFreeDescriptorSets`**。
+- 環境変数 **`QWEN3_VK_SHADER_DIR`** で SPIR-V 探索。
+
+#### 参考ベンチ（RADV GFX1201、`-p "Hello" -n 4 -t 0`）
+
+- Prefill **~2.9** / Decode **~2.3** / Total **~2.8** tok/s。
+
+#### ドキュメント
+
+**`README.md`** / **`README.en.md`**: **`gpu-vulkan`** 独立節（比較表、制約、トラブルシュート、ベンチ）を追加。
+
+**`doc/design.md`**: バリアント表・ファイル構成・ビルド節・forward 節・トラブルシュート・**「Vulkan compute 実装メモ」** を同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 08:44:32
 
 **`gpu-rocm` WMMA 確認の gfx12 対応・`wmma-probe` ビルド修正・ドキュメント拡充**。

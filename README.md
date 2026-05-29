@@ -8,7 +8,7 @@
 推論の基準となる実装は **標準Cと `libm`** のみで、`qwen3-8b/cpu/main.c` から **CPU 単スレッド**の実行ファイル（`cpu/qwen3-cpu`）をビルドします。  
 より速い検証向けに、同じ GGUF に対応した **OpenMP マルチスレッド**版を `qwen3-8b/cpu-multicore/main.c` から **`qwen3-cpu-omp`** として別ビルドできます（ランタイムは **標準C + `libm` + OpenMP ランタイム**）。  
 さらに **`qwen3-8b/cpu-blas/`** では **OpenMP + OpenBLAS** と **Q8_K 活性化 + 全型 AVX2 整数内積**で **`qwen3-cpu-blas`** をビルドできます（**標準C + `libm` + OpenMP + OpenBLAS**）。  
-**ROCm/HIP**（AMD GPU）・**CUDA**（NVIDIA GPU）・**XDNA2 NPU**（`amdxdna` ioctl）向けは **付録**として README 末尾にまとめています（本文の主眼は CPU 3 バリアント）。
+**ROCm/HIP**（AMD GPU）・**Vulkan compute**（ベンダー非依存 GPU）・**CUDA**（NVIDIA GPU）・**XDNA2 NPU**（`amdxdna` ioctl）向けは **付録**として README 末尾にまとめています（本文の主眼は CPU 3 バリアント）。
 
 ### なぜライブラリ非依存なのか
 
@@ -67,6 +67,13 @@
     │   ├── wmma_probe.c          （`make wmma-probe` — WMMA 検出器校正）
     │   └── scripts/
     │       └── check_wmma.sh     （`make wmma`）
+    ├── gpu-vulkan/        # 付録（README 末尾・Vulkan compute）
+    │   ├── Makefile
+    │   ├── main.c
+    │   ├── gpu.h
+    │   ├── vk_context.c/h / vk_alloc.c/h / vk_pipeline.c/h / vk_kernels.c
+    │   ├── fp16_cache.h / fp16_cache_io.c
+    │   └── shaders/              （GLSL compute → `make` で `.spv` 生成）
     ├── gpu-cuda/          # 付録（README 末尾・FP16）
     │   ├── Makefile
     │   ├── main.c
@@ -93,7 +100,7 @@
     └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
-推論コードは **`qwen3-8b/cpu/`**（参照・単スレッド）が基準です。並列版は **`qwen3-8b/cpu-multicore/`**、CPU 最適化版は **`qwen3-8b/cpu-blas/`** です。GPU 向けは **`gpu-rocm`**（AMD）、**`gpu-cuda`**（NVIDIA・FP16）、**`gpu-cuda-nvfp4`**（NVIDIA・NVFP4）が付録としてあります。XDNA2 NPU 向けは **`xdna2`** / **`xdna2-bfp16`** が付録です（本文末尾）。**GGUF の取得**は `qwen3-8b/` の **`make model`**、**ビルドと実行**は各サブディレクトリの Makefile で行います。
+推論コードは **`qwen3-8b/cpu/`**（参照・単スレッド）が基準です。並列版は **`qwen3-8b/cpu-multicore/`**、CPU 最適化版は **`qwen3-8b/cpu-blas/`** です。GPU 向けは **`gpu-rocm`**（AMD・ROCm/HIP）、**`gpu-vulkan`**（AMD/NVIDIA/Intel 等・Vulkan compute）、**`gpu-cuda`**（NVIDIA・FP16）、**`gpu-cuda-nvfp4`**（NVIDIA・NVFP4）が付録としてあります。XDNA2 NPU 向けは **`xdna2`** / **`xdna2-bfp16`** が付録です（本文末尾）。**GGUF の取得**は `qwen3-8b/` の **`make model`**、**ビルドと実行**は各サブディレクトリの Makefile で行います。
 
 ## 初心者向け: LLM推論で何が起きるか
 
@@ -196,6 +203,7 @@ qwen3-8b/
 ├── cpu-multicore/ …
 ├── cpu-blas/ …
 ├── gpu-rocm/ …
+├── gpu-vulkan/ …
 ├── gpu-cuda/ …
 ├── gpu-cuda-nvfp4/ …
 ├── xdna2/ …
@@ -378,6 +386,7 @@ cd qwen3-8b/cpu-multicore && make clean
 cd qwen3-8b/cpu-blas && make clean
 # 付録 GPU / XDNA:
 cd qwen3-8b/gpu-rocm && make clean
+cd qwen3-8b/gpu-vulkan && make clean
 cd qwen3-8b/gpu-cuda && make clean
 cd qwen3-8b/gpu-cuda-nvfp4 && make clean
 cd qwen3-8b/xdna2 && make clean
@@ -390,6 +399,7 @@ cd qwen3-8b/xdna2-bfp16 && make clean
 - `cpu-multicore/qwen3-cpu-omp`
 - `cpu-blas/qwen3-cpu-blas`
 - `gpu-rocm/qwen3-rocm`
+- `gpu-vulkan/qwen3-vulkan`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
 - `gpu-cuda/qwen3-gpu-cuda`
@@ -528,7 +538,7 @@ thinking 対応 GGUF をそのまま動かすと、**reasoning テキストが�
 ## このリポジトリで扱わないもの
 
 - 学習、ファインチューニング
-- **AMD NPU（XDNA2 等）** や **ROCm / CUDA GPU** 向けコード（**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`** / **`xdna2`** / **`xdna2-bfp16`** は付録の参考実装。本文の主眼は CPU 3 バリアント）
+- **AMD NPU（XDNA2 等）** や **ROCm / Vulkan / CUDA GPU** 向けコード（**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`** / **`xdna2`** / **`xdna2-bfp16`** は付録の参考実装。本文の主眼は CPU 3 バリアント）
 - バッチ推論の最適化（GPU 付録の prefill バッチは decode 高速化用）
 - 画像入力
 - **マルチターン対話の組み込み CLI**（履歴管理・KV 再利用・公式 chat template の完全再現）
@@ -681,7 +691,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="日本語で短く説明してください。"
 ```
 
-プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。推論終了時、**`qwen3-rocm`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** は **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（モデル・GPU・トークン数・tok/s・プロンプト全文など）を書き出します（**推論区間のみ**。モデル重み H2D は計測外）。tok/s に加え **VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）も **`[vram_breakdown]`** 節で出力します。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** は stdout に **`prefill_tps:`** 等も出力します（**`make log.push`** の互換用）。
+プロンプト区間では stderr に **Prefill progress bar** と prefill / decode / total のスループット要約が出ます（**`cpu-blas`** と同形式）。推論終了時、**`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** は **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value 形式のベンチログ（モデル・GPU・トークン数・tok/s・プロンプト全文など）を書き出します（**推論区間のみ**。モデル重み H2D は計測外）。tok/s に加え **VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）も **`[vram_breakdown]`** 節で出力します（**`gpu-vulkan`** は **`vram_total`** のみ）。重みアップロード中は 8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** が stdout に出ます。**`gpu-cuda/`** は stdout に **`prefill_tps:`** 等も出力します（**`make log.push`** の互換用）。
 
 ### ベンチマーク履歴（`gpu-rocm/Makefile`）
 
@@ -700,7 +710,7 @@ make log.push BENCH_LOG_FILE=/tmp/my-bench.log
 
 手動実行時は **`BENCH_LOG_FILE=/path/to/log ./qwen3-rocm model.gguf -p "…" -n 64`** のあと、同ファイルの **`prefill_tps=`** 等を参照できます。
 
-**ベンチログファイル**（推論終了時に上書き）の主なキー: **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**、**`vram_total`**、**`[vram_breakdown]`**（**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。プロンプト全文は **`--- prompt ---`** 節。**`make log.push`**（**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）はこのファイルから **`prompt_tokens=`** 等を読み、**`Makefile` の `BENCH_LOG`** に 1 行追記します。Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳は **`BENCH_LOG_FILE`** を参照してください。
+**ベンチログファイル**（推論終了時に上書き）の主なキー: **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**、**`vram_total`**、**`[vram_breakdown]`**（**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。プロンプト全文は **`--- prompt ---`** 節。**`make log.push`**（**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）はこのファイルから **`prompt_tokens=`** 等を読み、**`Makefile` の `BENCH_LOG`** に 1 行追記します。Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳は **`BENCH_LOG_FILE`** を参照してください。
 
 #### ROCm GPU 長プロンプト（`gpu-rocm`・`make log.push`）
 
@@ -801,6 +811,128 @@ echo "total v_wmma instructions: $total"
 
 6. `qwen3-8b/gpu-rocm/fp16_cache_io.c` / `main.c` — AMD GPU。**`<model>.gguf.fp16`** オフラインキャッシュ、GGUF 行単位融合逆量子化。**Prefill** は **`forward_prefill_gpu`**（**hipBLAS GemmEx**）。**Decode** は **`forward_gpu`**。Prefill 高速化の詳細は **`doc/design.md`** の **「ROCm Prefill 高速化の詳細（3 段階）」**。
 
+## Vulkan compute 実装（`gpu-vulkan`）について
+
+**`qwen3-8b/gpu-vulkan/`** は **ROCm も CUDA も使わず**、**Vulkan 1.1 compute シェーダ**だけで GPU 推論を行う **付録**です。AMD（RADV/Mesa）、NVIDIA、Intel など **Vulkan 対応 GPU** で動作を想定していますが、**ベンダー固有の最適化（hipBLAS / cuBLAS / Tensor Core 等）は使いません**。参照すべき最小実装は **`cpu/main.c`** です。
+
+### 位置づけ（`gpu-rocm` / `gpu-cuda` との関係）
+
+| 観点 | `gpu-rocm` | `gpu-vulkan` | `gpu-cuda` |
+|------|------------|--------------|------------|
+| ランタイム | ROCm / HIP | Vulkan loader + compute | CUDA |
+| 対象 GPU | AMD（ROCm 必須） | Vulkan 対応 GPU（ベンダー非依存） | NVIDIA |
+| 線形層 Prefill | hipBLAS GemmEx | FP16 GEMV バッチ（compute） | FP16 GEMV バッチ |
+| 線形層 Decode | カスタム GEMV（HIP） | FP16 GEMV（compute） | FP16 GEMV（CUDA） |
+| Attention | Flash Attention（HIP） | Flash Attention（GLSL） | Flash Attention（CUDA） |
+| FP16 キャッシュ | **`<model>.gguf.fp16`**（共通） | 同左 | 同左 |
+
+**AMD GPU で ROCm を入れたくない**、**クロスベンダーで同じ GPU 経路を試したい**場合の代替経路です。**スループット最優先なら `gpu-rocm`（AMD）または `gpu-cuda`（NVIDIA）を推奨**します。
+
+### 必要なもの
+
+- **Vulkan 1.1 以降**対応 GPU とドライバ（Linux 例: Mesa RADV、NVIDIA プロプライエタリ）
+- 開発パッケージ: **`libvulkan-dev`**
+- シェーダコンパイル: **`glslang-tools`**（`glslangValidator`）
+- 実行時: **`vulkan-loader`**（多くのディストリビューションでは `libvulkan1`）
+
+確認例:
+
+```bash
+vulkaninfo --summary
+glslangValidator --version
+```
+
+### ビルドと実行
+
+```bash
+cd qwen3-8b/gpu-vulkan
+make build          # shaders/*.comp → shaders/*.spv を生成して qwen3-vulkan をリンク
+make run            # 既定 PROMPT="Hello, how are you?"
+make pack-cache     # <model>.gguf.fp16 を生成（gpu-rocm / gpu-cuda と同形式）
+```
+
+`make run` は内部で **`QWEN3_VK_SHADER_DIR=$(pwd)/shaders`** を渡します。バイナリを直接起動する場合も、**SPIR-V（`.spv`）のあるディレクトリ**を指定してください:
+
+```bash
+cd qwen3-8b/gpu-vulkan
+QWEN3_VK_SHADER_DIR=$(pwd)/shaders ./qwen3-vulkan ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 64
+```
+
+CLI は **`gpu-rocm` / `gpu-cuda`** と同趣旨です（**`--pack-fp16-cache`**、**`--no-fp16-cache`**、**`-p` / `-n` / `-t` / `-k` / `-s` / `-l`**）。
+
+### 実装構成
+
+- **`main.c`** — GGUF 読み込み、トークナイザ、FP16 重み H2D（`gpu-cuda` ベース）
+- **`vk_context.c`** — Vulkan インスタンス・デバイス・キュー・コマンドプール
+- **`vk_alloc.c`** — デバイスバッファ（`vk_malloc` / H2D / D2H）
+- **`vk_pipeline.c`** — compute パイプラインと dispatch
+- **`vk_kernels.c`** — `gpu_forward` / `gpu_forward_prefill`（`gpu.h` API）
+- **`shaders/*.comp`** — RMSNorm、RoPE、FP16 GEMV、Flash Attention 等（18 本）
+
+重みロードは **`gpu-rocm` / `gpu-cuda`（FP16）** と同じです。**`<model>.gguf.fp16`** があれば **`.fp16bin`** から H2D、無ければ GGUF 行単位逆量子化 → FP16 → VRAM。KV キャッシュは **F32** です。
+
+### 既知の制約と今後の改善余地
+
+現状の **`gpu-vulkan`** は **正しく推論できることを確認した初期実装**です。`gpu-rocm` と比べ **スループットは大幅に低い**のが通常です（カーネル自体の差に加え、ホスト側オーバーヘッドが大きい）。
+
+主な要因:
+
+1. **カーネル起動オーバーヘッド** — レイヤーごとに多数の **`vkCmdDispatch`** を発行。各 dispatch でディスクリプタセット確保・更新・フェンス待ちを行う（同期実行）。
+2. **Prefill 線形層** — **`gpu-rocm`** の hipBLAS GemmEx に相当する **GEMM バッチ最適化が未実装**。Prefill も decode も **FP16 GEMV 系 compute シェーダ**に依存。
+3. **シェーダ汎用性優先** — WMMA / cooperative matrix 等の **ハードウェア固有 intrinsics は未使用**（GLSL の可搬性を優先）。
+4. **転送経路** — 重み H2D は **ステージングバッファ経由の都度コピー**（CUDA/HIP の pinned memory 最適化より単純）。
+
+改善の候補（未実装）:
+
+- ディスクリプタセット・コマンドバッファの **再利用**（dispatch 回数は据え置きでも CPU オーバーヘッド削減）
+- Prefill 用 **batched GEMM** compute シェーダ（または Vulkan **`VK_KHR_cooperative_matrix`** 等）
+- 1 レイヤー分を **1 回の dispatch に融合**する mega-kernel 化
+- 長プロンプトベンチ（**`make log.push`**）での性能改善と履歴更新
+
+### 参考ベンチ（短プロンプト・開発環境）
+
+AMD Radeon（RADV **GFX1201**、Vulkan）上で **ChatML 後 20 プロンプト + 4 生成**（`-p "Hello" -n 4 -t 0`）の一例:
+
+| 区間 | tok/s（参考） |
+|------|----------------|
+| Prefill | ~2.9 |
+| Decode | ~2.3 |
+| Total | ~2.8 |
+
+同一 GPU の **`gpu-rocm`**（`make log.push` 履歴）では prefill/decode とも **数十 tok/s 級**です。**数値は環境依存**であり、上記は「Vulkan 経路が動作する」ことの参考値です。
+
+### ベンチマーク履歴（`gpu-vulkan/Makefile`）
+
+**`make log.push`** / **`make log`** の枠組みは **`gpu-rocm`** と同趣旨です（**`BENCH_LOG_FILE`** から読取、Makefile の **`BENCH_LOG`** に追記）。履歴行の第 2 列は **`vulkaninfo` 由来の GPU 名**です。
+
+```bash
+cd qwen3-8b/gpu-vulkan
+make log.push    # 長プロンプト ~132 token + -n 128 -t 0
+make log
+```
+
+### ソースを読む場合
+
+7. `qwen3-8b/gpu-vulkan/fp16_cache_io.c` / `main.c` / `vk_kernels.c` / `vk_pipeline.c` / `shaders/*.comp` — Vulkan compute。**`gpu.h`** 経由で forward を分離。**`QWEN3_VK_SHADER_DIR`** で `.spv` 探索。
+
+### よくあるトラブル（`gpu-vulkan`）
+
+**`Cannot open shader: …/xxx.spv`**
+
+`make build` で **`shaders/*.spv`** が生成されているか確認してください。直接実行時は **`QWEN3_VK_SHADER_DIR`** を **`shaders/` ディレクトリ**に設定します。
+
+**`vkAllocateDescriptorSets` / OUT_OF_POOL_MEMORY**
+
+1 回の forward で大量の dispatch を行うため、ディスクリプタプールを使い切ることがあります。最新版ではプールサイズ拡大と **`vkFreeDescriptorSets`** による解放を行っています。**`make clean && make build`** で再ビルドしてください。
+
+**RADV の `not a conformant Vulkan implementation` 警告**
+
+Mesa RADV では開発中の警告が出ることがあります。本付録は **検証用**であり、Vulkan 適合性認証済み実装を前提としていません。
+
+**ROCm / CUDA と比べて極端に遅い**
+
+上記 **「既知の制約」** を参照してください。性能が目的なら **`gpu-rocm`** または **`gpu-cuda`** を使用してください。
+
 ## NVIDIA CUDA 実装（`gpu-cuda` / `gpu-cuda-nvfp4`）について
 
 **`qwen3-8b/gpu-cuda/`** および **`qwen3-8b/gpu-cuda-nvfp4/`** も同様に **付録**です。`main.c` + `kernels.cu`（+ NVFP4 用 `fp4_*.cu`）に分かれ、**CUDA Toolkit（`nvcc`）・NVIDIA ドライバ・GPU 実機**が必要です。NVFP4 版は **CUDA 13 + Blackwell（sm_120 系）** + CUTLASS が必要です。初めて読む方は無視して構いません。
@@ -828,6 +960,8 @@ nvidia-smi
 | 用途 | コマンド |
 |------|----------|
 | **ROCm FP16 オフラインキャッシュ**（2 回目以降の起動を高速化） | `cd qwen3-8b/gpu-rocm` → `make pack-cache`（**`make build`** は MODEL 存在時に自動 pack） |
+| **Vulkan compute FP16**（ROCm/CUDA 不要・クロスベンダー） | `cd qwen3-8b/gpu-vulkan` → `make build` / `make run`（**`QWEN3_VK_SHADER_DIR`** で `.spv` 指定） |
+| **Vulkan FP16 オフラインキャッシュ** | `cd qwen3-8b/gpu-vulkan` → `make pack-cache` |
 | **FP16 のみ**（Ampere/Ada 等・PTX 可） | `cd qwen3-8b/gpu-cuda` → `make build` / `make run` |
 | **FP16 オフラインキャッシュ**（2 回目以降の起動を高速化） | `cd qwen3-8b/gpu-cuda` → `make pack-cache` |
 | **PolarQuant-R KV キャッシュ**（FP16 線形・任意 GPU） | `cd qwen3-8b/gpu-cuda` → `make build.polarquant` / `make run.polarquant` |
@@ -840,6 +974,7 @@ nvidia-smi
 | SFA/SFB 索引検証 | `cd qwen3-8b/gpu-cuda-nvfp4` → `make sfa-verify` |
 | Flash Attention 診断（Hello） | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fa-debug`（FP16 / NVFP4 比較） |
 | ベンチマーク履歴（ROCm） | `cd qwen3-8b/gpu-rocm` → `make log.push` / `make log`（**`BENCH_LOG_FILE`** から読取。既定 **`/tmp/benchmark.log`**） |
+| ベンチマーク履歴（Vulkan） | `cd qwen3-8b/gpu-vulkan` → `make log.push` / `make log`（**`BENCH_LOG_FILE`** から読取。既定 **`/tmp/benchmark.log`**） |
 | ベンチマーク履歴（CUDA FP16） | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log`（**`BENCH_LOG_FILE`** から読取。既定 **`/tmp/benchmark.log`**） |
 | ベンチマーク履歴（CUDA NVFP4） | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log`（**`BENCH_LOG_FILE`** から読取。既定 **`/tmp/benchmark.log`**） |
 
@@ -850,12 +985,13 @@ FP16 ビルド（`gpu-cuda`）の既定は **`nvidia-smi` による GPU 自動�
 | ディレクトリ | ロード時の重み | 線形層 / KV キャッシュの実行 |
 |--------------|----------------|------------------------------|
 | **`gpu-rocm`** | オフラインキャッシュ（**`<model>.gguf.fp16`**）があれば **`.fp16bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → FP16 | hipBLAS GemmEx（Prefill）+ カスタム GEMV（Decode）。KV は **F32** |
+| **`gpu-vulkan`** | 上記 FP16 キャッシュと同形式 | FP16 GEMV compute シェーダ（Prefill / Decode 共通）。Flash Attention（GLSL）。KV は **F32**。hipBLAS / cuBLAS 相当の GEMM **未実装** |
 | **`gpu-cuda`** | オフラインキャッシュ（**`<model>.gguf.fp16`**）があれば **`.fp16bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → FP16 | FP16 GEMV カーネル。KV は **F32**（既定） |
 | **`gpu-cuda`** + **`build.polarquant`** | 線形は FP16（上と同じ） | KV は **PolarQuant-R**（64 B/head）。Attention タイル読み出し時に F32 復号 |
 | **`gpu-cuda-nvfp4`** | オフラインキャッシュ（**`<model>.gguf.nvfp4`**、**`FP4_CACHE_VERSION=2`**）があれば **`.fp4bin`** から H2D。無ければ GGUF **行単位融合逆量子化** → NVFP4。**`token_embd`** は行単位 FP16 H2D | **`fp4_qwen3_mm`** — prefill / decode とも **CUTLASS NVFP4 GEMM**（**`fp4_gemm_run_cached`**、**`M` を 128 整列**）。活性量子化は **`FP4_QUANT_MAX_ABS=1024`** でクランプ |
 | **`gpu-cuda-nvfp4`** + **`build.polarquant`** | 線形は NVFP4 のみ（上と同じ） | 線形は上記 GEMM。KV は PolarQuant-R |
 
-**`gpu-rocm`** / **`gpu-cuda`**（FP16）も初回起動は GGUF 行逆量子化に時間がかかります。**`make pack-cache`**（または **`--pack-fp16-cache`**）で **`<model>.gguf.fp16`** を事前生成すると、2 回目以降は **`Loading FP16 cache from …`** から H2D できます。**`--no-fp16-cache`** でキャッシュを無視して毎回再逆量子化します。**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack されます。
+**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`**（FP16）も初回起動は GGUF 行逆量子化に時間がかかります。**`make pack-cache`**（または **`--pack-fp16-cache`**）で **`<model>.gguf.fp16`** を事前生成すると、2 回目以降は **`Loading FP16 cache from …`** から H2D できます。**`--no-fp16-cache`** でキャッシュを無視して毎回再逆量子化します。**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack されます。
 
 **`gpu-cuda-nvfp4`** は CUTLASS **NVFP4** を使い、**CUDA 13 + sm_120 系 GPU**（Blackwell / RTX 50 系等）向けです。初回起動は GGUF から NVFP4 へ量子化するため時間がかかります。**`make pack-cache`**（または **`--pack-nvfp4-cache`**）で **`<model>.gguf.nvfp4`** を事前生成すると、2 回目以降は **`Loading NVFP4 cache from …`** から H2D できます。**`--no-nvfp4-cache`** でキャッシュを無視して毎回再量子化します。
 
@@ -875,7 +1011,7 @@ make build CUDA_GENCODE=arch=compute_89,code=sm_89
 
 ### オフライン FP16 キャッシュ（`make pack-cache`）
 
-初回起動の GGUF 逆量子化を省略するため、事前に FP16 キャッシュを生成します。出力先は既定で **`<model>.gguf.fp16`**（各 tensor の **`.fp16bin`** + **`manifest`**）。**`gpu-rocm`** と **`gpu-cuda`** で同形式です。
+初回起動の GGUF 逆量子化を省略するため、事前に FP16 キャッシュを生成します。出力先は既定で **`<model>.gguf.fp16`**（各 tensor の **`.fp16bin`** + **`manifest`**）。**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** で同形式です。
 
 **`gpu-cuda`**:
 
@@ -893,7 +1029,15 @@ make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-バイナリから直接（**`gpu-cuda`** / **`gpu-rocm`** 共通 CLI）:
+**`gpu-vulkan`**:
+
+```bash
+cd qwen3-8b/gpu-vulkan
+make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+```
+
+バイナリから直接（**`gpu-cuda`** / **`gpu-rocm`** / **`gpu-vulkan`** 共通 CLI）:
 
 ```bash
 ./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --pack-fp16-cache
@@ -1011,7 +1155,7 @@ make fa-debug      # FP16 vs NVFP4、Hello + --fa-debug
 
 ### ベンチマーク履歴（`gpu-cuda/Makefile` / `gpu-cuda-nvfp4/Makefile`）
 
-**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** と **`gpu-rocm/`** 同趣旨。長プロンプト（ChatML 後 **約 132 トークン**）+ decode **最大 128** トークン（**`-n 128 -t 0 -s 42`**）のベンチを実行し、結果を各 **`Makefile` 内の `BENCH_LOG`** に追記できます。第 2 列は **`GPU_SM`**（**`nvidia-smi` の compute capability**、例: **`sm_120`**）。
+**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** / **`gpu-vulkan/`** と **`gpu-rocm/`** 同趣旨。長プロンプト（ChatML 後 **約 132 トークン**）+ decode **最大 128** トークン（**`-n 128 -t 0 -s 42`**）のベンチを実行し、結果を各 **`Makefile` 内の `BENCH_LOG`** に追記できます。第 2 列は **`GPU_SM`**（**`nvidia-smi` の compute capability**、例: **`sm_120`**）。**`gpu-vulkan`** は **`vulkaninfo` 由来の GPU 名**です。
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
@@ -1038,6 +1182,7 @@ make log
 **`BENCH_LOG_FILE` の VRAM 項目**（推論終了時）: **`vram_total`**、**`vram_device_used`** / **`vram_device_total`**（**`cudaMemGetInfo`** / **`hipMemGetInfo`**、各 **bytes** と **`_mib`**）、**`[vram_breakdown]`** セクション。
 
 - **`gpu-rocm`（FP16）**: FP16 embedding / F32 norm / FP16 線形重み（**`vram_weights_linear`**）/ KV / decode 活性 / prefill バッチ（**`d_scratch_f16`** 含む）
+- **`gpu-vulkan`（FP16）**: FP16 線形重み + KV + 活性バッファ（内訳は簡易。**`vram_total`** のみベンチログ出力）
 - **`gpu-cuda`（FP16）**: FP16 embedding / F32 norm / FP16 線形重み（**`vram_weights_linear`**）/ KV / decode 活性 / prefill バッチ
 - **`gpu-cuda-nvfp4`（NVFP4）**: 上記のうち線形は **`vram_weights_fp4`**、加えて **`vram_fp4_gemm_scratch`**（BF16 活性／出力 + CUTLASS workspace 等）
 
@@ -1045,6 +1190,7 @@ Makefile の **`BENCH_LOG`** 履歴には tok/s のみ追記され、VRAM 内訳
 
 1 行形式（パイ区切り）: **`日時|GPU_SM|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
 
+- **`gpu-vulkan`**: 第 2 列は **`vulkaninfo`** 由来の GPU 名
 - **`gpu-cuda`**: 第 2 列 **`sm_120`** 等（**`nvidia-smi` 自動検出**）
 - **`gpu-cuda-nvfp4`**: 第 2 列は既定 **`sm_120a`**
 
@@ -1122,9 +1268,9 @@ NVFP4 線形重み（**~5864 MiB**）と GEMM スクラッチ（**~1165 MiB**）
 
 ### ソースを読む場合
 
-7. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu` / `fa_debug.c` — CUDA FP16 版（**`gpu_model_vram_profile`**・**VRAM ベンチログ**・**`--fa-debug`** 含む）。  
-8. `qwen3-8b/gpu-cuda-nvfp4/fp4_cache_io.c` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `fp4_verify.cu` — Blackwell NVFP4 版（**`FP4_QUANT_MAX_ABS`**・共有 **`kernels.cu`**）。  
-9. `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md` — NVFP4 異常出力の調査・修正ログ（ベース **`433319eb31c3c992536afb5c9a3717084ea5d137`**）。
+8. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu` / `fa_debug.c` — CUDA FP16 版（**`gpu_model_vram_profile`**・**VRAM ベンチログ**・**`--fa-debug`** 含む）。  
+9. `qwen3-8b/gpu-cuda-nvfp4/fp4_cache_io.c` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `fp4_verify.cu` — Blackwell NVFP4 版（**`FP4_QUANT_MAX_ABS`**・共有 **`kernels.cu`**）。  
+10. `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md` — NVFP4 異常出力の調査・修正ログ（ベース **`433319eb31c3c992536afb5c9a3717084ea5d137`**）。
 
 
 ### よくあるトラブル（GPU / XDNA 付録）
@@ -1140,9 +1286,9 @@ nvcc --version
 
 **RTX 50 系**は **CUDA 13** と **`sm_120` / `sm_120a` ネイティブ**が必要です（**PTX `compute_86` は使わない**）。**`gpu-cuda`** の **`make build`** は **`nvidia-smi` で `CUDA_GENCODE` を自動選択**します。PTX のみのビルドで極端に遅い／出力が壊れる場合は、実機の `sm_XX` を `CUDA_GENCODE` で指定して再ビルドしてください。
 
-### FP16 初回起動が遅い／キャッシュ miss（`gpu-rocm` / `gpu-cuda`）
+### FP16 初回起動が遅い／キャッシュ miss（`gpu-rocm` / `gpu-vulkan` / `gpu-cuda`）
 
-初回は GGUF 行逆量子化が走ります。**`cd gpu-rocm && make pack-cache`** または **`cd gpu-cuda && make pack-cache`** で **`<model>.gguf.fp16`** を事前生成してください（**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack）。起動時に **`Warning: FP16 cache miss for …`** が出る場合は **`.fp16bin`** 欠落・形状不一致・**`manifest`** 無効です。**`make pack-cache`** を再実行するか、**`--no-fp16-cache`** で強制再逆量子化します。
+初回は GGUF 行逆量子化が走ります。**`cd gpu-rocm && make pack-cache`**、**`cd gpu-vulkan && make pack-cache`**、または **`cd gpu-cuda && make pack-cache`** で **`<model>.gguf.fp16`** を事前生成してください（**`gpu-rocm`** では **`make build`**（**`MODEL`** 存在時）でも自動 pack）。起動時に **`Warning: FP16 cache miss for …`** が出る場合は **`.fp16bin`** 欠落・形状不一致・**`manifest`** 無効です。**`make pack-cache`** を再実行するか、**`--no-fp16-cache`** で強制再逆量子化します。
 
 ### NVFP4 初回起動が遅い／キャッシュ miss
 

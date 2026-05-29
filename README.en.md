@@ -6,7 +6,7 @@ This repository is an **inference implementation** that runs **Qwen3-family mode
 The reference implementation uses **standard C and `libm` only**: build the **single-thread CPU** binary (`cpu/qwen3-cpu`) from `qwen3-8b/cpu/main.c`.  
 For faster trials on the same GGUF, build **`qwen3-cpu-omp`** from `qwen3-8b/cpu-multicore/main.c` (**OpenMP**; runtime: **standard C + `libm` + OpenMP**).  
 **`qwen3-8b/cpu-blas/`** adds **OpenMP + OpenBLAS** and **Q8_K activations + AVX2 integer dots for all types** to produce **`qwen3-cpu-blas`** (**standard C + `libm` + OpenMP + OpenBLAS**).  
-**ROCm/HIP** (AMD GPU), **CUDA** (NVIDIA GPU), and **XDNA2 NPU** (`amdxdna` ioctl) builds are **appendix** material at the **end of this README** (the main focus is the **three CPU variants**).
+**ROCm/HIP** (AMD GPU), **Vulkan compute** (vendor-neutral GPU), **CUDA** (NVIDIA GPU), and **XDNA2 NPU** (`amdxdna` ioctl) builds are **appendix** material at the **end of this README** (the main focus is the **three CPU variants**).
 
 ### Why avoid ML libraries?
 
@@ -37,7 +37,7 @@ There are **three CPU variants**: **single-thread**, **OpenMP**, and **OpenMP + 
 | CPU OpenMP | `qwen3-8b/cpu-multicore/main.c` | `cpu-multicore/qwen3-cpu-omp` | Faster CPU trials |
 | CPU OpenMP + OpenBLAS | `qwen3-8b/cpu-blas/main.c` | `cpu-blas/qwen3-cpu-blas` | BLAS for F32 GEMV and attention; quantized GEMV uses **Q8_K activations + AVX2 integer dots for all types** (layer-shared Q8). **RoPE cache**, prefill **LM head skip**, greedy **`mm_argmax_row`**. **F16 embedding via F16C**. **Prefill progress bar** on stderr |
 
-An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable throughput, prefer **`cpu-blas`**. Faster paths for AMD GPU, NVIDIA GPU, and XDNA2 NPU are in the **appendix** at the end of this README.
+An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usable throughput, prefer **`cpu-blas`**. Faster paths for AMD GPU, cross-vendor Vulkan GPU, NVIDIA GPU, and XDNA2 NPU are in the **appendix** at the end of this README.
 
 ## Repository layout
 
@@ -67,6 +67,13 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     │   ├── wmma_probe.c          (`make wmma-probe` — WMMA detector calibration)
     │   └── scripts/
     │       └── check_wmma.sh     (`make wmma`)
+    ├── gpu-vulkan/        # appendix (end of README · Vulkan compute)
+    │   ├── Makefile
+    │   ├── main.c
+    │   ├── gpu.h
+    │   ├── vk_context.c/h / vk_alloc.c/h / vk_pipeline.c/h / vk_kernels.c
+    │   ├── fp16_cache.h / fp16_cache_io.c
+    │   └── shaders/              (GLSL compute → `.spv` via `make`)
     ├── gpu-cuda/          # appendix (end of README · FP16)
     │   ├── Makefile
     │   ├── main.c
@@ -93,7 +100,7 @@ An 8B model on CPU is **very slow**. CPU is fine for a first smoke test; for usa
     └── Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum
 ```
 
-The reference inference code is **`qwen3-8b/cpu/`** (single-thread). Parallel builds live in **`qwen3-8b/cpu-multicore/`**; the optimized CPU build is **`qwen3-8b/cpu-blas/`**. GPU builds **`gpu-rocm`** (AMD), **`gpu-cuda`** (NVIDIA · FP16), and **`gpu-cuda-nvfp4`** (NVIDIA · NVFP4) are **appendix** material. XDNA2 NPU builds **`xdna2`** / **`xdna2-bfp16`** are also appendix (end of this README). Use **`make model`** under `qwen3-8b/` to fetch the GGUF; **build and run** from each subdirectory Makefile.
+The reference inference code is **`qwen3-8b/cpu/`** (single-thread). Parallel builds live in **`qwen3-8b/cpu-multicore/`**; the optimized CPU build is **`qwen3-8b/cpu-blas/`**. GPU builds **`gpu-rocm`** (AMD · ROCm/HIP), **`gpu-vulkan`** (AMD/NVIDIA/Intel etc. · Vulkan compute), **`gpu-cuda`** (NVIDIA · FP16), and **`gpu-cuda-nvfp4`** (NVIDIA · NVFP4) are **appendix** material. XDNA2 NPU builds **`xdna2`** / **`xdna2-bfp16`** are also appendix (end of this README). Use **`make model`** under `qwen3-8b/` to fetch the GGUF; **build and run** from each subdirectory Makefile.
 
 ## Beginners: what happens during LLM inference?
 
@@ -196,6 +203,7 @@ qwen3-8b/
 ├── cpu-multicore/ …
 ├── cpu-blas/ …
 ├── gpu-rocm/ …
+├── gpu-vulkan/ …
 ├── gpu-cuda/ …
 ├── gpu-cuda-nvfp4/ …
 ├── xdna2/ …
@@ -382,6 +390,7 @@ cd qwen3-8b/cpu-multicore && make clean
 cd qwen3-8b/cpu-blas && make clean
 # appendix GPU / XDNA:
 cd qwen3-8b/gpu-rocm && make clean
+cd qwen3-8b/gpu-vulkan && make clean
 cd qwen3-8b/gpu-cuda && make clean
 cd qwen3-8b/gpu-cuda-nvfp4 && make clean
 cd qwen3-8b/xdna2 && make clean
@@ -394,6 +403,7 @@ Typical files removed:
 - `cpu-multicore/qwen3-cpu-omp`
 - `cpu-blas/qwen3-cpu-blas`
 - `gpu-rocm/qwen3-rocm`
+- `gpu-vulkan/qwen3-vulkan`
 - `xdna2/qwen3-xdna2`
 - `xdna2-bfp16/qwen3-xdna2-bfpx`
 - `gpu-cuda/qwen3-gpu-cuda`
@@ -523,7 +533,7 @@ This repo is sufficient as a **one-shot text generation** reference. For **ChatG
 ## Out of scope
 
 - Training / fine-tuning
-- **AMD NPU (XDNA2, etc.)** and **ROCm / CUDA GPU** code (**`gpu-rocm`**, **`gpu-cuda`**, **`gpu-cuda-nvfp4`**, **`xdna2`**, **`xdna2-bfp16`** are optional appendix builds; the main focus is the **three CPU variants**)
+- **AMD NPU (XDNA2, etc.)** and **ROCm / Vulkan / CUDA GPU** code (**`gpu-rocm`**, **`gpu-vulkan`**, **`gpu-cuda`**, **`gpu-cuda-nvfp4`**, **`xdna2`**, **`xdna2-bfp16`** are optional appendix builds; the main focus is the **three CPU variants**)
 - Batch inference tuning (GPU appendix prefill batching is for faster decode, not server batching)
 - Image input
 - **Built-in multi-turn CLI** (history management, KV reuse, full official chat template)
@@ -607,7 +617,7 @@ Startup logs **`Loading FP16 cache from …`** or **`Uploading weights (row dequ
 
 ### Offline FP16 cache (`make pack-cache`)
 
-Pre-pack FP16 weights to skip GGUF dequant on every run. Default output: **`<model>.gguf.fp16`** (per-tensor **`.fp16bin`** files + **`manifest`**). Same format as **`gpu-cuda`**.
+Pre-pack FP16 weights to skip GGUF dequant on every run. Default output: **`<model>.gguf.fp16`** (per-tensor **`.fp16bin`** files + **`manifest`**). Same format as **`gpu-vulkan`** and **`gpu-cuda`**.
 
 ```bash
 cd qwen3-8b/gpu-rocm
@@ -676,7 +686,7 @@ cd qwen3-8b/gpu-rocm
 make run PROMPT="Short explanation in English."
 ```
 
-During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). After inference, **`qwen3-rocm`** writes a structured benchmark log to **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) as key=value lines (model, GPU, token counts, tok/s, full prompt, etc.; **inference only**; model weight H2D excluded). During weight upload, stdout prints **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** every 8 layers. **`gpu-cuda/`** and **`gpu-cuda-nvfp4/`** still print **`prefill_tps:`** etc. on stdout for **`make log.push`**.
+During prefill, stderr shows a **Prefill progress bar** plus prefill / decode / total throughput summaries (same format as **`cpu-blas`**). After inference, **`qwen3-rocm`** / **`qwen3-vulkan`** / **`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** write a structured benchmark log to **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) as key=value lines (model, GPU, token counts, tok/s, full prompt, etc.; **inference only**; model weight H2D excluded). tok/s plus **VRAM breakdown** (**`GpuVramProfile`** / **`model_vram_profile`**) appear under **`[vram_breakdown]`** (**`gpu-vulkan`** logs **`vram_total`** only). During weight upload, stdout prints **`layer N/L uploaded: X.XX sec, X.XX GB/sec`** every 8 layers. **`gpu-cuda/`** still prints **`prefill_tps:`** etc. on stdout for **`make log.push`** compatibility.
 
 ### Benchmark history (`gpu-rocm/Makefile`)
 
@@ -695,7 +705,7 @@ make log.push BENCH_LOG_FILE=/tmp/my-bench.log
 
 For manual runs: **`BENCH_LOG_FILE=/path/to/log ./qwen3-rocm model.gguf -p "…" -n 64`**, then inspect **`prefill_tps=`** etc. in that file.
 
-**Benchmark log file** (overwritten after inference): main keys **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**, plus the full prompt under **`--- prompt ---`**. **`make log.push`** reads **`prompt_tokens=`** etc. from this file and appends one line to **`BENCH_LOG`** in the Makefile (CUDA builds still parse stdout).
+**Benchmark log file** (overwritten after inference): main keys **`timestamp`**, **`hostname`**, **`model`**, **`gpu`**, **`prompt_tokens`**, **`gen_tokens`**, **`prefill_tps`**, **`decode_tps`**, **`total_tps`**, **`vram_total`**, **`[vram_breakdown]`** (**`gpu-rocm`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**), plus the full prompt under **`--- prompt ---`**. **`make log.push`** (**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**) reads **`prompt_tokens=`** etc. from this file and appends one line to **`BENCH_LOG`** in the Makefile.
 
 ### WMMA usage check (`make wmma`)
 
@@ -719,6 +729,128 @@ See [`doc/design.md`](doc/design.md) ROCm build section and **`scripts/check_wmm
 ### Source reading
 
 6. `qwen3-8b/gpu-rocm/fp16_cache_io.c` / `main.c` — AMD GPU. **`<model>.gguf.fp16`** offline cache, GGUF fused row-wise dequant. **Prefill**: **`forward_prefill_gpu`** (**hipBLAS GemmEx**). **Decode**: **`forward_gpu`**. Prefill details in **`doc/design.md`** section on ROCm prefill optimization.
+
+## Vulkan compute implementation (`gpu-vulkan`)
+
+**`qwen3-8b/gpu-vulkan/`** is an **appendix** that runs GPU inference with **Vulkan 1.1 compute shaders only** — **no ROCm, no CUDA**. It targets **Vulkan-capable GPUs** (AMD via RADV/Mesa, NVIDIA proprietary, Intel, etc.) but **does not use vendor-specific libraries** (hipBLAS, cuBLAS, Tensor Cores, etc.). Read **`cpu/main.c`** first as the reference.
+
+### Positioning (`gpu-rocm` / `gpu-cuda`)
+
+| Aspect | `gpu-rocm` | `gpu-vulkan` | `gpu-cuda` |
+|--------|------------|--------------|------------|
+| Runtime | ROCm / HIP | Vulkan loader + compute | CUDA |
+| Target GPU | AMD (ROCm required) | Any Vulkan GPU (vendor-neutral) | NVIDIA |
+| Linear Prefill | hipBLAS GemmEx | FP16 GEMV batch (compute) | FP16 GEMV batch |
+| Linear Decode | Custom GEMV (HIP) | FP16 GEMV (compute) | FP16 GEMV (CUDA) |
+| Attention | Flash Attention (HIP) | Flash Attention (GLSL) | Flash Attention (CUDA) |
+| FP16 cache | **`<model>.gguf.fp16`** (shared) | same | same |
+
+Use this when you **cannot or do not want to install ROCm on AMD**, or when you want a **cross-vendor GPU path**. For **maximum throughput**, prefer **`gpu-rocm`** (AMD) or **`gpu-cuda`** (NVIDIA).
+
+### Requirements
+
+- **Vulkan 1.1+** GPU and driver (Linux examples: Mesa RADV, NVIDIA proprietary)
+- Dev packages: **`libvulkan-dev`**
+- Shader compile: **`glslang-tools`** (`glslangValidator`)
+- Runtime: **`vulkan-loader`** (often **`libvulkan1`** on distros)
+
+Check:
+
+```bash
+vulkaninfo --summary
+glslangValidator --version
+```
+
+### Build and run
+
+```bash
+cd qwen3-8b/gpu-vulkan
+make build          # shaders/*.comp → shaders/*.spv, then link qwen3-vulkan
+make run            # default PROMPT="Hello, how are you?"
+make pack-cache     # <model>.gguf.fp16 (same format as gpu-rocm / gpu-cuda)
+```
+
+**`make run`** sets **`QWEN3_VK_SHADER_DIR=$(pwd)/shaders`**. When running the binary directly, point **`QWEN3_VK_SHADER_DIR`** at the directory containing **SPIR-V (`.spv`)** files:
+
+```bash
+cd qwen3-8b/gpu-vulkan
+QWEN3_VK_SHADER_DIR=$(pwd)/shaders ./qwen3-vulkan ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 64
+```
+
+CLI matches **`gpu-rocm` / `gpu-cuda`**: **`--pack-fp16-cache`**, **`--no-fp16-cache`**, **`-p` / `-n` / `-t` / `-k` / `-s` / `-l`**.
+
+### Implementation layout
+
+- **`main.c`** — GGUF load, tokenizer, FP16 weight H2D (based on `gpu-cuda`)
+- **`vk_context.c`** — Vulkan instance, device, queue, command pool
+- **`vk_alloc.c`** — device buffers (`vk_malloc` / H2D / D2H)
+- **`vk_pipeline.c`** — compute pipelines and dispatch
+- **`vk_kernels.c`** — `gpu_forward` / `gpu_forward_prefill` (`gpu.h` API)
+- **`shaders/*.comp`** — RMSNorm, RoPE, FP16 GEMV, Flash Attention, etc. (18 shaders)
+
+Weight loading matches **`gpu-rocm` / `gpu-cuda` (FP16)**: if **`<model>.gguf.fp16`** exists, H2D from **`.fp16bin`**; otherwise fused row-wise GGUF dequant → FP16 → VRAM. KV cache is **F32**.
+
+### Known limitations and future work
+
+**`gpu-vulkan`** is an **initial implementation verified to produce correct output**. Throughput is **typically much lower than `gpu-rocm`** (both kernel quality and host-side overhead).
+
+Main factors:
+
+1. **Kernel launch overhead** — many **`vkCmdDispatch`** calls per layer; each dispatch allocates/updates descriptor sets and waits on a fence (synchronous).
+2. **Prefill linear layers** — no **batched GEMM** equivalent to **`gpu-rocm`** hipBLAS GemmEx; prefill and decode both use **FP16 GEMV compute shaders**.
+3. **Portable shaders** — no WMMA / cooperative matrix intrinsics (GLSL portability first).
+4. **Transfer path** — weight H2D via **staging buffers** (simpler than CUDA/HIP pinned memory).
+
+Possible improvements (not implemented):
+
+- **Reuse** descriptor sets and command buffers (reduce CPU overhead even if dispatch count stays the same)
+- Prefill **batched GEMM** compute shaders (or **`VK_KHR_cooperative_matrix`**, etc.)
+- **Mega-kernel** fusion (one dispatch per layer)
+- Long-prompt bench improvements and **`make log.push`** history updates
+
+### Reference bench (short prompt, dev environment)
+
+On AMD Radeon (RADV **GFX1201**, Vulkan), **20 prompt tokens after ChatML + 4 generated** (`-p "Hello" -n 4 -t 0`):
+
+| Phase | tok/s (reference) |
+|-------|-------------------|
+| Prefill | ~2.9 |
+| Decode | ~2.3 |
+| Total | ~2.8 |
+
+On the same GPU, **`gpu-rocm`** (`make log.push` history) reaches **tens of tok/s** for prefill and decode. Numbers are **environment-dependent**; the table above confirms the Vulkan path works.
+
+### Benchmark history (`gpu-vulkan/Makefile`)
+
+Same pattern as **`gpu-rocm`**: **`make log.push`** / **`make log`** read **`BENCH_LOG_FILE`** and append to **`BENCH_LOG`** in the Makefile. Column 2 is the **GPU name from `vulkaninfo`**.
+
+```bash
+cd qwen3-8b/gpu-vulkan
+make log.push    # long prompt ~132 tokens + -n 128 -t 0
+make log
+```
+
+### Source reading
+
+7. `qwen3-8b/gpu-vulkan/fp16_cache_io.c` / `main.c` / `vk_kernels.c` / `vk_pipeline.c` / `shaders/*.comp` — Vulkan compute. Forward split via **`gpu.h`**. **`QWEN3_VK_SHADER_DIR`** locates `.spv` files.
+
+### Troubleshooting (`gpu-vulkan`)
+
+**`Cannot open shader: …/xxx.spv`**
+
+Confirm **`shaders/*.spv`** exist after **`make build`**. When running the binary directly, set **`QWEN3_VK_SHADER_DIR`** to the **`shaders/`** directory.
+
+**`vkAllocateDescriptorSets` / OUT_OF_POOL_MEMORY**
+
+One forward issues many dispatches and can exhaust the descriptor pool. Recent builds enlarge the pool and call **`vkFreeDescriptorSets`**. Try **`make clean && make build`**.
+
+**RADV `not a conformant Vulkan implementation` warning**
+
+Mesa RADV may print this during development. This appendix is for **validation**; it does not assume a fully conformant certified Vulkan implementation.
+
+**Extremely slow vs ROCm / CUDA**
+
+See **Known limitations** above. For performance, use **`gpu-rocm`** or **`gpu-cuda`**.
 
 ## NVIDIA CUDA implementation (`gpu-cuda` / `gpu-cuda-nvfp4`)
 
@@ -747,6 +879,8 @@ Put CUDA **`bin`** on **`PATH`** (`/usr/local/bin/nvcc` alone may fail at link t
 | Use case | Command |
 |------|----------|
 | **ROCm FP16 offline cache** | `cd qwen3-8b/gpu-rocm` → `make pack-cache` (**`make build`** auto-packs when MODEL exists) |
+| **Vulkan compute FP16** (no ROCm/CUDA · cross-vendor) | `cd qwen3-8b/gpu-vulkan` → `make build` / `make run` (**`QWEN3_VK_SHADER_DIR`** for `.spv`) |
+| **Vulkan FP16 offline cache** | `cd qwen3-8b/gpu-vulkan` → `make pack-cache` |
 | **FP16 only** (Ampere/Ada, PTX OK) | `cd qwen3-8b/gpu-cuda` → `make build` / `make run` |
 | **FP16 offline cache** | `cd qwen3-8b/gpu-cuda` → `make pack-cache` |
 | **PolarQuant-R KV** (FP16 linear, any GPU) | `cd qwen3-8b/gpu-cuda` → `make build.polarquant` / `make run.polarquant` |
@@ -759,6 +893,7 @@ Put CUDA **`bin`** on **`PATH`** (`/usr/local/bin/nvcc` alone may fail at link t
 | SFA/SFB index verification | `cd qwen3-8b/gpu-cuda-nvfp4` → `make sfa-verify` |
 | Flash Attention debug (Hello) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make fa-debug` (FP16 vs NVFP4) |
 | Benchmark history (ROCm) | `cd qwen3-8b/gpu-rocm` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
+| Benchmark history (Vulkan) | `cd qwen3-8b/gpu-vulkan` → `make log.push` / `make log` (**`BENCH_LOG_FILE`**, default **`/tmp/benchmark.log`**) |
 | Benchmark history (CUDA FP16) | `cd qwen3-8b/gpu-cuda` → `make log.push` / `make log` (parses stdout **`prefill_tps:`**) |
 | Benchmark history (CUDA NVFP4) | `cd qwen3-8b/gpu-cuda-nvfp4` → `make log.push` / `make log` (same) |
 
@@ -768,12 +903,13 @@ Default FP16 build (`gpu-cuda`) uses **`nvidia-smi` auto-detection** (Blackwell 
 | Directory | Weights at load | Linear / KV at runtime |
 |-----------|-----------------|------------------------|
 | **`gpu-rocm`** | If offline cache (**`<model>.gguf.fp16`**) exists, H2D from **`.fp16bin`**; otherwise **fused row-wise GGUF dequant** → FP16 | hipBLAS GemmEx (Prefill) + custom GEMV (Decode); KV in **F32** |
+| **`gpu-vulkan`** | Same FP16 cache format as above | FP16 GEMV compute shaders (Prefill / Decode); Flash Attention (GLSL); KV in **F32**. No hipBLAS / cuBLAS-class **GEMM** yet |
 | **`gpu-cuda`** | If offline cache (**`<model>.gguf.fp16`**) exists, H2D from **`.fp16bin`**; otherwise **fused row-wise GGUF dequant** → FP16 | FP16 GEMV kernels; KV in **F32** (default) |
 | **`gpu-cuda`** + **`build.polarquant`** | Linear weights stay FP16 (same as above) | KV in **PolarQuant-R** (64 B/head); tile-wise F32 decode during attention |
 | **`gpu-cuda-nvfp4`** | If offline cache (**`<model>.gguf.nvfp4`**, **`FP4_CACHE_VERSION=2`**) exists, H2D from **`.fp4bin`**; otherwise **fused row-wise GGUF dequant** → NVFP4. **`token_embd`** via row-wise FP16 H2D | **`fp4_qwen3_mm`** — prefill / decode both use **CUTLASS NVFP4 GEMM** (**`fp4_gemm_run_cached`**, **`M` padded to 128**). Activations clamped with **`FP4_QUANT_MAX_ABS=1024`** |
 | **`gpu-cuda-nvfp4`** + **`build.polarquant`** | Same as above (NVFP4 only) | Same GEMM linear path; PolarQuant-R KV |
 
-**`gpu-rocm`** / **`gpu-cuda`** (FP16) also spend time on first-run GGUF row dequant. Pre-generate **`<model>.gguf.fp16`** with **`make pack-cache`** (or **`--pack-fp16-cache`**) so later runs show **`Loading FP16 cache from …`**. Use **`--no-fp16-cache`** to force re-dequantization from GGUF every time. On **`gpu-rocm`**, **`make build`** (when **`MODEL`** exists) auto-packs as well.
+**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** (FP16) also spend time on first-run GGUF row dequant. Pre-generate **`<model>.gguf.fp16`** with **`make pack-cache`** (or **`--pack-fp16-cache`**) so later runs show **`Loading FP16 cache from …`**. Use **`--no-fp16-cache`** to force re-dequantization from GGUF every time. On **`gpu-rocm`**, **`make build`** (when **`MODEL`** exists) auto-packs as well.
 
 **`gpu-cuda-nvfp4`** uses CUTLASS **NVFP4** and targets **CUDA 13 + sm_120-class GPUs** (Blackwell / RTX 50). First startup quantizes from GGUF and can take a while. Pre-generate **`<model>.gguf.nvfp4`** with **`make pack-cache`** (or **`--pack-nvfp4-cache`**) so later runs show **`Loading NVFP4 cache from …`**. Use **`--no-nvfp4-cache`** to force re-quantization from GGUF every time.
 
@@ -793,7 +929,7 @@ make build CUDA_GENCODE=arch=compute_89,code=sm_89
 
 ### Offline FP16 cache (`make pack-cache`)
 
-Pre-pack FP16 weights to skip GGUF dequant on every run. Default output: **`<model>.gguf.fp16`** (per-tensor **`.fp16bin`** files + **`manifest`**). Same format for **`gpu-rocm`** and **`gpu-cuda`**.
+Pre-pack FP16 weights to skip GGUF dequant on every run. Default output: **`<model>.gguf.fp16`** (per-tensor **`.fp16bin`** files + **`manifest`**). Same format for **`gpu-rocm`**, **`gpu-vulkan`**, and **`gpu-cuda`**.
 
 **`gpu-cuda`**:
 
@@ -811,7 +947,15 @@ make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
 ```
 
-Direct binary (**`gpu-cuda`** / **`gpu-rocm`** share CLI):
+**`gpu-vulkan`**:
+
+```bash
+cd qwen3-8b/gpu-vulkan
+make pack-cache MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
+make run MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf PROMPT="Hello"
+```
+
+Direct binary (**`gpu-cuda`** / **`gpu-rocm`** / **`gpu-vulkan`** share CLI):
 
 ```bash
 ./qwen3-gpu-cuda ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf --pack-fp16-cache
@@ -929,7 +1073,7 @@ See **`doc/design.md`** (CUDA section) and **`qwen3-8b/gpu-cuda-nvfp4/DEBUG.md`*
 
 ### Benchmark history (`gpu-cuda/Makefile` / `gpu-cuda-nvfp4/Makefile`)
 
-Same idea as **`gpu-rocm`**: **`make log.push`** runs inference, then reads **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) and appends one line to **`BENCH_LOG`** in that directory's Makefile. **`make log`** prints the table.
+**`gpu-cuda/`** / **`gpu-cuda-nvfp4/`** / **`gpu-vulkan/`** follow the same pattern as **`gpu-rocm/`**: **`make log.push`** runs inference, then reads **`BENCH_LOG_FILE`** (default **`/tmp/benchmark.log`**) and appends one line to **`BENCH_LOG`** in that directory's Makefile. **`make log`** prints the table. Column 2 is **`GPU_SM`** from **`nvidia-smi`** (e.g. **`sm_120`**) for CUDA builds; **`gpu-vulkan`** uses the **GPU name from `vulkaninfo`**.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -950,8 +1094,18 @@ make log.push
 make log
 ```
 
+**`BENCH_LOG_FILE` VRAM fields** (after inference): **`vram_total`**, **`vram_device_used`** / **`vram_device_total`** (from **`cudaMemGetInfo`** / **`hipMemGetInfo`**, bytes and **`_mib`**), **`[vram_breakdown]`** section.
+
+- **`gpu-rocm` (FP16)**: FP16 embedding / F32 norm / FP16 linear weights (**`vram_weights_linear`**) / KV / decode activations / prefill batch (includes **`d_scratch_f16`**)
+- **`gpu-vulkan` (FP16)**: FP16 linear weights + KV + activation buffers (simplified breakdown; bench log outputs **`vram_total`** only)
+- **`gpu-cuda` (FP16)**: FP16 embedding / F32 norm / FP16 linear weights (**`vram_weights_linear`**) / KV / decode activations / prefill batch
+- **`gpu-cuda-nvfp4` (NVFP4)**: linear weights in **`vram_weights_fp4`** plus **`vram_fp4_gemm_scratch`** (BF16 activations/output + CUTLASS workspace, etc.)
+
+Makefile **`BENCH_LOG`** history records tok/s only; see **`BENCH_LOG_FILE`** for VRAM breakdown.
+
 One line per entry (pipe-separated): **`timestamp|GPU_SM|hostname|prompt_tokens|gen_tokens|prefill_tps|decode_tps|total_tps`**
 
+- **`gpu-vulkan`**: column 2 from **`vulkaninfo`** (GPU name)
 - **`gpu-cuda`**: column 2 from **`nvidia-smi`** (e.g. **`sm_120`**)
 - **`gpu-cuda-nvfp4`**: column 2 defaults to **`sm_120a`**
 
@@ -959,9 +1113,9 @@ Example NVFP4 entries (132 prompt tokens, RTX 5090): **622.60** / **66.71** / **
 
 ### Source reading
 
-7. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu` / `fa_debug.c` — CUDA FP16 (**`--fa-debug`**, VRAM bench log).  
-8. `qwen3-8b/gpu-cuda-nvfp4/fp4_cache_io.c` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `fp4_verify.cu` — Blackwell NVFP4 (**`FP4_QUANT_MAX_ABS`**, shared **`kernels.cu`**).  
-9. `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md` — NVFP4 anomaly investigation log (baseline **`433319eb31c3c992536afb5c9a3717084ea5d137`**).
+8. `qwen3-8b/gpu-cuda/fp16_cache_io.c` / `main.c` / `kernels.cu` / `polarquant.cu` / `fa_debug.c` — CUDA FP16 (**`--fa-debug`**, VRAM bench log).  
+9. `qwen3-8b/gpu-cuda-nvfp4/fp4_cache_io.c` / `fp4_qwen3.cu` / `fp4_gemm.cu` / `fp4_verify.cu` — Blackwell NVFP4 (**`FP4_QUANT_MAX_ABS`**, shared **`kernels.cu`**).  
+10. `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md` — NVFP4 anomaly investigation log (baseline **`433319eb31c3c992536afb5c9a3717084ea5d137`**).
 
 
 ### Troubleshooting (GPU / XDNA appendix)
@@ -977,9 +1131,9 @@ nvcc --version
 
 If a PTX-only build is very slow, rebuild with `CUDA_GENCODE=arch=compute_XX,code=sm_XX` for your GPU.
 
-### FP16 first startup is slow / cache miss (`gpu-rocm` / `gpu-cuda`)
+### FP16 first startup is slow / cache miss (`gpu-rocm` / `gpu-vulkan` / `gpu-cuda`)
 
-First run dequantizes from GGUF row-by-row. Pre-generate **`<model>.gguf.fp16`** with **`cd gpu-rocm && make pack-cache`** or **`cd gpu-cuda && make pack-cache`** (**`gpu-rocm`**: **`make build`** auto-packs when **`MODEL`** exists). If you see **`Warning: FP16 cache miss for …`**, a **`.fp16bin`** is missing, shapes mismatch, or **`manifest`** is invalid — re-run **`make pack-cache`** or use **`--no-fp16-cache`** to force re-dequantization.
+First run dequantizes from GGUF row-by-row. Pre-generate **`<model>.gguf.fp16`** with **`cd gpu-rocm && make pack-cache`**, **`cd gpu-vulkan && make pack-cache`**, or **`cd gpu-cuda && make pack-cache`** (**`gpu-rocm`**: **`make build`** auto-packs when **`MODEL`** exists). If you see **`Warning: FP16 cache miss for …`**, a **`.fp16bin`** is missing, shapes mismatch, or **`manifest`** is invalid — re-run **`make pack-cache`** or use **`--no-fp16-cache`** to force re-dequantization.
 
 ### NVFP4 first startup is slow / cache miss
 

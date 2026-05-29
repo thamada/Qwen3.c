@@ -1,0 +1,19 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer ABuf { float a[]; };
+layout(set = 0, binding = 1) readonly buffer BBuf { float b[]; };
+
+layout(push_constant) uniform PC {
+    int n;
+    int n_tokens;
+} pc;
+
+void main()
+{
+    int i = int(gl_GlobalInvocationID.x);
+    int total = pc.n * pc.n_tokens;
+    if (i >= total) return;
+    a[i] += b[i];
+}

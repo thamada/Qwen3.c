@@ -1,0 +1,32 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer OutBuf { float o[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; };
+layout(set = 0, binding = 2) readonly buffer WBuf { float w[]; };
+
+layout(push_constant) uniform PC {
+    int n;
+    float eps;
+    int x_off;
+} pc;
+
+shared float ssum[256];
+
+void main()
+{
+    uint lid = gl_LocalInvocationID.x;
+    float local = 0.0;
+    for (int i = int(lid); i < pc.n; i += 256)
+        local += x[pc.x_off + i] * x[pc.x_off + i];
+    ssum[lid] = local;
+    barrier();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (int(lid) < s) ssum[lid] += ssum[lid + uint(s)];
+        barrier();
+    }
+    float ss = inversesqrt(ssum[0] / float(pc.n) + pc.eps);
+    for (int i = int(lid); i < pc.n; i += 256)
+        o[i] = x[pc.x_off + i] * ss * w[i];
+}

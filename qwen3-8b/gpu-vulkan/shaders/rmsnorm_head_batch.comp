@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer VecBuf { float vec[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; };
+
+layout(push_constant) uniform PC {
+    int n_heads;
+    int hd;
+    int n_tokens;
+    float eps;
+} pc;
+
+shared float ssum[256];
+
+void main()
+{
+    int bt = int(gl_WorkGroupID.x);
+    int t = bt / pc.n_heads;
+    int h = bt % pc.n_heads;
+    if (t >= pc.n_tokens) return;
+    uint lid = gl_LocalInvocationID.x;
+    int base = (t * pc.n_heads + h) * pc.hd;
+
+    float local = 0.0;
+    for (int i = int(lid); i < pc.hd; i += 256)
+        local += vec[base + i] * vec[base + i];
+    ssum[lid] = local;
+    barrier();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (int(lid) < s) ssum[lid] += ssum[lid + uint(s)];
+        barrier();
+    }
+    float ss = inversesqrt(ssum[0] / float(pc.hd) + pc.eps);
+    for (int i = int(lid); i < pc.hd; i += 256)
+        vec[base + i] = vec[base + i] * ss * w[i];
+}
