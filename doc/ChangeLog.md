@@ -4,6 +4,23 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-05-29 10:26:34
+
+**GPU 推論 stdout ベンチ行の廃止**（**`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。**`gpu-rocm`** は既に stdout ベンチ行なし。
+
+#### `qwen3-8b/gpu-vulkan/main.c` / `qwen3-8b/gpu-cuda/main.c`
+
+- **`throughput_summary`**: stdout の **`--- benchmark ---`** / **`prefill_tps:` / `decode_tps:` / `total_tps:`** 行を廃止（**`gpu-rocm`** と同形式）。stderr の **`--- throughput ---`** 要約と **`BENCH_LOG_FILE`** への key=value 書き出しは維持。
+- **`gpu-cuda-nvfp4`** は **`../gpu-cuda/main.c`** を共有参照のため同変更が適用される。
+
+#### ドキュメント
+
+**`doc/design.md`**: ファイル一覧（**`gpu-cuda/main.c`**）・**`make log.push`** 節・実行時挙動（CUDA stdout ベンチ行の記述削除）を上記に同期。
+
+**`README.md`** / **`README.en.md`**: ROCm 節のスループット説明・クイックリファレンス（CUDA **`make log.push`** が stdout パースする旨の記述削除）を上記に同期。
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 09:45:10
 
 **`gpu-vulkan` 長プロンプトベンチ実測の文書化**（**`make log.push`**）**と `GPU_VK` パース修正**。
