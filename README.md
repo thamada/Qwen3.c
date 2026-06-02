@@ -568,7 +568,7 @@ thinking 対応 GGUF をそのまま動かすと、**reasoning テキストが�
 
 ### 必要なもの（ROCm）
 
-AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。`GPU_ARCH`（`hipcc --offload-arch`）は **`rocminfo` から自動検出**されます。**`fp16_cache_io.o`** リンクのため **g++ / libstdc++-dev** も必要です。
+AMD GPU と ROCm が必要です。`Makefile` は既定で ROCm を `/opt/rocm` にあるものとして扱います。**`rocminfo` の `Name: gfx*`** を **`GPU_ARCH_DETECTED`** として取得し、**`hipcc --offload-arch`** には **`HIP_OFFLOAD_ARCH`** を使います。**Ryzen AI 5 340（Radeon 840M / `gfx1152`）** など **rocBLAS が `gfx1152` 用 Tensile を同梱していない GPU** では Makefile が **`gfx1151` ビルド + `HSA_OVERRIDE_GFX_VERSION=11.5.1`** を自動適用します（**ROCm を 7.2.1 に上げるだけでは直らない**場合がある — 下記 **「Ryzen AI / gfx1152 と rocBLAS」**）。**`fp16_cache_io.o`** リンクのため **g++ / libstdc++-dev** も必要です。
 
 ```bash
 sudo apt install -y g++ libstdc++-dev   # C++ ヘッダ／libstdc++ リンク用
@@ -585,11 +585,12 @@ make -C gpu-rocm detect-gpu-arch   # 例: Detected GPU arch: gfx1100
 
 ### GPU_ARCH（自動検出）
 
-`gpu-rocm/Makefile` は、ビルド前に `$(ROCM)/bin/rocminfo` から最初の GPU エージェント名（`gfx*`）を **`GPU_ARCH` として自動検出**します。成功すると次のように表示されます:
+`gpu-rocm/Makefile` は、ビルド前に `$(ROCM)/bin/rocminfo` から最初の GPU エージェント名（`gfx*`）を **`GPU_ARCH_DETECTED`** として取得します（上書き変数は **`GPU_ARCH`**）。成功すると次のように表示されます:
 
 ```text
 ===============================================
   Detected GPU arch: gfx1100
+  Build offload arch: gfx1100
 ===============================================
 ```
 
@@ -599,6 +600,45 @@ make -C gpu-rocm detect-gpu-arch   # 例: Detected GPU arch: gfx1100
 cd qwen3-8b/gpu-rocm
 make build GPU_ARCH=gfx1100
 ```
+
+### Ryzen AI / gfx1152 と rocBLAS（環境依存）
+
+**AMD Ryzen AI 系 APU** の内蔵 Radeon（RDNA 3.5）のうち、**`gfx1152`**（例: **Ryzen AI 5 340 + Radeon 840M**）では、Prefill 線形層の **hipBLAS → rocBLAS** が次の理由で失敗しやすいです。
+
+| 項目 | 内容 |
+|------|------|
+| 典型エラー | **`rocBLAS error: Cannot read … TensileLibrary.dat … for GPU arch : gfx1152`**（利用可能リストに **`gfx1150` / `gfx1151` のみ**） |
+| 本質 | 公式 **`/opt/rocm/lib/rocblas/library/`** に **`TensileLibrary_lazy_gfx1152.dat`** が無い（**ROCm 7.1.x / 7.2.x の apt 同梱時点**） |
+| ROCm 7.2.1 へ上げる必要 | **この GPU 専用の必須条件ではない**。上げても **`gfx1152` Tensile が同梱されない**場合がある |
+| 本リポジトリの対処 | **`HIP_OFFLOAD_ARCH=gfx1151`** + **`HSA_OVERRIDE_GFX_VERSION=11.5.1`**（**`make build` / `make run`** で自動） |
+
+**`gfx1152` / `gfx1153` 検出時のビルドログ例:**
+
+```text
+  Detected GPU arch: gfx1152
+  Build offload arch: gfx1151
+  HSA_OVERRIDE_GFX_VERSION: 11.5.1
+```
+
+**成功時の起動ログ例**（オーバーライド有効時、`gcnArchName` は **`gfx1151`** と表示）:
+
+```text
+ROCm HIP device 0: AMD Radeon 840M Graphics (gcnArchName: gfx1151)
+Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)
+```
+
+**参考（他の Ryzen AI 世代）:** Ryzen AI 9 HX 370 等は **`gfx1150`**（**`TensileLibrary_lazy_gfx1150.dat`** 同梱）のことが多く、通常はオーバーライド不要です。
+
+**確認:**
+
+```bash
+ls /opt/rocm/lib/rocblas/library/TensileLibrary_lazy_gfx115*.dat
+cd qwen3-8b/gpu-rocm && make detect-gpu-arch
+```
+
+**避けるべき例:** **`gfx1151` の `.dat` を `gfx1152` 名でコピー／symlink だけ** → **`hipBLAS error: 6`**。**`HSA_OVERRIDE` のみ**でバイナリが **`gfx1152` offload** のまま → **Segmentation fault**。
+
+詳細は [`doc/design.md`](doc/design.md) の **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」** を参照。
 
 ### ビルド
 
@@ -1366,14 +1406,34 @@ cd qwen3-8b/gpu-rocm
 make build ROCM=/path/to/rocm
 ```
 
+### `rocBLAS error: … for GPU arch : gfx1152`（Ryzen AI 5 340 等）
+
+rocBLAS に **`gfx1152` 用 Tensile が無い**状態です。**ROCm のマイナーアップのみ**では直らないことがあります。
+
+```bash
+cd qwen3-8b/gpu-rocm
+make clean build && make run
+```
+
+ビルドログで **`Build offload arch: gfx1151`** と **`HSA_OVERRIDE_GFX_VERSION: 11.5.1`** が出ているか確認してください。詳細は上記 **「Ryzen AI / gfx1152 と rocBLAS」** と [`doc/design.md`](doc/design.md)。
+
+### `hipBLAS error: 6`（Prefill 0%）
+
+**`HIPBLAS_STATUS_INTERNAL_ERROR`**。**`gfx1152` 名での rocBLAS ライブラリ symlink のみ**、または **HSA オーバーライドと `--offload-arch` の不一致**が多いです。**`make clean build`** 後 **`make run`**（Makefile の自動設定に任せる）。
+
+### Segmentation fault（Prefill 直後・`gcnArchName: gfx1151` 表示）
+
+**`HSA_OVERRIDE_GFX_VERSION=11.5.1` だけ**設定し、バイナリが **`gfx1152` offload** のままのときに起きやすいです。**`make clean build`** で **`Build offload arch: gfx1151`** を確認してから **`make run`**。
+
 ### GPU_ARCH が合わない / 検出に失敗する
 
-`GPU_ARCH` は実機の GPU ISA に合わせる必要があります。通常は `rocminfo` から自動検出されますが、検出に失敗したり別の GPU 向けにビルドしたい場合は手動指定してください。
+**`GPU_ARCH_DETECTED`** は実機の GPU ISA です。通常は `rocminfo` から自動検出されます。**`gfx1152` 実機**では Makefile が内部で **`gfx1151` offload** にマップします。検出失敗時や別 GPU 向けビルドでは手動指定してください。
 
 ```bash
 rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
 cd qwen3-8b/gpu-rocm
 make build GPU_ARCH=gfx1100
+make detect-gpu-arch   # Detected / Build offload を表示
 ```
 
 ### ROCm Prefill が遅い（~30 tok/s 程度）

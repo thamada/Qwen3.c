@@ -563,7 +563,7 @@ What follows is a technical note for anyone curious about GPU speed comparisons.
 
 ### Requirements (ROCm)
 
-You need an **AMD GPU** and **ROCm**. The Makefile assumes ROCm at **`/opt/rocm`**. **`GPU_ARCH`** (`hipcc --offload-arch`) is **auto-detected from `rocminfo`**. Linking **`fp16_cache_io.o`** requires **g++ / libstdc++-dev**.
+You need an **AMD GPU** and **ROCm**. The Makefile assumes ROCm at **`/opt/rocm`**. **`rocminfo`** reports **`Name: gfx*`** as **`GPU_ARCH_DETECTED`**; **`hipcc --offload-arch`** uses **`HIP_OFFLOAD_ARCH`**. On **`gfx1152`** / **`gfx1153`** (e.g. **Ryzen AI 5 340 + Radeon 840M**), official rocBLAS often ships **no `gfx1152` Tensile libraries** — the Makefile applies **`gfx1151` build + `HSA_OVERRIDE_GFX_VERSION=11.5.1`** automatically (**upgrading to ROCm 7.2.1 alone may not fix this** — see **“Ryzen AI / gfx1152 and rocBLAS”** below). Linking **`fp16_cache_io.o`** requires **g++ / libstdc++-dev**.
 
 ```bash
 sudo apt install -y g++ libstdc++-dev
@@ -580,11 +580,12 @@ If `rocminfo` reports no GPU, set **`GPU_ARCH=gfx1100`** (or your ISA) at build 
 
 ### `GPU_ARCH` (auto-detect)
 
-`gpu-rocm/Makefile` **auto-detects** the first GPU agent name (`gfx*`) from **`$(ROCM)/bin/rocminfo`** as **`GPU_ARCH`** before building. On success you will see:
+`gpu-rocm/Makefile` reads the first GPU agent name (`gfx*`) from **`$(ROCM)/bin/rocminfo`** as **`GPU_ARCH_DETECTED`** (override via **`GPU_ARCH`**). On success you will see:
 
 ```text
 ===============================================
   Detected GPU arch: gfx1100
+  Build offload arch: gfx1100
 ===============================================
 ```
 
@@ -594,6 +595,45 @@ To override manually:
 cd qwen3-8b/gpu-rocm
 make build GPU_ARCH=gfx1100
 ```
+
+### Ryzen AI / gfx1152 and rocBLAS (environment-specific)
+
+On **AMD Ryzen AI APUs** with integrated Radeon (**RDNA 3.5**), **`gfx1152`** (e.g. **Ryzen AI 5 340 + Radeon 840M**) often fails at Prefill linear layers because **hipBLAS → rocBLAS** cannot load Tensile kernels for that arch.
+
+| Topic | Detail |
+|-------|--------|
+| Typical error | **`rocBLAS error: Cannot read … TensileLibrary.dat … for GPU arch : gfx1152`** (only **`gfx1150` / `gfx1151`** listed as available) |
+| Root cause | No **`TensileLibrary_lazy_gfx1152.dat`** under official **`/opt/rocm/lib/rocblas/library/`** (as of **ROCm 7.1.x / 7.2.x** apt packages) |
+| Is ROCm 7.2.1 required? | **Not for this GPU specifically.** Upgrading may still leave **`gfx1152`** Tensile unpackaged |
+| This repo | **`HIP_OFFLOAD_ARCH=gfx1151`** + **`HSA_OVERRIDE_GFX_VERSION=11.5.1`** (auto on **`make build` / `make run`**) |
+
+**Build log when `gfx1152` / `gfx1153` is detected:**
+
+```text
+  Detected GPU arch: gfx1152
+  Build offload arch: gfx1151
+  HSA_OVERRIDE_GFX_VERSION: 11.5.1
+```
+
+**Successful startup (override active; `gcnArchName` may show **`gfx1151`**):**
+
+```text
+ROCm HIP device 0: AMD Radeon 840M Graphics (gcnArchName: gfx1151)
+Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)
+```
+
+**Other Ryzen AI SKUs:** e.g. Ryzen AI 9 HX 370 often reports **`gfx1150`** (**`TensileLibrary_lazy_gfx1150.dat`** bundled) — override usually not needed.
+
+**Check:**
+
+```bash
+ls /opt/rocm/lib/rocblas/library/TensileLibrary_lazy_gfx115*.dat
+cd qwen3-8b/gpu-rocm && make detect-gpu-arch
+```
+
+**Avoid:** **symlink/copy `gfx1151` libs to `gfx1152` names only** → **`hipBLAS error: 6`**. **`HSA_OVERRIDE` only** with binary still built for **`gfx1152` offload** → **segmentation fault**.
+
+See [`doc/design.md`](doc/design.md), section **“Environment: gfx1152 (Ryzen AI / Radeon 840M) and rocBLAS”** (Japanese heading in source).
 
 ### Build
 
@@ -1213,14 +1253,34 @@ cd qwen3-8b/gpu-rocm
 make build ROCM=/path/to/rocm
 ```
 
+### `rocBLAS error: … for GPU arch : gfx1152` (Ryzen AI 5 340, etc.)
+
+rocBLAS has **no `gfx1152` Tensile bundle**. **A ROCm minor upgrade alone** may not fix this.
+
+```bash
+cd qwen3-8b/gpu-rocm
+make clean build && make run
+```
+
+Confirm build log shows **`Build offload arch: gfx1151`** and **`HSA_OVERRIDE_GFX_VERSION: 11.5.1`**. See **“Ryzen AI / gfx1152 and rocBLAS”** above and [`doc/design.md`](doc/design.md).
+
+### `hipBLAS error: 6` (Prefill at 0%)
+
+**`HIPBLAS_STATUS_INTERNAL_ERROR`**. Often caused by **symlinking `gfx1151` rocBLAS files to `gfx1152` names only**, or **HSA override without matching `--offload-arch`**. Use **`make clean build`** then **`make run`** (Makefile auto settings).
+
+### Segmentation fault (right after Prefill starts; log shows `gcnArchName: gfx1151`)
+
+Common when **`HSA_OVERRIDE_GFX_VERSION=11.5.1`** is set but the binary was built with **`gfx1152` offload**. **`make clean build`** — verify **`Build offload arch: gfx1151`** — then **`make run`**.
+
 ### Wrong `GPU_ARCH` / detection failed
 
-Must match the GPU ISA. Normally **`GPU_ARCH`** is auto-detected from `rocminfo`; if detection fails or you need a different target, set it manually:
+**`GPU_ARCH_DETECTED`** should match hardware. Normally auto-detected from `rocminfo`. On **`gfx1152`** hardware the Makefile maps to **`gfx1151` offload** internally. Override manually if needed:
 
 ```bash
 rocminfo | awk '/^  Name:/ { n=$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }'
 cd qwen3-8b/gpu-rocm
 make build GPU_ARCH=gfx1100
+make detect-gpu-arch
 ```
 
 ### ROCm Prefill is slow (~30 tok/s)

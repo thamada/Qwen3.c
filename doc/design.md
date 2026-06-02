@@ -49,7 +49,7 @@
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value ベンチ＋**`[vram_breakdown]`**（**`GpuVramProfile`** / **`model_vram_profile`**。**`make log.push`** がパース。推論区間のみ）。 |
 | `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-cuda/`** と同 API。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH`** は **`$(ROCM)/bin/rocminfo`** の最初の **`gfx*`** を自動検出（**`detect-gpu-arch`**）。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ（pack-cache 省略）。**`pack-cache`**: **`--pack-fp16-cache`**。**`make log`** / **`make log.push`** でベンチマーク履歴（**`log.push`** は **`BENCH_LOG_FILE`** から **`prompt_tokens=`** 等を読み取り **`BENCH_LOG`** に追記）。**`BENCH_LOG_FILE`** 既定 **`/tmp/benchmark.log`**。**`make wmma`** / **`make wmma-probe`** で WMMA 利用状況確認（**`scripts/check_wmma.sh`**）。**`wmma-probe`** は **`$(HIP_CFLAGS)`** + **`WMMA_PROBE_RDNA_FLAG`**（**`gfx11*` / `gfx12*`**）。**`clean`** は **`qwen3-rocm`**・**`wmma-probe`**・**`main.o`**・**`fp16_cache_io.o`** を削除。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH_DETECTED`** は **`rocminfo`** の最初の **`gfx*`**。**`gfx1152` / `gfx1153`** では rocBLAS 未同梱のため **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VERSION=11.5.1`**（**`make run`** で自動 export）。**`detect-gpu-arch`**。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ。**`pack-cache`** / **`make log`** / **`make log.push`** / **`make wmma`**。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。 |
 | `qwen3-8b/gpu-rocm/wmma_probe.c` | RDNA **gfx11 / gfx12** 向け **WMMA 校正用**最小 HIP プローブ。**gfx11**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`**。**gfx12**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`**。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
 | `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（RDNA **gfx11 / gfx12**）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3 --kernel-trace`** カーネル trace。**`count_wmma_in_obj`**: HIP バイナリは **`--offloading`** で AMDGPU コードを抽出して **`v_wmma`** をカウント。 |
 | `qwen3-8b/gpu-vulkan/main.c` | Vulkan compute 推論ホスト（**`gpu-cuda/main.c`** ベース）。GGUF・トークナイザ・FP16 重み H2D・生成ループ。**`gpu.h`** 経由で **`vk_kernels.c`** に forward を委譲。推論終了時 **`BENCH_LOG_FILE`** へ key=value ベンチ + 簡易 **`[vram_breakdown]`**（**`write_benchmark_log`**。**`vram_weights_linear` は未出力**）。 |
@@ -94,7 +94,7 @@
 
 ### 生成バイナリと Make ターゲット（`qwen3-8b/`）
 
-**GGUF 取得**は **`qwen3-8b/`** の **`make model`**。**ビルド・実行**は各サブディレクトリに移動して **`make build`** / **`make run`** する。ROCm 版の **`GPU_ARCH`** は **`gpu-rocm/Makefile`** が **`rocminfo`** から自動検出。GGUF 未取得時は先に **`make model`**（詳細は **「モデル参照」**）。
+**GGUF 取得**は **`qwen3-8b/`** の **`make model`**。**ビルド・実行**は各サブディレクトリに移動して **`make build`** / **`make run`** する。ROCm 版の ISA は **`gpu-rocm/Makefile`** が **`rocminfo`** から **`GPU_ARCH_DETECTED`** を取得（**`gfx1152` 等は `gfx1151` + HSA オーバーライド** — **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**）。GGUF 未取得時は先に **`make model`**（詳細は **「モデル参照」**）。
 
 #### トップ `qwen3-8b/Makefile`
 
@@ -165,7 +165,9 @@ OMP_NUM_THREADS=8 ./qwen3-cpu-blas ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "H
 | `LDFLAGS` | リンクフラグ・ライブラリ | `-lm` |
 | `ROCM` | ROCm ルート（**`gpu-rocm/`**） | `/opt/rocm` |
 | `HIPCC` | HIP コンパイラ | `$(ROCM)/bin/hipcc` |
-| `GPU_ARCH` | **`hipcc --offload-arch=`**（**`gpu-rocm/Makefile`** で **`rocminfo` から自動検出**。上書き例: **`gfx1100`**） | （自動。未検出時はビルド失敗） |
+| `GPU_ARCH` / `GPU_ARCH_DETECTED` | **`rocminfo` の `Name: gfx*`**（検出値は **`GPU_ARCH_DETECTED`**。**`GPU_ARCH`** は上書き可） | （自動。未検出時はビルド失敗） |
+| `HIP_OFFLOAD_ARCH` | **`hipcc --offload-arch=`** の実際の値（**`gfx1152`/`gfx1153` 時は `gfx1151` にマップ**） | 検出 ISA または **`gfx1151`** |
+| `HSA_OVERRIDE_GFX_VERSION` | **`gfx1152`/`gfx1153` 実機で rocBLAS が **`gfx1151` 用 Tensile** を選ぶためのランタイム上書き（**`make run`** が **`11.5.1`** を export） | （該当 GPU のみ設定） |
 | `XDNA_INCS` | `<drm/drm.h>` が標準外にあるときの `-I…`（**`xdna2/`** / **`xdna2-bfp16/`**） | 未定義（空で可） |
 | `PROMPT` | ユーザプロンプト（**`make run`**） | `Hello, how are you?` |
 
@@ -202,7 +204,9 @@ make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 
 ### ROCm
 
-**`GPU_ARCH`** はビルド前に **`gpu-rocm/Makefile`** が **`$(ROCM)/bin/rocminfo`** から自動検出する（**`make -C gpu-rocm detect-gpu-arch`** で確認）。検出に失敗する環境や別 ISA 向けビルドでは **`GPU_ARCH=gfx1100`** 等を明示する。ビルドは **`-lhipblas -lrocblas -lstdc++`** をリンクする（Prefill 線形層の **hipBLAS GemmEx** 用。**`fp16_cache_io.o`** のため **g++ / libstdc++-dev** が必要）。**`make build`**: **`qwen3-rocm`** + **`$(MODEL).fp16/manifest`**（**`MODEL`** が存在する場合）。**`make run`**: バイナリのみ（pack-cache をスキップ）。**`make pack-cache`**: オフライン FP16 キャッシュを明示生成。
+**`GPU_ARCH_DETECTED`** はビルド前に **`gpu-rocm/Makefile`** が **`$(ROCM)/bin/rocminfo`** から自動検出する（**`make -C gpu-rocm detect-gpu-arch`** で **検出 ISA** と **ビルド offload ISA** を表示）。検出に失敗する環境や別 ISA 向けビルドでは **`GPU_ARCH=gfx1100`** 等を明示する。ビルドは **`-lhipblas -lrocblas -lstdc++`** をリンクする（Prefill 線形層の **hipBLAS GemmEx** 用。**`fp16_cache_io.o`** のため **g++ / libstdc++-dev** が必要）。**`make build`**: **`qwen3-rocm`** + **`$(MODEL).fp16/manifest`**（**`MODEL`** が存在する場合）。**`make run`**: バイナリのみ（pack-cache をスキップ）。**`make pack-cache`**: オフライン FP16 キャッシュを明示生成。
+
+**Ryzen AI 5 340（Radeon 840M / `gfx1152`）** など **rocBLAS が `gfx1152` 用 Tensile を同梱していない GPU** では、Makefile が **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VERSION=11.5.1`** を自動適用する（詳細は直後の専用節）。**ROCm を 7.2.1 に上げること自体はこの GPU 専用の必須条件ではない**（7.1.x でも同様のワークアラウンドで動作しうる）。
 
 ```bash
 cd qwen3-8b/gpu-rocm
@@ -225,6 +229,113 @@ make wmma                           # build + wmma-probe + check_wmma.sh（MODEL
 make wmma WMMA_SKIP_RUN=1           # 静的チェックのみ（MODEL 不要）
 make wmma WMMA_SKIP_ROCPROF=0       # rocprofv3 カーネル ISA も試行
 make wmma-probe                     # 校正用 wmma-probe のみビルド
+```
+
+#### 環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS
+
+本節は **AMD Ryzen AI 系 APU の内蔵 Radeon（RDNA 3.5）** で **`qwen3-rocm`** を動かす際の、**ROCm / rocBLAS と実機 ISA のずれ**をまとめる。検証環境の一例は **Ryzen AI 5 340 + Radeon 840M（`gcnArchName: gfx1152`）**。
+
+##### ハードウェアと ISA の対応（参考）
+
+| 製品例 | 内蔵 GPU | `rocminfo` の `Name`（代表） |
+|--------|----------|------------------------------|
+| Ryzen AI 9 HX 370 等 | Radeon 890M 系 | **`gfx1150`**（Strix Point） |
+| 一部 Halo 系 | — | **`gfx1151`** |
+| **Ryzen AI 5 340** 等 | **Radeon 840M** | **`gfx1152`**（Krackan Point） |
+| 今後の APU | — | **`gfx1153`**（同様に rocBLAS 未同梱の可能性） |
+
+**`qwen3-rocm` の自前 HIP カーネル**（Attention・Norm・GEMV 等）は **`hipcc --offload-arch=`** でコンパイルされる。**Prefill の線形層 GEMM** だけは **hipBLAS `GemmEx` → rocBLAS（Tensile 事前ビルドカーネル）** に依存する。この二系統の「アーキテクチャの見え方」がずれると、モデルロード後・Prefill 0% で落ちる。
+
+##### 典型エラー（ROCm 7.1.x / 7.2.x 共通）
+
+Prefill 開始直後（**`Prefill linear: hipBLAS GemmEx`** のあと）に次が出て **`Aborted (core dumped)`** することがある。
+
+```text
+rocBLAS error: Cannot read /opt/rocm/lib/rocblas/library/TensileLibrary.dat:
+  No such file or directory for GPU arch : gfx1152
+ List of available TensileLibrary Files :
+  ... TensileLibrary_lazy_gfx1150.dat
+  ... TensileLibrary_lazy_gfx1151.dat
+  （gfx1152 はリストに無い）
+```
+
+**原因の整理:**
+
+| 層 | 内容 |
+|----|------|
+| 直接原因 | **`/opt/rocm/lib/rocblas/library/`** に **`TensileLibrary_lazy_gfx1152.dat`**（および関連 **`Kernels.so-000-gfx1152.hsaco`** 等）が **公式 DEB に無い** |
+| トリガ | Prefill 線形層の初回 **`hipblasGemmEx`** が rocBLAS に GPU arch **`gfx1152`** を渡す |
+| 本リポジトリ | **`main.c` のバグではない**（重み H2D・トークナイズは成功しうる） |
+| ROCm バージョン | **7.1.1 → 7.2.1 へ上げても**（2026-06 時点の apt 同梱では）**`gfx1152` 用 Tensile は依然未収録**。上げただけでは直らない |
+
+AMD 側では **`gfx1152` / `gfx1153` の rocBLAS 同梱**が開発中（[ROCm/TheRock#2310](https://github.com/ROCm/TheRock/issues/2310) 等）。将来 **`TensileLibrary_lazy_gfx1152.dat`** が入った ROCm では、下記ワークアラウンドを外せる可能性がある。
+
+##### Makefile の自動ワークアラウンド（`gpu-rocm/Makefile`）
+
+**`GPU_ARCH_DETECTED`** が **`gfx1152`** または **`gfx1153`** のとき:
+
+| 変数 | 値 | 役割 |
+|------|-----|------|
+| **`HIP_OFFLOAD_ARCH`** | **`gfx1151`** | **`hipcc --offload-arch=`** — 自前 HIP カーネルを **同梱されている最寄り ISA** でコンパイル |
+| **`HSA_OVERRIDE_GFX_VERSION`** | **`11.5.1`** | ランタイムで HSA が GPU を **`gfx1151`** として報告し、rocBLAS が **`TensileLibrary_lazy_gfx1151.dat`** を選択 |
+| **`RUN_ENV`** | 上記を **`make run`** / **`log.push`** 等に付与 | 手動 export を忘れないため |
+
+**`make build`** / **`make detect-gpu-arch`** のログ例:
+
+```text
+  Detected GPU arch: gfx1152
+  Build offload arch: gfx1151
+  HSA_OVERRIDE_GFX_VERSION: 11.5.1
+```
+
+**`make run`** 成功時の起動ログ例（Ryzen AI 5 340）:
+
+```text
+ROCm HIP device 0: AMD Radeon 840M Graphics (gcnArchName: gfx1151)
+Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)
+Prefill complete: 25 tokens in ~1.9s (~13 tok/s)   # 短プロンプト・環境依存
+```
+
+##### ROCm 7.2.1 へのアップグレードは必須か
+
+**いいえ。** 本問題は **「ROCm が古い」** より **「rocBLAS の同梱アーキテクチャ一覧に `gfx1152` が無い」** ことが本質である。
+
+- **7.2.1 に上げる利点**: バグ修正・他 GPU 向け更新・ツールチェーン新しさ（任意）
+- **7.2.1 だけでは不十分**: **`gfx1150` / `gfx1151`** の lazy Tensile のみ同梱という状態は 7.1.1 でも 7.2.1 でも同様
+- **本リポジトリで実際に効いた対処**: **`HIP_OFFLOAD_ARCH=gfx1151` + `HSA_OVERRIDE_GFX_VERSION=11.5.1`**（Makefile 自動化）
+
+##### 避けるべき対処（検証で失敗した例）
+
+| 対処 | 結果 |
+|------|------|
+| **`gfx1151` の `.dat` / `.hsaco` を `gfx1152` 名でコピー／シンボリックリンクのみ** | Tensile の読み込みは進むが **`hipBLAS error: 6`**（**`HIPBLAS_STATUS_INTERNAL_ERROR`**）になりうる |
+| **`HSA_OVERRIDE_GFX_VERSION=11.5.1` のみ**（バイナリは **`--offload-arch=gfx1152`** のまま） | **Segmentation fault**（自前カーネル ISA とランタイム報告の不一致） |
+| **別 ISA への無根拠な `HSA_OVERRIDE`**（例: **`11.0.2`** で **`gfx1102` 扱い） | 動く報告はあるが **非推奨**（本プロジェクトでは **RDNA 3.5 最寄りの `gfx1151`** を採用） |
+
+##### 手動での再現・上書き
+
+Makefile を使わない場合の最小セット:
+
+```bash
+cd qwen3-8b/gpu-rocm
+make clean build GPU_ARCH=gfx1152   # 内部で HIP_OFFLOAD_ARCH=gfx1151 になる
+export HSA_OVERRIDE_GFX_VERSION=11.5.1
+./qwen3-rocm ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "Hello" -n 16
+```
+
+**`rocminfo`** で **`gfx1150`** が報告される機種（例: Ryzen AI 9 HX 370）では、通常 **オーバーライド不要**（**`TensileLibrary_lazy_gfx1150.dat`** が同梱されている前提）。
+
+##### 確認コマンド
+
+```bash
+# 検出 ISA
+/opt/rocm/bin/rocminfo | awk '/^  Name:/ { print }' | head -5
+
+# rocBLAS が同梱する gfx115x Tensile（gfx1152 が無いことを確認）
+ls /opt/rocm/lib/rocblas/library/TensileLibrary_lazy_gfx115*.dat
+
+# 本リポジトリの検出・マップ
+cd qwen3-8b/gpu-rocm && make detect-gpu-arch
 ```
 
 起動時に **`Prefill linear: hipBLAS GemmEx (llama.cpp cublas path)`** が出れば Prefill 線形層は hipBLAS 経路が有効。Prefill / Decode の分離と 3 段階の改善経緯は **「ROCm Prefill 高速化の詳細（3 段階）」** を参照。
@@ -1113,7 +1224,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 ## 制約・既知の制限
 
 - **CPU 版**: IQ 混在 8B は計算量が大きく、**実用的な速度は期待しにくい**。OpenMP はアルゴリズム忠実なまま並列化するが、帯域 bound のため環境次第では伸びが限定的な場合がある。**`cpu-blas`** は F32 経路の OpenBLAS 化に加え量子化 GEMV を **Q8_K + 全型 AVX2 整数内積**（層内 Q8 共有）に置き換え、**RoPE キャッシュ**・**prefill LM スキップ**・**greedy `mm_argmax_row`** でオーバーヘッドを削るため **`cpu-multicore` より速くなることが多い**。**`-ffast-math`** を付けると IQ / Q8_K 量子化で出力が壊れる。**`-march=native`** は **AVX2/F16C** 等を有効化（移植性より当該 CPU 向け最適化）。
-- **ROCm 版**: AMD GPU・ROCm・**`hipcc`**・**g++ / libstdc++-dev`**（**`fp16_cache_io.o`** リンク用）。**Prefill** 線形層は **hipBLAS / rocBLAS**（**`-lhipblas -lrocblas -lstdc++`**）。重み H2D は **オフライン FP16 キャッシュ**または **GGUF 行単位融合逆量子化**（**`make pack-cache`** / **`make build`** で事前 pack 可）。通常は **`rocminfo` による `GPU_ARCH` 自動検出**だが、検出失敗時やクロスビルド時は手動 **`GPU_ARCH`** が必要。**Prefill Attention** の **`attn_flash_prefill_kernel`** は **`FA_BR=32`** 固定（gfx1100 等で 64 だと shared memory 65 KiB 上限超過）。Prefill 高速化の詳細は **「ROCm Prefill 高速化の詳細（3 段階）」**。ベンチは **`BENCH_LOG_FILE`**（**`make log.push`** が読取。VRAM 内訳は **`[vram_breakdown]`** / **`model_vram_profile`**）。
+- **ROCm 版**: AMD GPU・ROCm・**`hipcc`**・**g++ / libstdc++-dev`**（**`fp16_cache_io.o`** リンク用）。**Prefill** 線形層は **hipBLAS / rocBLAS**（**`-lhipblas -lrocblas -lstdc++`**）。重み H2D は **オフライン FP16 キャッシュ**または **GGUF 行単位融合逆量子化**（**`make pack-cache`** / **`make build`** で事前 pack 可）。通常は **`rocminfo` による `GPU_ARCH_DETECTED` 自動検出**だが、検出失敗時やクロスビルド時は手動 **`GPU_ARCH`** が必要。**`gfx1152` / `gfx1153`**（例: **Ryzen AI 5 340 / Radeon 840M**）では **rocBLAS に公式 `gfx1152` Tensile が無い**ため Makefile が **`gfx1151` ビルド + `HSA_OVERRIDE_GFX_VERSION=11.5.1`** を適用（**ROCm 7.2.1 へ上げるだけでは解決しない** — **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**）。**Prefill Attention** の **`attn_flash_prefill_kernel`** は **`FA_BR=32`** 固定（gfx1100 等で 64 だと shared memory 65 KiB 上限超過）。Prefill 高速化の詳細は **「ROCm Prefill 高速化の詳細（3 段階）」**。ベンチは **`BENCH_LOG_FILE`**（**`make log.push`** が読取。VRAM 内訳は **`[vram_breakdown]`** / **`model_vram_profile`**）。
 - **CUDA 版（`qwen3-gpu-cuda` / `qwen3-gpu-cuda-nvfp4`）**: NVIDIA GPU・**`nvcc`**・**`libcudart`**。**`gpu-cuda/`** または **`gpu-cuda-nvfp4/`** で単体ビルド。**`gpu-cuda`** は **`nvidia-smi`** で **`CUDA_GENCODE`** / **`FA_BR`** を自動選択（Blackwell **12.x → `sm_120` + FA_BR=32**）。**PTX `compute_86` JIT** は Blackwell 等で推論が壊れるため非推奨。**Blackwell NVFP4** は **`gpu-cuda-nvfp4`**（**CUDA 13**・CUTLASS・**`sm_120a`**）。**`build.polarquant`** は KV のみ PolarQuant-R（**`gpu-cuda`** または **`gpu-cuda-nvfp4`**、任意 GPU 可／NVFP4 併用可）。ベンチは **`BENCH_LOG_FILE`**（**`make log.push`** が読取。VRAM 内訳は **`[vram_breakdown]`**）。**`gpu-cuda-nvfp4/third_party/cutlass`** と **`fp4_verify`** は clone／ビルド生成物で常時同梱されない。**`gpu-cuda-nvfp4`** では線形重みは NVFP4 のみ VRAM に載り、**`gpu-cuda` 比で線形 FP16 分（8B 級で約 15 GiB 相当）を節約**できる（代わりに **`token_embd`** は FP16 のまま）。
 - **XDNA2 版（`qwen3-xdna2`）**: 恒久の全レイヤー **BF16 重み複製は行わない**。**mmap + 単一 GEMV 用 BF16 スクラッチ**（および `scratch_f32`）であり、代表的 8B 級 IQ 量子化モデルでも **`main-omp.c` に近い「GGUF を載せつつ増分バッファ」**になる（スクラッチの最大要素数は **`output.weight`** クラスの巨大行列にひもづき、VRAM／DRAM の余裕が依然必要になる場合がある）。変換済み GGUF でない限りロード済みモデルサイズより **桁違いの常駐 BF16 が乗らない**。NPU 本線には **MLIR-AIE / IRON** が生成した制御コード（`XDNA_GEMV_DIR`）。未配置時は OpenMP CPU フォールバック。`/dev/accel/accel0` は `render`。**推論レイテンシは GEMV のたびフル復号するため増えうる**。
 - **テキストのみ**: Vision・マルチモーダル入力は未対応。
@@ -1173,7 +1284,10 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | **ROCm Prefill が遅い（~30 tok/s 程度）** | 古いバイナリ・hipBLAS 未リンク | 起動ログに **`Prefill linear: hipBLAS GemmEx`** があるか確認。**`make -C gpu-rocm clean build`**。詳細は **「ROCm Prefill 高速化の詳細（3 段階）」** |
 | **`make wmma` が FAIL** | **`qwen3-rocm` に WMMA 命令**・hipBLAS 経路未報告・**`wmma-probe` 校正失敗**（**gfx11/gfx12** で probe に **`v_wmma` 無し**） | **`make -C gpu-rocm wmma WMMA_SKIP_RUN=1`** で静的のみ確認。**`llvm-objdump`** パス（**`LLVM_OBJDUMP=`**）。MODEL 未配置時は **`WMMA_SKIP_RUN=1`**。実行時 ISA は **`WMMA_SKIP_ROCPROF=0`** または **`README.md`** の手動 **`rocprofv3`** 手順 |
 | **`make wmma-probe` で `cmath` / `cstdlib` エラー** | **`hipcc`** が libstdc++ ヘッダを見つけられない | **`apt install g++ libstdc++-dev`**。**`wmma-probe`** は **`$(HIP_CFLAGS)`** 経由でヘッダパスを付与（2026-05-29 以降の Makefile） |
-| ISA 不一致 / `GPU_ARCH not detected` | 自動検出失敗・手動指定の誤り | **`cd qwen3-8b/gpu-rocm && make detect-gpu-arch`**。失敗時は **`rocminfo`** の **`Name: gfx*`** を確認し **`make build GPU_ARCH=…`** |
+| **`rocBLAS error: … for GPU arch : gfx1152`**（**TensileLibrary** 欠落） | 公式 rocBLAS に **`gfx1152`** 用 lazy Tensile が無い（**ROCm 7.1.x / 7.2.x 共通**） | **`cd gpu-rocm && make clean build && make run`**（Makefile の **`gfx1151` offload + `HSA_OVERRIDE_GFX_VERSION=11.5.1`**）。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。**ROCm バージョンアップのみ**では直らない場合がある |
+| **`hipBLAS error: 6`**（Prefill 0%・**`HIPBLAS_STATUS_INTERNAL_ERROR`**） | **`gfx1152` 名で `gfx1151` ライブラリを無理に symlink した**、または **HSA オーバーライドと `--offload-arch` の不一致** | **`make clean build`**（**`HIP_OFFLOAD_ARCH=gfx1151`** を確認）。**`HSA_OVERRIDE_GFX_VERSION=11.5.1`** を **`make run`** とセットで使用。手動実行時は両方必須 |
+| **`Segmentation fault`**（Prefill 直後・**`gcnArchName: gfx1151`** 表示あり） | **`HSA_OVERRIDE_GFX_VERSION` のみ**でバイナリが **`gfx1152` offload** のまま | **`make clean build`** 後 **`make run`**。ビルドログの **`Build offload arch: gfx1151`** を確認 |
+| ISA 不一致 / `GPU_ARCH not detected` | 自動検出失敗・手動指定の誤り | **`cd qwen3-8b/gpu-rocm && make detect-gpu-arch`**。失敗時は **`rocminfo`** の **`Name: gfx*`** を確認し **`make build GPU_ARCH=…`**（**`gfx1152` 実機では内部で `gfx1151` offload**） |
 | `nvcc` not found / `nvlink` 失敗 | `PATH` に CUDA `bin` が無い | `export PATH=/usr/local/cuda/bin:$PATH` または各 CUDA ディレクトリの **`Makefile`** の `CUDA_HOME` を確認 |
 | CUDA FP16 で出力が文字化け（Blackwell / RTX 50 系） | **`CUDA_GENCODE=compute_86` PTX JIT** で **`kernels.cu`** が不整合 | **`make build`** で **`nvidia-smi` 自動検出**（**`sm_120` + FA_BR=32**）を確認。**`=== build: GPU_CCAP=… ===`** 行を参照。手動 **`CUDA_GENCODE=arch=compute_120,code=sm_120`** |
 | CUDA で PTX は動くが極端に遅い／非 Blackwell で PTX のみ | `CUDA_GENCODE` が PTX のみ | 実機 **`sm_XX`** を `code=sm_XX` で指定して再ビルド（**`gpu-cuda`**） |
