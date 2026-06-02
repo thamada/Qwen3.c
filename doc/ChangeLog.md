@@ -4,6 +4,34 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-06-02 23:18:29
+
+**`gfx1152`（Ryzen AI 5 340 / Radeon 840M）環境依存と rocBLAS** — 設計ドキュメントへの詳細追記。
+
+#### 背景（本チャットで確認した事象）
+
+- **実機**: AMD Ryzen AI 5 340、内蔵 **Radeon 840M**（**`gcnArchName: gfx1152`**）
+- **失敗**: Prefill 0% で **`rocBLAS error: Cannot read … TensileLibrary.dat … for GPU arch : gfx1152`** → **`Aborted`**
+- **ROCm**: apt **7.1.1 → 7.2.1** へ更新しても **`TensileLibrary_lazy_gfx1152.dat` は同梱されず**（**`gfx1150` / `gfx1151` のみ**）
+- **有効な対処**: **`gpu-rocm/Makefile`** — **`HIP_OFFLOAD_ARCH=gfx1151`**、**`HSA_OVERRIDE_GFX_VERSION=11.5.1`** を **`gfx1152`/`gfx1153` 検出時に自動適用**（**`make run`** で export）。**ROCm マイナーアップのみでは必須ではない**
+
+#### `qwen3-8b/gpu-rocm/Makefile`（コード側・本エントリ以前に反映済み）
+
+- **`GPU_ARCH_DETECTED`** / **`HIP_OFFLOAD_ARCH`** / **`HSA_OVERRIDE_GFX_VER`** / **`RUN_ENV`**
+- **`gfx1152` / `gfx1153`** → **`gfx1151` ビルド + 実行時 HSA オーバーライド
+
+#### `doc/design.md`
+
+- 新設 **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**（ハードウェア対応表・典型エラー・ROCm 7.2.1 との関係・避けるべき対処・手動再現・確認コマンド）
+- **ROCm** ビルド節・**制約・既知の制限**・**Make 変数表**・**ファイル構成表（`Makefile` 行）**・**トラブルシューティング早見表**（**`gfx1152` Tensile 欠落** / **hipBLAS 6** / **Segfault**）を同期
+
+#### `README.md` / `README.en.md`
+
+- ROCm 付録: **「Ryzen AI / gfx1152 と rocBLAS」** 節（**`GPU_ARCH_DETECTED`** / **`HIP_OFFLOAD_ARCH`** / HSA オーバーライド・ROCm 7.2.1 は必須ではない旨）
+- 付録トラブルシュート: **`rocBLAS … gfx1152`** / **`hipBLAS error: 6`** / **Segfault** / **`GPU_ARCH` 検出** を同期
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-05-29 10:26:34
 
 **GPU 推論 stdout ベンチ行の廃止**（**`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。**`gpu-rocm`** は既に stdout ベンチ行なし。

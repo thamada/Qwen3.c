@@ -4,7 +4,21 @@ HIPCC      ?= $(ROCM)/bin/hipcc
 ROCMININFO ?= $(ROCM)/bin/rocminfo
 
 # Auto-detect GPU ISA from rocminfo (first GPU agent Name: gfx*). Override: make GPU_ARCH=gfx1100
-GPU_ARCH   ?= $(shell $(ROCMININFO) 2>/dev/null | awk '/^  Name:/ { n=$$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }')
+GPU_ARCH_DETECTED := $(shell $(ROCMININFO) 2>/dev/null | awk '/^  Name:/ { n=$$NF; if (n ~ /^gfx[0-9]+/) { print n; exit } }')
+GPU_ARCH          ?= $(GPU_ARCH_DETECTED)
+
+# rocBLAS Tensile libs: gfx1152/gfx1153 are not packaged in ROCm <=7.2.x — build/run via gfx1151.
+ifneq ($(filter gfx1152 gfx1153,$(GPU_ARCH)),)
+HIP_OFFLOAD_ARCH      := gfx1151
+HSA_OVERRIDE_GFX_VER  := 11.5.1
+else
+HIP_OFFLOAD_ARCH      := $(GPU_ARCH)
+endif
+ifneq ($(filter gfx1152 gfx1153,$(GPU_ARCH_DETECTED)),)
+HSA_OVERRIDE_GFX_VER  ?= 11.5.1
+endif
+export HSA_OVERRIDE_GFX_VERSION := $(HSA_OVERRIDE_GFX_VER)
+RUN_ENV := $(if $(HSA_OVERRIDE_GFX_VER),HSA_OVERRIDE_GFX_VERSION=$(HSA_OVERRIDE_GFX_VER),)
 
 MODEL   ?= ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
@@ -41,7 +55,9 @@ detect-gpu-arch:
 	fi
 	@echo ""
 	@echo "==============================================="
-	@echo "  Detected GPU arch: $(GPU_ARCH)"
+	@echo "  Detected GPU arch: $(GPU_ARCH_DETECTED)"
+	@echo "  Build offload arch: $(HIP_OFFLOAD_ARCH)"
+	@if [ -n "$(HSA_OVERRIDE_GFX_VER)" ]; then echo "  HSA_OVERRIDE_GFX_VERSION: $(HSA_OVERRIDE_GFX_VER)"; fi
 	@echo "==============================================="
 	@echo ""
 # -----------------------------------------------------------------------------
@@ -64,7 +80,7 @@ STDCXX_LIBDIR ?= $(shell dirname "$$($(CXX) -print-file-name=libstdc++.a 2>/dev/
 LDFLAGS_STDCXX := $(if $(STDCXX_LIBDIR),-L$(STDCXX_LIBDIR),-L/usr/lib/gcc/x86_64-linux-gnu/$(shell $(CXX) -dumpversion | cut -d. -f1)) -lstdc++
 
 HIP_CFLAGS := -O3 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
-	--offload-arch=$(GPU_ARCH) -I$(ROCM)/include $(HIP_CXXFLAGS)
+	--offload-arch=$(HIP_OFFLOAD_ARCH) -I$(ROCM)/include $(HIP_CXXFLAGS)
 HIP_LDFLAGS := -L$(ROCM)/lib -lamdhip64 -lhipblas -lrocblas -Wl,-rpath,$(ROCM)/lib $(LDFLAGS_STDCXX)
 
 ifeq ($(GPU_ARCH),)
@@ -82,7 +98,9 @@ qwen3-rocm: main.o fp16_cache_io.o
 	@test -n "$(CXX_INC_DIRS)" || (echo "error: C++ headers not found. Install: apt install g++ libstdc++-dev" >&2; exit 1)
 	@echo ""
 	@echo "==============================================="
-	@echo "  Detected GPU arch: $(GPU_ARCH)"
+	@echo "  Detected GPU arch: $(GPU_ARCH_DETECTED)"
+	@echo "  Build offload arch: $(HIP_OFFLOAD_ARCH)"
+	@if [ -n "$(HSA_OVERRIDE_GFX_VER)" ]; then echo "  HSA_OVERRIDE_GFX_VERSION: $(HSA_OVERRIDE_GFX_VER)"; fi
 	@echo "==============================================="
 	@echo ""
 	$(HIPCC) $(HIP_CFLAGS) -o qwen3-rocm main.o fp16_cache_io.o $(HIP_LDFLAGS)
@@ -104,7 +122,7 @@ fp16_cache_io.o: fp16_cache_io.c fp16_cache.h
 	$(HIPCC) -O3 -Wall -Wextra -x c -c fp16_cache_io.c -o fp16_cache_io.o
 
 run: qwen3-rocm
-	./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
+	$(RUN_ENV) ./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
 
 clean:
 	rm -f qwen3-rocm wmma-probe main.o fp16_cache_io.o
