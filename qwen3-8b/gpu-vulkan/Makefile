@@ -68,7 +68,7 @@ ensure-model:
 		$(MAKE) -C .. model; \
 	fi
 
-run: qwen3-vulkan ensure-model
+run: ensure-model qwen3-vulkan pack-cache
 	QWEN3_VK_SHADER_DIR=$(CURDIR)/shaders ./qwen3-vulkan "$(MODEL)" -p "$(PROMPT)"
 
 clean:

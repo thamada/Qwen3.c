@@ -92,7 +92,7 @@ ifeq ($(GPU_ARCH),)
 $(error GPU_ARCH not detected. Ensure $(ROCMININFO) reports a GPU, or: make GPU_ARCH=gfx1100 build)
 endif
 
-# run: binary only (skip pack-cache). build: binary + FP16 cache when MODEL exists.
+# run / build: binary + FP16 cache (pack-cache runs when manifest is missing or stale).
 ifneq ($(wildcard $(MODEL)),)
 BUILD_PREREQS := qwen3-rocm $(FP16_CACHE_MANIFEST)
 else
@@ -135,7 +135,7 @@ ensure-model:
 		$(MAKE) -C .. model; \
 	fi
 
-run: qwen3-rocm ensure-model
+run: ensure-model qwen3-rocm pack-cache
 	$(RUN_ENV) ./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
 
 clean:

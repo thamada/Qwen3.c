@@ -96,6 +96,8 @@ MAIN_OBJ    := main.pq$(BONSAI_POLARQUANT).o
 FA_DEBUG_OBJ := fa_debug.o
 BIN         := qwen3-gpu-cuda
 
+FP16_CACHE_MANIFEST := $(MODEL).fp16/manifest
+
 .PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache fa-debug ensure-model FORCE
 
 .DEFAULT_GOAL := run
@@ -145,14 +147,18 @@ ensure-model:
 		$(MAKE) -C .. model; \
 	fi
 
-run: build ensure-model
-	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
-
-run.polarquant: build.polarquant ensure-model
-	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
-
-pack-cache: build
+# run / build: binary + FP16 cache (pack-cache runs when manifest is missing or stale).
+$(FP16_CACHE_MANIFEST): $(MODEL) build
+	@test -f "$(MODEL)" || (echo "error: model not found: $(MODEL)" >&2; echo "  run: make -C .. model" >&2; exit 1)
 	./$(BIN) "$(MODEL)" --pack-fp16-cache
+
+pack-cache: $(FP16_CACHE_MANIFEST)
+
+run: ensure-model pack-cache
+	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
+
+run.polarquant: ensure-model build.polarquant pack-cache
+	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
 clean:
 	rm -f $(BIN) polarquant_verify .build_config.stamp \

@@ -4,6 +4,36 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-06-06 01:20:08
+
+**GPU 4 経路 `Makefile`** — **`make run` が `pack-cache` を自動実行**（オフラインキャッシュの初回生成を省略可能に）。
+
+#### 背景
+
+- 前回の **`ensure-model`** 追加後も、**`make run`** はオフラインキャッシュ（**`<model>.gguf.fp16`** / **`<model>.gguf.nvfp4`**）をスキップしていた
+- 初回推論で GGUF 行逆量子化が毎回走り、起動が遅い／手動 **`make pack-cache`** が必要だった
+
+#### 対象 `Makefile`
+
+**`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`**
+
+#### 変更内容
+
+- **`FP16_CACHE_MANIFEST`** / **`FP4_CACHE_MANIFEST`**: **`$(MODEL).fp16/manifest`** / **`$(MODEL).nvfp4/manifest`**
+- **`pack-cache`**: **`manifest`** ルール — **`manifest`** 欠落または **MODEL / バイナリ** が新しいとき **`--pack-fp16-cache`** / **`--pack-nvfp4-cache`** を実行
+- **`run`**: **`ensure-model`** +（バイナリビルド）+ **`pack-cache`** + 推論
+  - **`gpu-rocm`**: **`ensure-model qwen3-rocm pack-cache`**
+  - **`gpu-vulkan`**: **`ensure-model qwen3-vulkan pack-cache`**
+  - **`gpu-cuda`**: **`ensure-model pack-cache`**（**`manifest`** が **`build`** に依存）
+  - **`gpu-cuda-nvfp4`**: 同上（NVFP4）。**`run.polarquant`**: **`ensure-model build.polarquant pack-cache`**
+- **`gpu-cuda` / `gpu-cuda-nvfp4`**: **`build`** はバイナリのみ（**`run`** 経由で **`pack-cache`** が **`build`** を引く）
+
+#### `doc/design.md`
+
+- バリアント表・ファイル構成表（各 **`Makefile`** 行）・共通ターゲット表・ビルド例・ROCm ビルド節・CUDA ベンチログ節・**「モデル参照」**・ROCm / NVFP4 **`pack-cache`** 節・トラブルシューティング（初回起動遅延）を同期
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-06-06 01:06:50
 
 **全バリアント `Makefile`** — **`.DEFAULT_GOAL := run`** と **`ensure-model`**（GGUF 自動取得）。
