@@ -35,7 +35,9 @@ BENCH_LOG_FILE ?= /tmp/benchmark.log
 
 FP16_CACHE_MANIFEST := $(MODEL).fp16/manifest
 
-.PHONY: run clean detect-gpu-arch log log.push pack-cache wmma wmma-probe
+.DEFAULT_GOAL := run
+
+.PHONY: run clean detect-gpu-arch log log.push pack-cache wmma wmma-probe ensure-model
 
 LLVM_OBJDUMP ?= $(ROCM)/llvm/bin/llvm-objdump
 
@@ -124,7 +126,16 @@ main.o: main.c fp16_cache.h
 fp16_cache_io.o: fp16_cache_io.c fp16_cache.h
 	$(HIPCC) -O3 -Wall -Wextra -x c -c fp16_cache_io.c -o fp16_cache_io.o
 
-run: qwen3-rocm
+ensure-model:
+	@if [ ! -f "$(MODEL)" ]; then \
+		echo ""; \
+		echo "Model not found: $(MODEL)"; \
+		echo "Running: make -C .. model"; \
+		echo ""; \
+		$(MAKE) -C .. model; \
+	fi
+
+run: qwen3-rocm ensure-model
 	$(RUN_ENV) ./qwen3-rocm "$(MODEL)" -p "$(PROMPT)"
 
 clean:

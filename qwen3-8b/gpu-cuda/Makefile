@@ -96,7 +96,7 @@ MAIN_OBJ    := main.pq$(BONSAI_POLARQUANT).o
 FA_DEBUG_OBJ := fa_debug.o
 BIN         := qwen3-gpu-cuda
 
-.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache fa-debug FORCE
+.PHONY: build build.polarquant run run.polarquant clean pq-test log log.push pack-cache fa-debug ensure-model FORCE
 
 .DEFAULT_GOAL := run
 
@@ -136,10 +136,19 @@ pq-test: polarquant.o
 	$(NVCC) $(NVCCFLAGS) -DBONSAI_POLARQUANT=1 -o polarquant_verify polarquant_verify.cu polarquant.o $(LDFLAGS)
 	./polarquant_verify
 
-run: build
+ensure-model:
+	@if [ ! -f "$(MODEL)" ]; then \
+		echo ""; \
+		echo "Model not found: $(MODEL)"; \
+		echo "Running: make -C .. model"; \
+		echo ""; \
+		$(MAKE) -C .. model; \
+	fi
+
+run: build ensure-model
 	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
-run.polarquant: build.polarquant
+run.polarquant: build.polarquant ensure-model
 	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
 pack-cache: build

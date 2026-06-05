@@ -4,6 +4,32 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-06-06 01:06:50
+
+**全バリアント `Makefile`** — **`.DEFAULT_GOAL := run`** と **`ensure-model`**（GGUF 自動取得）。
+
+#### 背景
+
+- 各サブディレクトリで推論する前に、利用者が **`cd qwen3-8b && make model`** を別途実行する必要があった
+- **`make run`** 時に **`$(MODEL)`**（既定 **`../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**）が無いと推論が即失敗する
+
+#### 対象 `Makefile`（9 経路）
+
+**`cpu`** / **`cpu-multicore`** / **`cpu-blas`** / **`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`** / **`xdna2`** / **`xdna2-bfp16`**
+
+#### 変更内容
+
+- **`.DEFAULT_GOAL := run`**: 引数なし **`make`** で推論（ビルド + モデル確認 + 実行）
+- **`ensure-model`**: **`$(MODEL)`** 未存在時に **`make -C .. model`** を実行（親 **`qwen3-8b/Makefile`** の **`wget` + `.sha256sum` 検証**に委譲）
+- **`run`**: 既存のビルド依存（**`build`** または **`qwen3-rocm`** / **`qwen3-vulkan`** 等）に **`ensure-model`** を追加
+- **`gpu-cuda` / `gpu-cuda-nvfp4`**: **`run.polarquant`** にも **`ensure-model`** を付与
+
+#### `doc/design.md`
+
+- **ファイル構成表**（各 **`Makefile`** 行）・**「生成バイナリと Make ターゲット」**（共通ターゲット表）・**ビルド例**・**共通変数**・**ROCm ビルド節**・**CUDA ベンチログ節**（**`.DEFAULT_GOAL`** 全経路）・**「モデル参照」**（**`ensure-model`** 経由を推奨手順 1 に）を同期
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-06-05 21:23:03
 
 **`gpu-rocm/Makefile`** — **`HSA_OVERRIDE_GFX_VERSION` の条件付き export**（**`gfx1030`** 等で空 export が HIP を壊す問題の修正）。

@@ -15,9 +15,9 @@ PROMPT  ?= Hello, how are you?
 
 FP16_CACHE_MANIFEST := $(MODEL).fp16/manifest
 
-.PHONY: build run clean pack-cache log log.push shaders
+.DEFAULT_GOAL := run
 
-.DEFAULT_GOAL := build
+.PHONY: build run clean pack-cache log log.push shaders ensure-model
 
 shaders: $(SPV)
 
@@ -59,7 +59,16 @@ $(FP16_CACHE_MANIFEST): $(MODEL) qwen3-vulkan
 
 pack-cache: $(FP16_CACHE_MANIFEST)
 
-run: qwen3-vulkan
+ensure-model:
+	@if [ ! -f "$(MODEL)" ]; then \
+		echo ""; \
+		echo "Model not found: $(MODEL)"; \
+		echo "Running: make -C .. model"; \
+		echo ""; \
+		$(MAKE) -C .. model; \
+	fi
+
+run: qwen3-vulkan ensure-model
 	QWEN3_VK_SHADER_DIR=$(CURDIR)/shaders ./qwen3-vulkan "$(MODEL)" -p "$(PROMPT)"
 
 clean:

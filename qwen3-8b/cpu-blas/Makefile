@@ -19,7 +19,9 @@ ifneq ($(strip $(OPENBLAS_LIBS)),)
   LDFLAGS += $(OPENBLAS_LIBS)
 endif
 
-.PHONY: build run clean openblas
+.DEFAULT_GOAL := run
+
+.PHONY: build run clean openblas ensure-model
 
 build:
 	@echo "$(CC) $(CPPFLAGS) $(CFLAGS) -o qwen3-cpu-blas main.c $(LDFLAGS)"
@@ -40,7 +42,16 @@ build:
 		exit $$rc; \
 	fi
 
-run: build
+ensure-model:
+	@if [ ! -f "$(MODEL)" ]; then \
+		echo ""; \
+		echo "Model not found: $(MODEL)"; \
+		echo "Running: make -C .. model"; \
+		echo ""; \
+		$(MAKE) -C .. model; \
+	fi
+
+run: build ensure-model
 	./qwen3-cpu-blas "$(MODEL)" -p "$(PROMPT)"
 
 # Debian/Ubuntu 等: libopenblas-dev + OpenMP ランタイム

@@ -28,7 +28,7 @@
 | `qwen3-8b/cpu/main.c` | CPU、単スレッド | GGUF mmap、`qwen3vl.*` パース。線形層は **IQ2_S / IQ3_S / Q4_K / Q5_K** 等を **`QK_K=256` ブロック単位**に逆量子化しつつ GEMV（全重みの float 一括展開なし）。`libm` のみ。**Prefill** は 1 トークンずつ forward し stderr に **progress bar**（**`Prefill [====...]`**、幅 40）と prefill / decode / total の **スループット要約**を出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU、**OpenMP** | 上記と同一アルゴリズム。**GEMV** は出力行並列、**Attention** はヘッド並列、`qwen3-8b/gpu-rocm/main.c`（ROCm 版）のカーネル粒度に相当する並列化（RoPE、RMSNorm、残差、SiLU 等）。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU、**OpenMP + OpenBLAS** | **`cpu-multicore`** と同一デコーダ・同一 GGUF。**F32 行列積**（**`cblas_sgemv`**）と **Attention の K 内積・V 合成**を OpenBLAS に委譲。量子化 GEMV は **Q8_K 活性化 + 全型 `vec_dot_*_q8_K` 整数内積**（**`__AVX2__`** で IQ2_S/IQ3_S/Q4_K/Q5_K）。**層内 Q8 共有**（**`mm(..., q8_ready)`**）。**RoPE cos/sin キャッシュ**、**prefill 中 LM head スキップ**（**`FWD_NO_LM`**）、**greedy 時 `mm_argmax_row`**（**`FWD_LM_ARGMAX`**）。**F16 埋め込み**は **F16C+AVX2** で 8 要素 SIMD 変換。**Prefill progress bar** とスループット要約を stderr に出力。**`-march=native`** 既定。 |
-| `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | 量子化重みを **行単位融合逆量子化** → **F16 VRAM**（**`max_tensor_nelements` ステージング廃止**）。任意で **`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**。**`make build`** は MODEL 存在時にキャッシュ自動生成）。**Prefill バッチ**（**`forward_prefill_gpu`** — 全プロンプトを 1 回 forward。線形層は **hipBLAS `GemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の `cublasGemmEx` 経路と同趣旨）。フォールバック **`mm_f16_gemv_batch_kernel`**）+ **Decode 1 トークン**（**`forward_gpu`** — **`mm_f16_gemv_kernel`** + Flash decode）。**Flash 系 Prefill/Decode 注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等。**Prefill progress bar** と prefill / decode / total の **スループット要約**を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へベンチ＋**VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）。**`make log` / `make log.push`**（ファイル読取）。**`gpu-rocm/` で `make build`** が AMD GPU 向け既定エントリ（**`make run`** はバイナリのみ）。ビルド時 **`GPU_ARCH`** は **`gpu-rocm/Makefile`** が **`rocminfo`** から自動検出。**リンク**: `-lhipblas -lrocblas -lstdc++`（**`fp16_cache_io.o`** リンクのため **g++ / libstdc++-dev** 要）。 |
+| `qwen3-8b/gpu-rocm/main.c` | **ROCm / HIP** | 量子化重みを **行単位融合逆量子化** → **F16 VRAM**（**`max_tensor_nelements` ステージング廃止**）。任意で **`<model>.gguf.fp16`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-fp16-cache`**。**`make build`** は MODEL 存在時にキャッシュ自動生成）。**Prefill バッチ**（**`forward_prefill_gpu`** — 全プロンプトを 1 回 forward。線形層は **hipBLAS `GemmEx`**（[llama.cpp](https://github.com/ggml-org/llama.cpp/) の `cublasGemmEx` 経路と同趣旨）。フォールバック **`mm_f16_gemv_batch_kernel`**）+ **Decode 1 トークン**（**`forward_gpu`** — **`mm_f16_gemv_kernel`** + Flash decode）。**Flash 系 Prefill/Decode 注意**・**KV カーネル書き込み**・**レイヤー間のホスト非介在**・GPU サンプリング（top-p 時は logits D2H フォールバック）等。**Prefill progress bar** と prefill / decode / total の **スループット要約**を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へベンチ＋**VRAM 内訳**（**`GpuVramProfile`** / **`model_vram_profile`**）。**`make log` / `make log.push`**（ファイル読取）。**`gpu-rocm/` で引数なし `make`**（**`.DEFAULT_GOAL := run`**。**`ensure-model`** で GGUF 自動取得）が AMD GPU 向け既定エントリ。**`make build`** は FP16 キャッシュ付きビルド用。ビルド時 **`GPU_ARCH`** は **`gpu-rocm/Makefile`** が **`rocminfo`** から自動検出。**リンク**: `-lhipblas -lrocblas -lstdc++`（**`fp16_cache_io.o`** リンクのため **g++ / libstdc++-dev** 要）。 |
 | `qwen3-8b/gpu-vulkan/` | **Vulkan 1.1 compute** | **`main.c`** + **`vk_context` / `vk_alloc` / `vk_pipeline` / `vk_kernels`** + **`shaders/*.comp`**（18 本 → **`glslangValidator`** で **`.spv`**）。**ROCm / CUDA 不要**（**`-lvulkan`**）。重みは **`gpu-rocm` / `gpu-cuda` と同じ FP16 経路**（**`<model>.gguf.fp16`** または GGUF 行単位融合逆量子化）。**Prefill / Decode** とも **FP16 GEMV compute シェーダ**（**hipBLAS GemmEx / cuBLAS 相当の batched GEMM 未実装**）。**Flash Attention**（GLSL）。**`gpu.h`** API（**`gpu_forward_prefill`** / **`gpu_forward`**）。各 **`vkCmdDispatch`** で descriptor set 確保・更新・**fence 待ち**（同期実行 — ホストオーバーヘッド大）。デバイスポインタは **`vk_malloc` ハンドル**（整数 ID）。**`QWEN3_VK_SHADER_DIR`** で SPIR-V 探索。**Prefill progress bar**。**`BENCH_LOG_FILE`**（**`vram_total`** + 簡易 **`[vram_breakdown]`**（線形重みは **`vram_total` に含む**・**`vram_weights_linear` キー未出力**）。**`vram_device_used`** は未取得）。**`make log` / `make log.push`**（第 2 列は **`vulkaninfo` の `deviceName`**。**`GPU_VK`** は **`awk -F'='`** で抽出）。**初期実装** — 長プロンプト **`make log.push`** 実測 **~3 tok/s** 級（**`gpu-rocm` 比 10〜40× 遅い**。README 付録参照）。 |
 | `qwen3-8b/gpu-cuda/main.c` + `kernels.cu` | **NVIDIA CUDA（FP16）** | **Prefill バッチ** + **Decode 1 トークン**、**Flash Attention**（GQA）。全線形 **FP16 VRAM**。GGUF **行単位融合逆量子化**、または **`<model>.gguf.fp16`** オフラインキャッシュ（**`gpu-cuda/` の `make pack-cache`** / **`--pack-fp16-cache`**）。**`Makefile`** は **`nvidia-smi`** で **`CUDA_GENCODE`** / **`FA_BR`** を自動選択（Blackwell **12.x → `sm_120` + FA_BR=32**）。任意で **`build.polarquant`**: KV **PolarQuant-R**（64 B/head、F32 比 ~8×）。サンプリング **logits D2H**。**Prefill progress bar** とスループット要約。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へベンチ＋**VRAM 内訳**。**`make log` / `make log.push`**（ファイル読取）。**`gpu-cuda/` で単体ビルド**。 |
 | `qwen3-8b/gpu-cuda-nvfp4/` + 共有 `gpu-cuda/` | **NVIDIA CUDA（NVFP4）** | 上記と同じ Prefill / Decode / Flash Attention。線形層はロード時 **NVFP4 のみ**（**`fp4_qwen3`**、**`BONSAI_FP4=1`** 固定）。GGUF 行単位融合逆量子化、または **`<model>.gguf.nvfp4`** オフラインキャッシュ（**`make pack-cache`** / **`--pack-nvfp4-cache`**。**`FP4_CACHE_VERSION=2`**。旧 v1 は再 **`pack-cache`**）。**`token_embd`** は **FP16**（量子化 GGUF から行単位 H2D）、norm は **F32**。線形は **`fp4_qwen3_mm`** — prefill / decode とも **CUTLASS NVFP4 GEMM**（**`fp4_gemm_run_cached`**、**`M` を 128 整列**、活性はその場 FP4 量子化。**`FP4_QUANT_MAX_ABS=1024`** で極大活性の NaN を防止）。起動 smoke・回帰は **`make fp4-test`** / **`make sfa-verify`**。**`--fa-debug`**（共有 **`fa_debug.*`**）で FA/KV/層トレース。調査ログは **`gpu-cuda-nvfp4/DEBUG.md`**（ベース **`433319eb`**）。**`fp4_quantize_weights`** は GPU カーネル（**`FP4_WEIGHT_SFB_LAYOUT_M=128`** + **`d_sf_lut`**）。任意で **`build.polarquant`**。**`BENCH_LOG_FILE`** + VRAM 内訳。**`make log` / `make log.push`**（**`BENCH_TEMP`** / **`BENCH_SEED`** 反映）。要 **CUDA 13 + CUTLASS + sm_120 系 GPU**。 |
@@ -46,10 +46,10 @@
 | `qwen3-8b/cpu/main.c` | CPU 単スレッド推論。**Prefill progress bar**（**`prefill_progress_*`**）と prefill / decode スループット要約を stderr に出力。 |
 | `qwen3-8b/cpu-multicore/main.c` | CPU OpenMP 並列推論。**ソース先頭**に **`qwen3-8b/gpu-rocm/main.c`**（ROCm/HIP）との並列粒度対応、当ディレクトリ **`make build`**（**`qwen3-cpu-omp`**）を記載。 |
 | `qwen3-8b/cpu-blas/main.c` | CPU OpenMP + OpenBLAS。**Q8_K GEMV**（全型 AVX2 整数内積・層内 Q8 共有）、**RoPE キャッシュ**、**lm_mode**（prefill LM スキップ / greedy argmax）、**F16 emb F16C**。詳細は **「量子化と行列積」→「`cpu-blas`：Q8_K 活性化 GEMV」**。**Prefill progress bar** を stderr に出力。 |
-| `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
+| `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`.DEFAULT_GOAL := run`**。**`ensure-model`**。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value ベンチ＋**`[vram_breakdown]`**（**`GpuVramProfile`** / **`model_vram_profile`**。**`make log.push`** がパース。推論区間のみ）。 |
 | `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-cuda/`** と同 API。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH_DETECTED`** は **`rocminfo`** の最初の **`gfx*`**。**`gfx1152` / `gfx1153`** では rocBLAS 未同梱のため **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VER=11.5.1`**（**`HSA_OVERRIDE_GFX_VER` が設定されているときのみ** **`HSA_OVERRIDE_GFX_VERSION` を export** — 空 export は **`gfx1030`** 等で HIP を壊す）。**`detect-gpu-arch`**。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ。**`pack-cache`** / **`make log`** / **`make log.push`** / **`make wmma`**。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH_DETECTED`** は **`rocminfo`** の最初の **`gfx*`**。**`gfx1152` / `gfx1153`** では rocBLAS 未同梱のため **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VER=11.5.1`**（**`HSA_OVERRIDE_GFX_VER` が設定されているときのみ** **`HSA_OVERRIDE_GFX_VERSION` を export** — 空 export は **`gfx1030`** 等で HIP を壊す）。**`.DEFAULT_GOAL := run`**。**`ensure-model`**: **`$(MODEL)`** 未存在時 **`make -C .. model`**。**`detect-gpu-arch`**。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: **`qwen3-rocm`** + **`ensure-model`**（pack-cache スキップ）。**`pack-cache`** / **`make log`** / **`make log.push`** / **`make wmma`**。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。 |
 | `qwen3-8b/gpu-rocm/wmma_probe.c` | RDNA **gfx11 / gfx12** 向け **WMMA 校正用**最小 HIP プローブ。**gfx11**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`**。**gfx12**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`**。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
 | `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（RDNA **gfx11 / gfx12**）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3 --kernel-trace`** カーネル trace。**`count_wmma_in_obj`**: HIP バイナリは **`--offloading`** で AMDGPU コードを抽出して **`v_wmma`** をカウント。 |
 | `qwen3-8b/gpu-vulkan/main.c` | Vulkan compute 推論ホスト（**`gpu-cuda/main.c`** ベース）。GGUF・トークナイザ・FP16 重み H2D・生成ループ。**`gpu.h`** 経由で **`vk_kernels.c`** に forward を委譲。推論終了時 **`BENCH_LOG_FILE`** へ key=value ベンチ + 簡易 **`[vram_breakdown]`**（**`write_benchmark_log`**。**`vram_weights_linear` は未出力**）。 |
@@ -60,16 +60,16 @@
 | `qwen3-8b/gpu-vulkan/vk_kernels.c` | **`gpu_model_create`** / **`gpu_forward`** / **`gpu_forward_prefill`** 実装。レイヤーごとに多数の compute dispatch。 |
 | `qwen3-8b/gpu-vulkan/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-rocm` / `gpu-cuda`** と同 API・同 **`<model>.gguf.fp16`** 形式）。 |
 | `qwen3-8b/gpu-vulkan/shaders/*.comp` | GLSL compute 18 本（embedding、FP16 GEMV、RMSNorm、RoPE、SiLU、KV write、Flash Attention 等）。**`common.inc`** を include。**`make`** で **`.spv`** 生成。 |
-| `qwen3-8b/gpu-vulkan/Makefile` | **`cc`** + **`-lvulkan`** で **`qwen3-vulkan`** をリンク。**`glslangValidator`** で **`shaders/*.spv`**。**`QWEN3_VK_SHADER_DIR`**（**`run`** / **`pack-cache`** で **`$(CURDIR)/shaders`** を設定）。**`GPU_VK`**: **`vulkaninfo --summary`** の **`deviceName=`** 行を **`awk -F'='`** でパース（旧 **`print $2`** は **`=` のみ**になり誤記録）。**`pack-cache`** / **`make log`** / **`make log.push`**（**`BENCH_LOG_FILE`** 読取、第 2 列 GPU 名）。**`clean`**: バイナリ・**`*.o`**・**`shaders/*.spv`**。 |
+| `qwen3-8b/gpu-vulkan/Makefile` | **`cc`** + **`-lvulkan`** で **`qwen3-vulkan`** をリンク。**`glslangValidator`** で **`shaders/*.spv`**。**`QWEN3_VK_SHADER_DIR`**（**`run`** / **`pack-cache`** で **`$(CURDIR)/shaders`** を設定）。**`GPU_VK`**: **`vulkaninfo --summary`** の **`deviceName=`** 行を **`awk -F'='`** でパース（旧 **`print $2`** は **`=` のみ**になり誤記録）。**`.DEFAULT_GOAL := run`**。**`ensure-model`**。**`run`**: **`qwen3-vulkan`** + **`ensure-model`**。**`pack-cache`** / **`make log`** / **`make log.push`**（**`BENCH_LOG_FILE`** 読取、第 2 列 GPU 名）。**`clean`**: バイナリ・**`*.o`**・**`shaders/*.spv`**。 |
 | `qwen3-8b/gpu-cuda/main.c` | NVIDIA CUDA 推論ホスト（**`BONSAI_FP4=0`** 時 FP16 線形 + オフラインキャッシュ。**`BONSAI_FP4=1`** 時 NVFP4 ロード・**`--pack-nvfp4-cache`** も本ファイル）。**`kernels.cu`** がデバイス forward。**`gpu.h`** が C/CUDA 境界（**`GpuVramProfile`** / **`gpu_model_vram_profile`** / **`gpu_get_device_desc`**）。重み H2D 時、8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value ベンチ＋**`[vram_breakdown]`**（**`make log.push`** が読取）。**`gpu-cuda-nvfp4`** も共有参照。 |
-| `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。既定 **`make build` / `make run`**。**`nvidia-smi`** で **`CUDA_GENCODE`** / **`FA_BR`** を自動選択（Blackwell **12.x → `sm_120` + FA_BR=32**、未検出時 **`compute_86` PTX**）。**`.build_config.stamp`** で **`kernels.*.o`** の stale 回避。**`build.polarquant`** / **`run.polarquant`**、**`pack-cache`**、**`pq-test`**、**`fa-debug`**。**`BENCH_LOG_FILE`**。**`make log`** / **`make log.push`**（**`GPU_SM=sm_<ccap>`**）。NVFP4 関連は含まない。 |
+| `qwen3-8b/gpu-cuda/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda`** をビルド。**`.DEFAULT_GOAL := run`**（**`make`** = **`run`** → **`build`** + **`ensure-model`** + 推論）。**`nvidia-smi`** で **`CUDA_GENCODE`** / **`FA_BR`** を自動選択（Blackwell **12.x → `sm_120` + FA_BR=32**、未検出時 **`compute_86` PTX**）。**`.build_config.stamp`** で **`kernels.*.o`** の stale 回避。**`build.polarquant`** / **`run.polarquant`**、**`pack-cache`**、**`pq-test`**、**`fa-debug`**。**`BENCH_LOG_FILE`**。**`make log`** / **`make log.push`**（**`GPU_SM=sm_<ccap>`**）。NVFP4 関連は含まない。 |
 | `qwen3-8b/gpu-cuda/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
 | `qwen3-8b/gpu-cuda/kernels.cu` | FP16 GEMV・Flash Attention（decode / prefill）・RoPE 等。PolarQuant 時は KV を **`PQBlock`** 経路に切替。**`BONSAI_FP4`** 時は **`fp4_qwen3_mm`** へ委譲。**`fa_debug.h`** フック（**`--fa-debug`**）。 |
 | `qwen3-8b/gpu-cuda/fa_debug.c` / `fa_debug.h` | **Flash Attention / KV / prefill 層トレース**（stderr **`FA_DEBUG`**）。**`make fa-debug`**（**`gpu-cuda`** / **`gpu-cuda-nvfp4`**）。 |
 | `qwen3-8b/gpu-cuda/polarquant.cu` / `polarquant.h` | **PolarQuant-R** KV キャッシュ圧縮。ホスト側コードブック初期化（Lloyd-Max L=2〜4）、デバイス **`PQState`**、KV 書き込み API。 |
 | `qwen3-8b/gpu-cuda/polarquant_kernels.cuh` | デバイス側 encode/decode（ランダム符号 + FWHT-128、L=4 再帰 polar 量子化、**`PQBlock`** 8 bytes × 8 blocks）。 |
 | `qwen3-8b/gpu-cuda/polarquant_verify.cu` | **`make pq-test`** 用のラウンドトリップ検証（推論バイナリには未リンク）。 |
-| `qwen3-8b/gpu-cuda-nvfp4/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda-nvfp4`** をビルド。既定 **`make build` / `make run`**（**`sm_120a`** + **`BONSAI_FP4=1`** + **`FA_BR=32`**）。**`build.polarquant`** / **`run.polarquant`**、**`pack-cache`**、**`blackwell`**、**`cutlass`**、**`fp4-test`**、**`sfa-verify`**、**`fa-debug`**、**`pq-test`**。**`BENCH_LOG_FILE`**。**`make log`** / **`make log.push`**（**`-t $(BENCH_TEMP) -s $(BENCH_SEED)`**）。**`main.c` / `kernels.cu` / `gpu.h` / `polarquant.*` / `fa_debug.*`** は **`../gpu-cuda/`** を参照。 |
+| `qwen3-8b/gpu-cuda-nvfp4/Makefile` | **`nvcc`** で **`qwen3-gpu-cuda-nvfp4`** をビルド。**`.DEFAULT_GOAL := run`**（**`sm_120a`** + **`BONSAI_FP4=1`** + **`FA_BR=32`**）。**`ensure-model`**。**`build.polarquant`** / **`run.polarquant`**、**`pack-cache`**、**`blackwell`**、**`cutlass`**、**`fp4-test`**、**`sfa-verify`**、**`fa-debug`**、**`pq-test`**。**`BENCH_LOG_FILE`**。**`make log`** / **`make log.push`**（**`-t $(BENCH_TEMP) -s $(BENCH_SEED)`**）。**`main.c` / `kernels.cu` / `gpu.h` / `polarquant.*` / `fa_debug.*`** は **`../gpu-cuda/`** を参照。 |
 | `qwen3-8b/gpu-cuda-nvfp4/DEBUG.md` | NVFP4 異常出力の調査・修正ログ（ベースコミット **`433319eb31c3c992536afb5c9a3717084ea5d137`**、層トレース、コマンド早見表）。 |
 | `qwen3-8b/gpu-cuda-nvfp4/fp4_cache.h` / `fp4_cache_io.c` | **NVFP4 オフラインキャッシュ** I/O。**`FP4_CACHE_VERSION=2`**（SFB + LUT レイアウト）。**`FP4HostWeight`** の save/load、**`<model>.gguf.nvfp4`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
 | `qwen3-8b/gpu-cuda-nvfp4/fp4_gemm.cu` / `fp4_gemm.h` | CUTLASS **NVFP4** GEMM（推論 **`fp4_gemm_run_cached`**、**`fp4-test`**、起動 smoke）。活性量子化に **`FP4_QUANT_MAX_ABS=1024`**。**`fp4_quantize_weights`**（GPU、**`FP4_WEIGHT_SFB_LAYOUT_M=128`** + **`d_sf_lut`**）。**`fp4_host_weight_build`** / **`fp4_weight_cache_upload`**。**`fp4_gemm_vram_bytes`**。 |
@@ -80,7 +80,7 @@
 | `qwen3-8b/xdna2/main.c` | AMD Ryzen AI（XDNA2）NPU。**mmap ウェイト + GEMV 毎 BF16 スクラッチ**・`amdxdna` ioctl 直叩き。**`--xdna-status` / `-X`** で制御コード環境の軽量診断。 |
 | `qwen3-8b/xdna2-bfp16/main.c` | **`xdna2/main.c` と同一の IOCTL／チャンク BF16 GEMV（枠組み）。密行列レイアウトの重みをロード時に BFPX 化しホストのみ保持、mmap は変換完了後に解放。** |
 | `qwen3-8b/Makefile` | **`model` のみ**。既定 **`MODEL`** の GGUF を **`gguf.txt`** の URL から **`wget`** し **`$(MODEL).sha256sum`** で検証（**既存ファイルが検証済みならダウンロードをスキップ**）。失敗時は破損ファイルを削除。ビルド・実行・クリーンは各サブディレクトリの **`Makefile`** で行う。 |
-| `qwen3-8b/cpu/Makefile` ほか（各経路直下） | 当該サブディレクトリの **`make build`** / **`make run`** / **`clean`**。出力バイナリは **`cpu/qwen3-cpu`** のように経路直下に生成。既定 **`MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**（サブディレクトリからの相対パス）。 |
+| `qwen3-8b/cpu/Makefile` ほか（各経路直下） | **`cpu` / `cpu-multicore` / `cpu-blas` / `xdna2` / `xdna2-bfp16`** 等。**.DEFAULT_GOAL := run`**（引数なし **`make`** で推論）。**`ensure-model`**: **`$(MODEL)`** 未存在時 **`make -C .. model`**。**`run`**: **`build`**（またはバイナリターゲット）+ **`ensure-model`** + 推論。**`make build`** / **`clean`** も可。出力バイナリは **`cpu/qwen3-cpu`** のように経路直下に生成。既定 **`MODEL=../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**（サブディレクトリからの相対パス）。 |
 | `doc/design.md` | 本書。 |
 | `doc/ChangeLog.md` | 変更履歴。 |
 | `qwen3-8b/xdna2/xdna-gemv/README.md` | **NPU GEMV 用 ctrlcode まわりの入口**。**`kernels/`**・**`toolchain/`**・スタブ再生成スクリプトへの導線。 |
@@ -94,7 +94,7 @@
 
 ### 生成バイナリと Make ターゲット（`qwen3-8b/`）
 
-**GGUF 取得**は **`qwen3-8b/`** の **`make model`**。**ビルド・実行**は各サブディレクトリに移動して **`make build`** / **`make run`** する。ROCm 版の ISA は **`gpu-rocm/Makefile`** が **`rocminfo`** から **`GPU_ARCH_DETECTED`** を取得（**`gfx1152` 等は `gfx1151` + HSA オーバーライド** — **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**）。GGUF 未取得時は先に **`make model`**（詳細は **「モデル参照」**）。
+**GGUF 取得**は **`qwen3-8b/`** の **`make model`**（各サブディレクトリの **`make run`** / 引数なし **`make`** は **`ensure-model`** 経由で同処理を自動委譲）。**ビルド・実行**は各サブディレクトリに移動して **`make`**（= **`run`**）または **`make build`** する。ROCm 版の ISA は **`gpu-rocm/Makefile`** が **`rocminfo`** から **`GPU_ARCH_DETECTED`** を取得（**`gfx1152` 等は `gfx1151` + HSA オーバーライド** — **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**）。手動で先に取得する場合は **「モデル参照」** を参照。
 
 #### トップ `qwen3-8b/Makefile`
 
@@ -103,6 +103,15 @@
 | **`model`** | **`$(MODEL)`**（既定 **`Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**） | **`gguf.txt`** → **`wget`**。**`$(MODEL).sha256sum`** で **`sha256sum --check`**。既存かつ検証 OK ならスキップ |
 
 #### 各サブディレクトリの `Makefile`
+
+**共通ターゲット**（**`cpu`** / **`cpu-multicore`** / **`cpu-blas`** / **`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`** / **`xdna2`** / **`xdna2-bfp16`**）:
+
+| ターゲット | 意味 |
+|------------|------|
+| **（既定）`run`** | **`.DEFAULT_GOAL := run`** — 引数なし **`make`** で推論 |
+| **`ensure-model`** | **`$(MODEL)`** が無ければ **`make -C .. model`**（親 **`qwen3-8b/`** へ委譲） |
+| **`run`** | バイナリビルド + **`ensure-model`** + **`./<bin> "$(MODEL)" -p "$(PROMPT)"`** |
+| **`build`** | バイナリのみ（モデル取得・推論なし） |
 
 | ディレクトリ | `make build` 出力 | ソース |
 |--------------|-------------------|--------|
@@ -119,6 +128,7 @@
 ```bash
 cd qwen3-8b
 make model                   # 既定 GGUF を gguf.txt から取得し .sha256sum で検証（済みならスキップ）
+cd cpu && make               # = make run（ensure-model → 未取得なら上記 model を自動実行）
 cd cpu && make build
 cd ../cpu-multicore && make build
 cd ../cpu-blas && make build               # libopenblas-dev 等が必要
@@ -156,7 +166,7 @@ OMP_NUM_THREADS=8 ./qwen3-cpu-blas ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "H
 |------|------|--------|
 | `MODEL` | GGUF ファイル名（`qwen3-8b/` 直下） | `Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf` |
 
-各バリアントの **`Makefile`** では **`MODEL`**（既定 **`../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**）・**`PROMPT`** 等を **`make run`** に渡す。ROCm / Vulkan / CUDA / CPU 向けのコンパイラ変数は各サブディレクトリの **`Makefile`** を参照。
+各バリアントの **`Makefile`** では **`MODEL`**（既定 **`../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**）・**`PROMPT`** 等を **`make run`**（引数なし **`make`**）に渡す。**`ensure-model`** が **`$(MODEL)`** 未存在時に親の **`make model`** を呼ぶ。ROCm / Vulkan / CUDA / CPU 向けのコンパイラ変数は各サブディレクトリの **`Makefile`** を参照。
 
 | 変数（代表） | 意味 | 既定例 |
 |------|------|--------|
@@ -205,7 +215,7 @@ make build CPPFLAGS=-I/usr/include/x86_64-linux-gnu/openblas-pthread
 
 ### ROCm
 
-**`GPU_ARCH_DETECTED`** はビルド前に **`gpu-rocm/Makefile`** が **`$(ROCM)/bin/rocminfo`** から自動検出する（**`make -C gpu-rocm detect-gpu-arch`** で **検出 ISA** と **ビルド offload ISA** を表示）。検出に失敗する環境や別 ISA 向けビルドでは **`GPU_ARCH=gfx1100`** 等を明示する。ビルドは **`-lhipblas -lrocblas -lstdc++`** をリンクする（Prefill 線形層の **hipBLAS GemmEx** 用。**`fp16_cache_io.o`** のため **g++ / libstdc++-dev** が必要）。**`make build`**: **`qwen3-rocm`** + **`$(MODEL).fp16/manifest`**（**`MODEL`** が存在する場合）。**`make run`**: バイナリのみ（pack-cache をスキップ）。**`make pack-cache`**: オフライン FP16 キャッシュを明示生成。
+**`GPU_ARCH_DETECTED`** はビルド前に **`gpu-rocm/Makefile`** が **`$(ROCM)/bin/rocminfo`** から自動検出する（**`make -C gpu-rocm detect-gpu-arch`** で **検出 ISA** と **ビルド offload ISA** を表示）。検出に失敗する環境や別 ISA 向けビルドでは **`GPU_ARCH=gfx1100`** 等を明示する。ビルドは **`-lhipblas -lrocblas -lstdc++`** をリンクする（Prefill 線形層の **hipBLAS GemmEx** 用。**`fp16_cache_io.o`** のため **g++ / libstdc++-dev** が必要）。**`make build`**: **`qwen3-rocm`** + **`$(MODEL).fp16/manifest`**（**`MODEL`** が存在する場合）。**`make run`**（引数なし **`make`**）: **`qwen3-rocm`** + **`ensure-model`**（pack-cache をスキップ）。**`make pack-cache`**: オフライン FP16 キャッシュを明示生成。
 
 **Ryzen AI 5 340（Radeon 840M / `gfx1152`）** など **rocBLAS が `gfx1152` 用 Tensile を同梱していない GPU** では、Makefile が **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VERSION=11.5.1`** を自動適用する（詳細は直後の専用節）。**ROCm を 7.2.1 に上げること自体はこの GPU 専用の必須条件ではない**（7.1.x でも同様のワークアラウンドで動作しうる）。
 
@@ -546,7 +556,7 @@ make log
 | **`vram_device_used`** / **`vram_device_total`** | **`cudaMemGetInfo`** / **`hipMemGetInfo`**（各 **bytes** + **`_mib`**） |
 | **`[vram_breakdown]`** | **`vram_weights_embd`**, **`vram_weights_f32_norm`**, **`vram_weights_linear`**（FP16）または **`vram_weights_fp4`**（NVFP4）, **`vram_kv_cache`**, **`vram_decode_activations`**, **`vram_prefill_batch`**（ROCm は **`d_scratch_f16`** 含む）, （NVFP4）**`vram_fp4_gemm_scratch`** |
 
-**`gpu-cuda`** と **`gpu-cuda-nvfp4`** のいずれも **`.DEFAULT_GOAL` は `run` → `build`**。**`nvcc` / `nvlink` は `PATH` に CUDA の `bin` を通す**。apt **`nvidia-cuda-toolkit`（CUDA 11）** と **CUDA 13** は併存させない（**`gpu-cuda-nvfp4` の `make blackwell`** が 11.x を除去して 13 を入れる）。
+**`cpu`** / **`cpu-multicore`** / **`cpu-blas`** / **`gpu-rocm`** / **`gpu-vulkan`** / **`gpu-cuda`** / **`gpu-cuda-nvfp4`** / **`xdna2`** / **`xdna2-bfp16`** の各 **`Makefile`** は **`.DEFAULT_GOAL := run`**（引数なし **`make`** で推論）。**`run`** は **`ensure-model`** に依存し、GGUF 未配置時は **`make -C .. model`** を自動実行する。**`gpu-cuda`** / **`gpu-cuda-nvfp4`** の **`run`** は **`build`**（または **`build.polarquant`**）を経由。**`nvcc` / `nvlink` は `PATH` に CUDA の `bin` を通す**。apt **`nvidia-cuda-toolkit`（CUDA 11）** と **CUDA 13** は併存させない（**`gpu-cuda-nvfp4` の `make blackwell`** が 11.x を除去して 13 を入れる）。
 
 ### XDNA2（AMD Ryzen AI NPU）
 
@@ -1218,10 +1228,11 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 
 利用する GGUF のファイル名は **`qwen3-8b/Makefile` の `MODEL`** を参照する。モデル本体は著作権とファイルサイズの都合でリポジトリに含めず、既定モデルの取得元は **`qwen3-8b/gguf.txt`** に URL として置く。
 
-取得・検証の手順は次の 2 通りである。
+取得・検証の手順は次の 3 通りである。
 
-1. **`cd qwen3-8b && make model`**: **`gguf.txt`** 先頭 URL の `blob/main` を `resolve/main` に置換して **`wget`** し、リポジトリ同梱の **`$(MODEL).sha256sum`** で **`sha256sum --check`** する。**`$(MODEL)` が既に存在し検証に成功した場合はダウンロードをスキップ**する。チェックサムファイルが無い・検証に失敗した場合はメッセージを出して終了し、破損ダウンロードは **`$(MODEL)`** を削除する。
-2. **手動**: 上記と同様に URL を `resolve/main` に直して **`wget`** 等で取得し、**`sha256sum -c $(MODEL).sha256sum`** で確認する。
+1. **各サブディレクトリから推論実行**（推奨）: **`cd qwen3-8b/cpu && make`**（= **`make run`**）。**`ensure-model`** が **`../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf`**（既定 **`MODEL`**）の存在を確認し、無ければ **`make -C .. model`** を実行してから推論する。
+2. **`cd qwen3-8b && make model`**: **`gguf.txt`** 先頭 URL の `blob/main` を `resolve/main` に置換して **`wget`** し、リポジトリ同梱の **`$(MODEL).sha256sum`** で **`sha256sum --check`** する。**`$(MODEL)` が既に存在し検証に成功した場合はダウンロードをスキップ**する。チェックサムファイルが無い・検証に失敗した場合はメッセージを出して終了し、破損ダウンロードは **`$(MODEL)`** を削除する。
+3. **手動**: 上記と同様に URL を `resolve/main` に直して **`wget`** 等で取得し、**`sha256sum -c $(MODEL).sha256sum`** で確認する。
 
 **`qwen3-8b/Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf.sha256sum`** は既定 **`MODEL`** 用の参照。別量子化・別サイズに切り替える場合は **`MODEL`** と本書の前提（メタキー `qwen3vl.*`・テンソル名）が実装と一致するかを確認すること。
 

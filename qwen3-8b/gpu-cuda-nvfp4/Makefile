@@ -114,7 +114,7 @@ BENCH_LOG_FILE ?= /tmp/benchmark.log
 # GPU identifier for BENCH_LOG (Blackwell sm_120a target)
 GPU_SM ?= sm_120a
 
-.PHONY: build build.polarquant run run.polarquant clean blackwell cutlass fp4-test pq-test log log.push pack-cache fa-debug
+.PHONY: build build.polarquant run run.polarquant clean blackwell cutlass fp4-test pq-test log log.push pack-cache fa-debug ensure-model
 
 .DEFAULT_GOAL := run
 
@@ -181,10 +181,19 @@ cutlass:
 			https://github.com/NVIDIA/cutlass.git $(CUTLASS_DIR); \
 	fi
 
-run: build
+ensure-model:
+	@if [ ! -f "$(MODEL)" ]; then \
+		echo ""; \
+		echo "Model not found: $(MODEL)"; \
+		echo "Running: make -C .. model"; \
+		echo ""; \
+		$(MAKE) -C .. model; \
+	fi
+
+run: build ensure-model
 	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
-run.polarquant: build.polarquant
+run.polarquant: build.polarquant ensure-model
 	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
 pack-cache: build
