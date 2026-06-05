@@ -49,7 +49,7 @@
 | `qwen3-8b/cpu-blas/Makefile` | **`qwen3-cpu-blas`** をビルド。**`-ffast-math` 無効**（IQ 量子化の精度維持）。**`-march=native`** 既定。**`openblas_set_num_threads(1)`** は **`main.c`** 実行時。**`make openblas`** で **`libopenblas-dev`** / **`libgomp1`** を apt 導入。**`cblas.h` 未検出時**はエラーメッセージで **`make openblas`** と **`CPPFLAGS`** 例を案内。 |
 | `qwen3-8b/gpu-rocm/main.c` | ROCm 推論。**Prefill バッチ**（**`forward_prefill_gpu`** — 線形層 **hipBLAS GemmEx** + カスタム Attention/Norm 等）+ **Decode**（**`forward_gpu`**）。重み H2D: オフライン **`.fp16bin`** または **GGUF 行単位融合逆量子化**（**`upload_fp16_linear`** / **`upload_fp16_tensor_streaming`**）。起動ログ: **`Loading FP16 cache from …`** または **`Uploading weights (row dequant -> FP16)...`**。8 レイヤーごとに **`layer N/L uploaded: X.XX sec, X.XX GB/sec`**。**Prefill progress bar** と prefill / decode / total スループット要約を stderr に出力。推論終了時 **`BENCH_LOG_FILE`**（既定 **`/tmp/benchmark.log`**）へ key=value ベンチ＋**`[vram_breakdown]`**（**`GpuVramProfile`** / **`model_vram_profile`**。**`make log.push`** がパース。推論区間のみ）。 |
 | `qwen3-8b/gpu-rocm/fp16_cache.h` / `fp16_cache_io.c` | **FP16 オフラインキャッシュ** I/O（**`gpu-cuda/`** と同 API。**`FP16HostWeight`** の save/load、**`<model>.gguf.fp16`** パス生成、**`manifest`**（GGUF サイズ・mtime 検証）。 |
-| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH_DETECTED`** は **`rocminfo`** の最初の **`gfx*`**。**`gfx1152` / `gfx1153`** では rocBLAS 未同梱のため **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VERSION=11.5.1`**（**`make run`** で自動 export）。**`detect-gpu-arch`**。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ。**`pack-cache`** / **`make log`** / **`make log.push`** / **`make wmma`**。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。 |
+| `qwen3-8b/gpu-rocm/Makefile` | **`qwen3-rocm`** を **`hipcc`** で **`main.o` + `fp16_cache_io.o`** からリンク（**`-lhipblas -lrocblas -lstdc++`**。**g++** で libstdc++ ヘッダ／リンクパスを検出）。**`GPU_ARCH_DETECTED`** は **`rocminfo`** の最初の **`gfx*`**。**`gfx1152` / `gfx1153`** では rocBLAS 未同梱のため **`HIP_OFFLOAD_ARCH=gfx1151`** と **`HSA_OVERRIDE_GFX_VER=11.5.1`**（**`HSA_OVERRIDE_GFX_VER` が設定されているときのみ** **`HSA_OVERRIDE_GFX_VERSION` を export** — 空 export は **`gfx1030`** 等で HIP を壊す）。**`detect-gpu-arch`**。**`build`**: バイナリ + **`$(MODEL).fp16/manifest`**（MODEL 存在時）。**`run`**: バイナリのみ。**`pack-cache`** / **`make log`** / **`make log.push`** / **`make wmma`**。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。 |
 | `qwen3-8b/gpu-rocm/wmma_probe.c` | RDNA **gfx11 / gfx12** 向け **WMMA 校正用**最小 HIP プローブ。**gfx11**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`**。**gfx12**: **`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`**。**`make wmma-probe`** の出力 **`wmma-probe`**。**`make wmma`** の **`llvm-objdump`** 検出器校正に使用。 |
 | `qwen3-8b/gpu-rocm/scripts/check_wmma.sh` | **`make wmma`** から呼ばれる検証スクリプト。**`main.c` / `qwen3-rocm` に直接 WMMA が無いこと**、**`wmma-probe` に WMMA があること**（RDNA **gfx11 / gfx12**）、rocBLAS バンドル ISA、任意で実行時 hipBLAS 経路・**`rocprofv3 --kernel-trace`** カーネル trace。**`count_wmma_in_obj`**: HIP バイナリは **`--offloading`** で AMDGPU コードを抽出して **`v_wmma`** をカウント。 |
 | `qwen3-8b/gpu-vulkan/main.c` | Vulkan compute 推論ホスト（**`gpu-cuda/main.c`** ベース）。GGUF・トークナイザ・FP16 重み H2D・生成ループ。**`gpu.h`** 経由で **`vk_kernels.c`** に forward を委譲。推論終了時 **`BENCH_LOG_FILE`** へ key=value ベンチ + 簡易 **`[vram_breakdown]`**（**`write_benchmark_log`**。**`vram_weights_linear` は未出力**）。 |
@@ -167,7 +167,8 @@ OMP_NUM_THREADS=8 ./qwen3-cpu-blas ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf -p "H
 | `HIPCC` | HIP コンパイラ | `$(ROCM)/bin/hipcc` |
 | `GPU_ARCH` / `GPU_ARCH_DETECTED` | **`rocminfo` の `Name: gfx*`**（検出値は **`GPU_ARCH_DETECTED`**。**`GPU_ARCH`** は上書き可） | （自動。未検出時はビルド失敗） |
 | `HIP_OFFLOAD_ARCH` | **`hipcc --offload-arch=`** の実際の値（**`gfx1152`/`gfx1153` 時は `gfx1151` にマップ**） | 検出 ISA または **`gfx1151`** |
-| `HSA_OVERRIDE_GFX_VERSION` | **`gfx1152`/`gfx1153` 実機で rocBLAS が **`gfx1151` 用 Tensile** を選ぶためのランタイム上書き（**`make run`** が **`11.5.1`** を export） | （該当 GPU のみ設定） |
+| `HSA_OVERRIDE_GFX_VER` | Makefile 内部変数。**`gfx1152`/`gfx1153` 検出時のみ `11.5.1`**。非空のときだけ **`export HSA_OVERRIDE_GFX_VERSION`**（空 export は **`gfx1030`** 等で HIP 初期化を壊す） | （該当 GPU のみ設定） |
+| `HSA_OVERRIDE_GFX_VERSION` | 上記 **`HSA_OVERRIDE_GFX_VER`** の export 名。**`make run`** の **`RUN_ENV`** でも同値を付与 | （該当 GPU のみ設定） |
 | `XDNA_INCS` | `<drm/drm.h>` が標準外にあるときの `-I…`（**`xdna2/`** / **`xdna2-bfp16/`**） | 未定義（空で可） |
 | `PROMPT` | ユーザプロンプト（**`make run`**） | `Hello, how are you?` |
 
@@ -277,8 +278,11 @@ AMD 側では **`gfx1152` / `gfx1153` の rocBLAS 同梱**が開発中（[ROCm/T
 | 変数 | 値 | 役割 |
 |------|-----|------|
 | **`HIP_OFFLOAD_ARCH`** | **`gfx1151`** | **`hipcc --offload-arch=`** — 自前 HIP カーネルを **同梱されている最寄り ISA** でコンパイル |
-| **`HSA_OVERRIDE_GFX_VERSION`** | **`11.5.1`** | ランタイムで HSA が GPU を **`gfx1151`** として報告し、rocBLAS が **`TensileLibrary_lazy_gfx1151.dat`** を選択 |
+| **`HSA_OVERRIDE_GFX_VER`** | **`11.5.1`** | Makefile 内部。**非空のときのみ** **`export HSA_OVERRIDE_GFX_VERSION`** |
+| **`HSA_OVERRIDE_GFX_VERSION`** | **`11.5.1`**（export 時） | ランタイムで HSA が GPU を **`gfx1151`** として報告し、rocBLAS が **`TensileLibrary_lazy_gfx1151.dat`** を選択 |
 | **`RUN_ENV`** | 上記を **`make run`** / **`log.push`** 等に付与 | 手動 export を忘れないため |
+
+**`gfx1152` / `gfx1153` 以外**（**`gfx1030`** / **`gfx1100`** / **`gfx1201`** 等）では **`HSA_OVERRIDE_GFX_VER` は未設定**のため、**`HSA_OVERRIDE_GFX_VERSION` は export も **`RUN_ENV` も付与されない**。以前のように **空の `HSA_OVERRIDE_GFX_VERSION` を常 export** すると、オーバーライド不要な GPU で HIP が失敗しうる。
 
 **`make build`** / **`make detect-gpu-arch`** のログ例:
 
@@ -1287,6 +1291,7 @@ Qwen3-VL-8B の代表形状では `head_dim=128` なので、専用の `attn_fla
 | **`rocBLAS error: … for GPU arch : gfx1152`**（**TensileLibrary** 欠落） | 公式 rocBLAS に **`gfx1152`** 用 lazy Tensile が無い（**ROCm 7.1.x / 7.2.x 共通**） | **`cd gpu-rocm && make clean build && make run`**（Makefile の **`gfx1151` offload + `HSA_OVERRIDE_GFX_VERSION=11.5.1`**）。詳細は **「環境依存：gfx1152（Ryzen AI / Radeon 840M）と rocBLAS」**。**ROCm バージョンアップのみ**では直らない場合がある |
 | **`hipBLAS error: 6`**（Prefill 0%・**`HIPBLAS_STATUS_INTERNAL_ERROR`**） | **`gfx1152` 名で `gfx1151` ライブラリを無理に symlink した**、または **HSA オーバーライドと `--offload-arch` の不一致** | **`make clean build`**（**`HIP_OFFLOAD_ARCH=gfx1151`** を確認）。**`HSA_OVERRIDE_GFX_VERSION=11.5.1`** を **`make run`** とセットで使用。手動実行時は両方必須 |
 | **`Segmentation fault`**（Prefill 直後・**`gcnArchName: gfx1151`** 表示あり） | **`HSA_OVERRIDE_GFX_VERSION` のみ**でバイナリが **`gfx1152` offload** のまま | **`make clean build`** 後 **`make run`**。ビルドログの **`Build offload arch: gfx1151`** を確認 |
+| HIP 初期化失敗・デバイス未検出（**`gfx1030`** / **`gfx1100`** 等・オーバーライド不要 GPU） | シェルや親 Makefile から **空の `HSA_OVERRIDE_GFX_VERSION`** が export されている | **`unset HSA_OVERRIDE_GFX_VERSION`** 後 **`make run`**。本リポジトリの Makefile は **`HSA_OVERRIDE_GFX_VER` 非空時のみ export**（2026-06-05 以降） |
 | ISA 不一致 / `GPU_ARCH not detected` | 自動検出失敗・手動指定の誤り | **`cd qwen3-8b/gpu-rocm && make detect-gpu-arch`**。失敗時は **`rocminfo`** の **`Name: gfx*`** を確認し **`make build GPU_ARCH=…`**（**`gfx1152` 実機では内部で `gfx1151` offload**） |
 | `nvcc` not found / `nvlink` 失敗 | `PATH` に CUDA `bin` が無い | `export PATH=/usr/local/cuda/bin:$PATH` または各 CUDA ディレクトリの **`Makefile`** の `CUDA_HOME` を確認 |
 | CUDA FP16 で出力が文字化け（Blackwell / RTX 50 系） | **`CUDA_GENCODE=compute_86` PTX JIT** で **`kernels.cu`** が不整合 | **`make build`** で **`nvidia-smi` 自動検出**（**`sm_120` + FA_BR=32**）を確認。**`=== build: GPU_CCAP=… ===`** 行を参照。手動 **`CUDA_GENCODE=arch=compute_120,code=sm_120`** |
