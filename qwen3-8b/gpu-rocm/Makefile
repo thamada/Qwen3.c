@@ -17,7 +17,10 @@ endif
 ifneq ($(filter gfx1152 gfx1153,$(GPU_ARCH_DETECTED)),)
 HSA_OVERRIDE_GFX_VER  ?= 11.5.1
 endif
+# Only export when set: an empty HSA_OVERRIDE_GFX_VERSION breaks HIP on gfx1030 etc.
+ifneq ($(HSA_OVERRIDE_GFX_VER),)
 export HSA_OVERRIDE_GFX_VERSION := $(HSA_OVERRIDE_GFX_VER)
+endif
 RUN_ENV := $(if $(HSA_OVERRIDE_GFX_VER),HSA_OVERRIDE_GFX_VERSION=$(HSA_OVERRIDE_GFX_VER),)
 
 MODEL   ?= ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf

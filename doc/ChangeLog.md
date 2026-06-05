@@ -4,6 +4,26 @@
 >   本ドキュメントは変更履歴です。日付はdateコマンドで確認して2026-01-23 12:34:55のように年-月-日 時:分:秒のようにします。
 >   最も最新のものから順に並べて記入します。
 
+## 2026-06-05 21:23:03
+
+**`gpu-rocm/Makefile`** — **`HSA_OVERRIDE_GFX_VERSION` の条件付き export**（**`gfx1030`** 等で空 export が HIP を壊す問題の修正）。
+
+#### 背景
+
+- **`gfx1152`/`gfx1153` 向け HSA オーバーライド**を入れた際、Makefile が **`HSA_OVERRIDE_GFX_VERSION` を常に export** していた
+- **`gfx1030`** / **`gfx1100`** 等（オーバーライド不要 GPU）では **空の `HSA_OVERRIDE_GFX_VERSION`** が HIP 初期化を壊しうる
+
+#### `qwen3-8b/gpu-rocm/Makefile`
+
+- **`ifneq ($(HSA_OVERRIDE_GFX_VER),)`** で **`HSA_OVERRIDE_GFX_VER` が非空のときのみ** **`export HSA_OVERRIDE_GFX_VERSION`**
+- **`RUN_ENV`** は従来どおり **`HSA_OVERRIDE_GFX_VER` 設定時のみ** 付与（変更なし）
+
+#### `doc/design.md`
+
+- **Make 変数表**（**`HSA_OVERRIDE_GFX_VER`** / 条件付き export）・**ファイル構成表（`Makefile` 行）**・**「環境依存：gfx1152…」** のワークアラウンド表（非 **`gfx1152`** GPU では export しない旨）・**トラブルシューティング早見表**（空 **`HSA_OVERRIDE_GFX_VERSION`** 行）を同期
+
+**`doc/ChangeLog.md`**: 本エントリ。
+
 ## 2026-06-02 23:18:29
 
 **`gfx1152`（Ryzen AI 5 340 / Radeon 840M）環境依存と rocBLAS** — 設計ドキュメントへの詳細追記。
