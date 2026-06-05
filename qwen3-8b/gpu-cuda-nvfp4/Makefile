@@ -100,6 +100,8 @@ KERNELS_OBJ := kernels.fabr$(FA_BR_VAL).pq$(BONSAI_POLARQUANT).o
 MAIN_OBJ    := main.pq$(BONSAI_POLARQUANT).o
 BIN         := qwen3-gpu-cuda-nvfp4
 
+FP4_CACHE_MANIFEST := $(MODEL).nvfp4/manifest
+
 MODEL   ?= ../Qwen_Qwen3-VL-8B-Instruct-IQ2_M.gguf
 PROMPT  ?= Hello, how are you?
 
@@ -190,14 +192,18 @@ ensure-model:
 		$(MAKE) -C .. model; \
 	fi
 
-run: build ensure-model
-	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
-
-run.polarquant: build.polarquant ensure-model
-	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
-
-pack-cache: build
+# run / build: binary + NVFP4 cache (pack-cache runs when manifest is missing or stale).
+$(FP4_CACHE_MANIFEST): $(MODEL) build
+	@test -f "$(MODEL)" || (echo "error: model not found: $(MODEL)" >&2; echo "  run: make -C .. model" >&2; exit 1)
 	./$(BIN) "$(MODEL)" --pack-nvfp4-cache
+
+pack-cache: $(FP4_CACHE_MANIFEST)
+
+run: ensure-model pack-cache
+	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
+
+run.polarquant: ensure-model build.polarquant pack-cache
+	./$(BIN) "$(MODEL)" -p "$(PROMPT)"
 
 clean:
 	rm -f $(BIN) fp4_verify polarquant_verify \
